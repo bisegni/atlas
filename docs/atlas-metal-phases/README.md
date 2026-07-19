@@ -18,8 +18,8 @@ cross-phase exit rules.
 | 8 | [Streaming generation]([done]%20phase-08-streaming-generation.md) |
 | 8.1 | [GPU-resident decode foundation]([done]%20phase-08a-gpu-resident-decode-foundation.md) |
 | 8.2 | [GPU-resident executor integration]([done]%20phase-08b-gpu-resident-executor.md) |
-| 8.3 | [Resident decode parity remediation](phase-08c-resident-decode-parity-remediation.md) |
-| 9 | [CLI model lifecycle](phase-09-cli-model-lifecycle.md) |
+| 8.3 | [Resident decode parity remediation]([done]%20phase-08c-resident-decode-parity-remediation.md) |
+| 9 | [CLI model lifecycle]([done]%20phase-09-cli-model-lifecycle.md) |
 | 10 | [Sampling engine](phase-10-sampling.md) |
 | 11 | [GGUF Q4_0/Q8_0 quantized models](phase-11-gguf-quantized-models.md) |
 | 12 | [Quantized CLI acceptance](phase-12-quantized-cli-acceptance.md) |

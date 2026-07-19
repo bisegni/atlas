@@ -101,6 +101,7 @@ fn phase_08a_metrics_expose_gpu_residency_observability() {
         command_buffer_count: 1,
         weight_upload_bytes: 4096,
         readback_bytes: 4,
+        resident_bytes: 4096,
         post_warmup_allocations: 0,
         ..Default::default()
     };
@@ -108,6 +109,7 @@ fn phase_08a_metrics_expose_gpu_residency_observability() {
     assert_eq!(metrics.command_buffer_count, 1);
     assert_eq!(metrics.weight_upload_bytes, 4096);
     assert_eq!(metrics.readback_bytes, 4);
+    assert_eq!(metrics.resident_bytes, 4096);
     assert_eq!(metrics.post_warmup_allocations, 0);
 }
 
@@ -243,6 +245,50 @@ fn phase_08a_cached_decode_is_faster_than_reference_and_keeps_greedy_parity() {
     assert!(
         executor_rate > reference_rate,
         "cached decode regression: executor {executor_rate:.2} tok/s <= reference {reference_rate:.2} tok/s"
+    );
+}
+
+#[test]
+#[ignore = "requires local Metal and the downloaded small fixture"]
+fn phase_08c_resident_production_prefill_matches_reference_before_decode() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fixture = root.join("models/hf/SmolLM2-135M-Instruct");
+    let model = match AtlasModel::load(&fixture) {
+        Ok(model) => model,
+        Err(error) if format!("{error:#}").contains("no Metal device is available") => return,
+        Err(error) => panic!("load small fixture: {error:#}"),
+    };
+    let prompt = "The capital of France is";
+    let mut reference = AtlasExecutor::new(
+        &model,
+        ExecutorConfig {
+            mode: ExecutorMode::Reference,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let expected = reference.generate_greedy(prompt, 1).unwrap();
+    let mut resident = AtlasExecutor::new(
+        &model,
+        ExecutorConfig {
+            mode: ExecutorMode::Resident,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let actual = resident.generate_greedy(prompt, 1).unwrap();
+    assert_eq!(
+        actual.generation.generated_token_ids,
+        expected.generation.generated_token_ids
+    );
+    assert_eq!(actual.finish_reason, expected.finish_reason);
+    assert_eq!(
+        actual.metrics.prefill_command_buffer_count,
+        actual.metrics.prefill_tokens as u64
+    );
+    assert_eq!(
+        actual.metrics.readback_bytes,
+        4 * (actual.metrics.prefill_tokens + actual.metrics.decode_tokens) as u64
     );
 }
 

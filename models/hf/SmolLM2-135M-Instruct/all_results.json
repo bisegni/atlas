@@ -1,0 +1,22 @@
+{
+    "epoch": 1.9973828840617638,
+    "eval_logits/chosen": 4.600930213928223,
+    "eval_logits/rejected": 4.9520039558410645,
+    "eval_logps/chosen": -443.648193359375,
+    "eval_logps/rejected": -378.15826416015625,
+    "eval_loss": 0.6740825176239014,
+    "eval_rewards/accuracies": 0.6150793433189392,
+    "eval_rewards/chosen": -0.07192634046077728,
+    "eval_rewards/margins": 0.26874542236328125,
+    "eval_rewards/rejected": -0.34067174792289734,
+    "eval_runtime": 20.4479,
+    "eval_samples": 2000,
+    "eval_samples_per_second": 97.81,
+    "eval_steps_per_second": 3.081,
+    "total_flos": 0.0,
+    "train_loss": 0.675485389037702,
+    "train_runtime": 5897.7907,
+    "train_samples": 61134,
+    "train_samples_per_second": 20.731,
+    "train_steps_per_second": 0.162
+}

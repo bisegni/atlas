@@ -224,6 +224,8 @@ pub struct ExecutorMetrics {
     pub weight_upload_bytes: u64,
     /// Bytes copied from Metal buffers back to CPU-visible vectors.
     pub readback_bytes: u64,
+    /// GPU-visible session arenas and immutable resident model weights.
+    pub resident_bytes: u64,
     pub resident_arena_allocations: u64,
 }
 
@@ -405,6 +407,58 @@ impl ResidentExecutor {
     }
     fn allocations(&self) -> u64 {
         30 + self.kv.len() as u64
+    }
+    fn resident_bytes(&self) -> u64 {
+        let buffers = [
+            &self.token,
+            &self.position,
+            &self.selected,
+            &self.state,
+            &self.work,
+            &self.residual,
+            &self.norm,
+            &self.q,
+            &self.q_rot,
+            &self.rope_input,
+            &self.rope_output,
+            &self.k,
+            &self.k_rot,
+            &self.v,
+            &self.attention,
+            &self.attention_scores,
+            &self.attention_weights,
+            &self.attention_key_count,
+            &self.gate,
+            &self.up,
+            &self.activated,
+            &self.product,
+            &self.logits,
+            &self.hidden,
+            &self.intermediate,
+            &self.heads,
+            &self.kv_heads,
+            &self.head_dim,
+            &self.kv_width,
+            &self.capacity,
+            &self.vocab,
+            &self.epsilon,
+            &self.rope_cos,
+            &self.rope_sin,
+            &self.one,
+        ];
+        self.weights
+            .values()
+            .map(|buffer| buffer.bytes() as u64)
+            .sum::<u64>()
+            + self
+                .kv
+                .iter()
+                .map(|buffer| buffer.bytes() as u64)
+                .sum::<u64>()
+            + buffers
+                .iter()
+                .map(|buffer| buffer.bytes() as u64)
+                .sum::<u64>()
     }
     fn weight(&self, name: &str) -> Result<&GpuBuffer> {
         self.weights
@@ -821,6 +875,8 @@ impl ResidentExecutor {
             "executor context exhausted"
         );
         let runtime = model.ops.runtime();
+        let hidden_size = model.config.hidden_size;
+        let kv_width = model.config.num_key_value_heads * model.config.head_dim();
         runtime.write_u32(&self.token, &[token])?;
         runtime.write_u32(&self.position, &[u32::try_from(self.position_index)?])?;
         self.write_rope_tables(model)?;
@@ -852,10 +908,10 @@ impl ResidentExecutor {
                 ],
                 1,
             )?;
-            for (name, output, width) in [
-                ("q_proj", &self.q, &self.hidden),
-                ("k_proj", &self.k, &self.kv_width),
-                ("v_proj", &self.v, &self.kv_width),
+            for (name, output, width_buffer, output_width) in [
+                ("q_proj", &self.q, &self.hidden, hidden_size),
+                ("k_proj", &self.k, &self.kv_width, kv_width),
+                ("v_proj", &self.v, &self.kv_width, kv_width),
             ] {
                 command.dispatch_1d(
                     "matvec_f32",
@@ -864,15 +920,15 @@ impl ResidentExecutor {
                         self.weight(&format!("{p}.self_attn.{name}.weight"))?,
                         output,
                         &self.hidden,
-                        width,
+                        width_buffer,
                     ],
-                    width.bytes() / 4,
+                    output_width,
                 )?;
             }
             command.dispatch_1d(
                 "rope_half_to_interleaved_f32",
                 &[&self.q, &self.rope_input, &self.heads, &self.head_dim],
-                model.config.hidden_size / 2,
+                hidden_size / 2,
             )?;
             command.dispatch_1d(
                 "rope_f32",
@@ -883,17 +939,17 @@ impl ResidentExecutor {
                     &self.rope_output,
                     &self.head_dim,
                 ],
-                model.config.hidden_size / 2,
+                hidden_size / 2,
             )?;
             command.dispatch_1d(
                 "rope_interleaved_to_half_f32",
                 &[&self.rope_output, &self.q_rot, &self.heads, &self.head_dim],
-                model.config.hidden_size / 2,
+                hidden_size / 2,
             )?;
             command.dispatch_1d(
                 "rope_half_to_interleaved_f32",
                 &[&self.k, &self.rope_input, &self.kv_heads, &self.head_dim],
-                self.k.bytes() / 8,
+                kv_width / 2,
             )?;
             command.dispatch_1d(
                 "rope_f32",
@@ -904,7 +960,7 @@ impl ResidentExecutor {
                     &self.rope_output,
                     &self.head_dim,
                 ],
-                self.k.bytes() / 8,
+                kv_width / 2,
             )?;
             command.dispatch_1d(
                 "rope_interleaved_to_half_f32",
@@ -914,7 +970,7 @@ impl ResidentExecutor {
                     &self.kv_heads,
                     &self.head_dim,
                 ],
-                self.k.bytes() / 8,
+                kv_width / 2,
             )?;
             command.dispatch_1d(
                 "kv_append_decode_f32",
@@ -926,7 +982,7 @@ impl ResidentExecutor {
                     &self.capacity,
                     &self.position,
                 ],
-                self.kv_width.bytes() / 4,
+                kv_width,
             )?;
             let attention_keys = self.position_index + 1;
             command.dispatch_1d(
@@ -1450,6 +1506,10 @@ impl<'a> AtlasExecutor<'a> {
                     - prefill_command_buffer_count,
                 weight_upload_bytes: self.weight_upload_bytes,
                 readback_bytes: runtime.readback_bytes() - readback_before,
+                resident_bytes: self
+                    .resident
+                    .as_ref()
+                    .map_or(0, ResidentExecutor::resident_bytes),
                 resident_arena_allocations: self
                     .resident
                     .as_ref()

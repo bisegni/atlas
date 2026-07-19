@@ -3,6 +3,7 @@ use std::{
     env, fs,
     io::{self, BufRead, Read, Write},
     path::{Path, PathBuf},
+    process::Command,
     sync::atomic::{AtomicBool, Ordering},
     time::Instant,
 };
@@ -20,9 +21,43 @@ use atlas_model::{
     },
     validate_generation_golden,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 
 static CHAT_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+const MODEL_MANIFEST: &str = "models/manifest.toml";
+
+#[derive(Debug)]
+struct ModelManifest {
+    models: Vec<ModelRecord>,
+}
+
+#[derive(Debug)]
+struct ModelRecord {
+    id: String,
+    source: String,
+    revision: String,
+    path: PathBuf,
+    architecture: String,
+    tokenizer: PathBuf,
+    format: String,
+    bytes: u64,
+    files: Vec<ModelFile>,
+}
+
+#[derive(Debug)]
+struct ModelFile {
+    path: PathBuf,
+    bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug)]
+struct ModelSelection {
+    id: String,
+    directory: PathBuf,
+    manifest: Option<ModelRecord>,
+}
 
 extern "C" fn chat_sigint_handler(_: i32) {
     // Signal handlers may only perform async-signal-safe work. Atomic stores
@@ -48,6 +83,7 @@ fn main() -> Result<()> {
         Some("fixture") if args.get(1).map(String::as_str) == Some("verify") => {
             fixture_verify(&args[2..])
         }
+        Some("model") => model_command(&args[1..]),
         Some("generate") => generate(&args[1..]),
         Some("chat") => chat(&args[1..]),
         Some("phase_03_model") => phase_03_model(&args[1..]),
@@ -55,7 +91,7 @@ fn main() -> Result<()> {
         Some("phase_08b_decode") => phase_08b_decode(&args[1..]),
         _ => {
             eprintln!(
-                "usage: atlas-cli chat --model small [--prompt TEXT] [--max-tokens N] | atlas-cli metal-info | atlas-cli fixture verify --model small [--model-dir PATH] | atlas-cli generate --model small --prompt TEXT --max-new-tokens N --greedy [--golden PATH] | atlas-cli phase_03_model --model larger [--model-dir PATH] | atlas-cli phase_05_quant --model small --format fp16|int8|q4 [--tensor NAME] | atlas-cli phase_08b_decode --model small --prompt TEXT [--warmup N] [--max-new-tokens N] [--trace-logits|--trace-stages] [--trace-tolerance N]"
+                "usage: atlas-cli model inspect|verify --model ID | atlas-cli chat --model ID [--executor reference|resident] [--prompt TEXT] [--max-tokens N] | atlas-cli generate --model ID --prompt TEXT --max-new-tokens N --greedy [--golden PATH] | atlas-cli phase_08b_decode --model ID --prompt TEXT [--warmup N] [--max-new-tokens N] [--trace-logits|--trace-stages] [--trace-tolerance N]"
             );
             bail!("invalid command")
         }
@@ -65,12 +101,20 @@ fn main() -> Result<()> {
 fn chat(args: &[String]) -> Result<()> {
     CHAT_INTERRUPTED.store(false, Ordering::Release);
     install_chat_sigint_handler();
-    let (model_args, prompt, max_tokens) = parse_chat_args(args)?;
-    let (_, directory) = model_dir(&model_args)?;
+    let (model_args, prompt, max_tokens, mode) = parse_chat_args(args)?;
+    let selection = resolve_model(&model_args)?;
+    let directory = &selection.directory;
     let model = AtlasModel::load(directory)?;
     if let Some(prompt) = prompt {
         let mut turn_metrics = ChatTurnMetrics::new();
-        print_completion(&model, &prompt, max_tokens, &mut turn_metrics)?;
+        print_completion(
+            &model,
+            &prompt,
+            max_tokens,
+            mode,
+            &selection.id,
+            &mut turn_metrics,
+        )?;
         return Ok(());
     }
     eprintln!("Atlas chat. Commands: /reset, /help, /quit");
@@ -113,7 +157,14 @@ fn chat(args: &[String]) -> Result<()> {
             }
         }
         let mut turn_metrics = ChatTurnMetrics::new();
-        let result = match print_completion(&model, &history, max_tokens, &mut turn_metrics) {
+        let result = match print_completion(
+            &model,
+            &history,
+            max_tokens,
+            mode,
+            &selection.id,
+            &mut turn_metrics,
+        ) {
             Ok(result) => result,
             Err(_) if CHAT_INTERRUPTED.load(Ordering::Acquire) => {
                 session_metrics.record(&turn_metrics);
@@ -178,9 +229,17 @@ fn print_completion(
     model: &AtlasModel,
     prompt: &str,
     max_tokens: usize,
+    mode: ExecutorMode,
+    model_id: &str,
     turn_metrics: &mut ChatTurnMetrics,
 ) -> Result<ExecutorGeneration> {
-    let mut executor = AtlasExecutor::new(model, ExecutorConfig::default())?;
+    let mut executor = AtlasExecutor::new(
+        model,
+        ExecutorConfig {
+            mode,
+            ..Default::default()
+        },
+    )?;
     let mut stdout = io::stdout();
     let result =
         executor.generate_greedy_stream(prompt, max_tokens, &CHAT_INTERRUPTED, |event| {
@@ -189,7 +248,20 @@ fn print_completion(
         })?;
     writeln!(stdout)?;
     stdout.flush()?;
-    eprintln!("{}", metrics_line(&result.metrics));
+    eprintln!(
+        "{}",
+        json!({
+            "event": "generation_metrics",
+            "model_id": model_id,
+            "executor": match mode { ExecutorMode::Reference => "reference", ExecutorMode::Resident => "resident" },
+            "format": "safetensors-fp32",
+            "token_ids": result.generation.generated_token_ids,
+            "finish_reason": format!("{:?}", result.finish_reason).to_lowercase(),
+            "resident_bytes": result.metrics.resident_bytes,
+            "timing": { "ttft_ms": result.metrics.ttft.as_secs_f64() * 1000.0, "host_ms": result.metrics.host_wall_time.as_secs_f64() * 1000.0 },
+            "decode_tok_s": result.metrics.decode_tokens_per_second(),
+        })
+    );
     Ok(result)
 }
 
@@ -201,10 +273,11 @@ fn write_stream_event(writer: &mut impl Write, event: &GenerationEvent) -> Resul
     Ok(())
 }
 
-fn parse_chat_args(args: &[String]) -> Result<(Vec<String>, Option<String>, usize)> {
+fn parse_chat_args(args: &[String]) -> Result<(Vec<String>, Option<String>, usize, ExecutorMode)> {
     let mut model_args = Vec::new();
     let mut prompt = None;
     let mut max_tokens = 64;
+    let mut mode = ExecutorMode::Reference;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -230,11 +303,19 @@ fn parse_chat_args(args: &[String]) -> Result<(Vec<String>, Option<String>, usiz
                     .context("parse --max-tokens")?;
                 ensure!(max_tokens > 0, "--max-tokens must be positive");
             }
+            "--executor" => {
+                index += 1;
+                mode = match args.get(index).map(String::as_str) {
+                    Some("reference") => ExecutorMode::Reference,
+                    Some("resident") => ExecutorMode::Resident,
+                    _ => bail!("--executor must be `reference` or `resident`"),
+                };
+            }
             flag => bail!("unknown chat option: {flag}"),
         };
         index += 1;
     }
-    Ok((model_args, prompt, max_tokens))
+    Ok((model_args, prompt, max_tokens, mode))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -298,7 +379,7 @@ mod phase_07_tests {
 
     #[test]
     fn chat_arguments_parse_one_shot_and_reject_zero_max_tokens() {
-        let (model, prompt, max) = parse_chat_args(&[
+        let (model, prompt, max, mode) = parse_chat_args(&[
             "--model".into(),
             "small".into(),
             "--prompt".into(),
@@ -310,6 +391,7 @@ mod phase_07_tests {
         assert_eq!(model, ["--model", "small"]);
         assert_eq!(prompt.as_deref(), Some("hello"));
         assert_eq!(max, 7);
+        assert_eq!(mode, ExecutorMode::Reference);
         assert!(
             parse_chat_args(&[
                 "--model".into(),
@@ -319,6 +401,40 @@ mod phase_07_tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn chat_accepts_explicit_resident_executor_only() {
+        let (_, _, _, mode) = parse_chat_args(&[
+            "--model".into(),
+            "small".into(),
+            "--executor".into(),
+            "resident".into(),
+        ])
+        .unwrap();
+        assert_eq!(mode, ExecutorMode::Resident);
+        assert!(
+            parse_chat_args(&[
+                "--model".into(),
+                "small".into(),
+                "--executor".into(),
+                "automatic".into(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn manifest_file_paths_cannot_escape_the_model_root() {
+        assert!(safe_model_file(Path::new("models/hf/small"), Path::new("config.json")).is_ok());
+        assert!(
+            safe_model_file(Path::new("models/hf/small"), Path::new("../config.json")).is_err()
+        );
+        assert!(
+            safe_model_file(Path::new("models/hf/small"), Path::new("/tmp/config.json")).is_err()
+        );
+        assert!(safe_project_path(Path::new("models/hf/small")).is_ok());
+        assert!(safe_project_path(Path::new("../models/hf/small")).is_err());
     }
 
     #[test]
@@ -698,7 +814,137 @@ fn phase_05_quant(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn model_dir(args: &[String]) -> Result<(String, PathBuf)> {
+fn load_manifest() -> Result<ModelManifest> {
+    let path = Path::new(MODEL_MANIFEST);
+    let contents = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let mut models: Vec<ModelRecord> = Vec::new();
+    let mut model: Option<ModelRecord> = None;
+    let mut file: Option<ModelFile> = None;
+    for raw in contents.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line == "[[models]]" {
+            if let Some(file) = file.take() {
+                model
+                    .as_mut()
+                    .context("model file appears before a model")?
+                    .files
+                    .push(file);
+            }
+            if let Some(model) = model.take() {
+                models.push(model);
+            }
+            model = Some(ModelRecord {
+                id: String::new(),
+                source: String::new(),
+                revision: String::new(),
+                path: PathBuf::new(),
+                architecture: String::new(),
+                tokenizer: PathBuf::new(),
+                format: String::new(),
+                bytes: 0,
+                files: Vec::new(),
+            });
+            continue;
+        }
+        if line == "[[models.files]]" {
+            if let Some(file) = file.take() {
+                model
+                    .as_mut()
+                    .context("model file appears before a model")?
+                    .files
+                    .push(file);
+            }
+            file = Some(ModelFile {
+                path: PathBuf::new(),
+                bytes: 0,
+                sha256: String::new(),
+            });
+            continue;
+        }
+        let (key, value) = line
+            .split_once('=')
+            .context("manifest entry must use key = value")?;
+        let key = key.trim();
+        let value = value.trim();
+        let text = value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'));
+        if let Some(file) = file.as_mut() {
+            match key {
+                "path" => {
+                    file.path = PathBuf::from(text.context("manifest file path must be quoted")?)
+                }
+                "bytes" => file.bytes = value.parse().context("parse manifest file bytes")?,
+                "sha256" => {
+                    file.sha256 = text.context("manifest SHA-256 must be quoted")?.to_owned()
+                }
+                _ => bail!("unknown model file manifest key `{key}`"),
+            }
+        } else {
+            let model = model
+                .as_mut()
+                .context("manifest entry appears before [[models]]")?;
+            match key {
+                "id" => model.id = text.context("model id must be quoted")?.to_owned(),
+                "source" => model.source = text.context("model source must be quoted")?.to_owned(),
+                "revision" => {
+                    model.revision = text.context("model revision must be quoted")?.to_owned()
+                }
+                "path" => model.path = PathBuf::from(text.context("model path must be quoted")?),
+                "architecture" => {
+                    model.architecture = text
+                        .context("model architecture must be quoted")?
+                        .to_owned()
+                }
+                "tokenizer" => {
+                    model.tokenizer = PathBuf::from(text.context("model tokenizer must be quoted")?)
+                }
+                "format" => model.format = text.context("model format must be quoted")?.to_owned(),
+                "bytes" => model.bytes = value.parse().context("parse model bytes")?,
+                _ => bail!("unknown model manifest key `{key}`"),
+            }
+        }
+    }
+    if let Some(file) = file {
+        model
+            .as_mut()
+            .context("model file appears before a model")?
+            .files
+            .push(file);
+    }
+    if let Some(model) = model {
+        models.push(model);
+    }
+    for model in &models {
+        ensure!(
+            !model.id.is_empty()
+                && !model.source.is_empty()
+                && !model.revision.is_empty()
+                && !model.path.as_os_str().is_empty()
+                && !model.architecture.is_empty()
+                && !model.tokenizer.as_os_str().is_empty()
+                && !model.format.is_empty()
+                && !model.files.is_empty(),
+            "manifest contains an incomplete model record"
+        );
+    }
+    let mut ids = BTreeSet::new();
+    for model in &models {
+        ensure!(
+            ids.insert(model.id.as_str()),
+            "duplicate model ID `{}`",
+            model.id
+        );
+    }
+    let manifest = ModelManifest { models };
+    ensure!(!manifest.models.is_empty(), "model manifest has no models");
+    Ok(manifest)
+}
+
+fn resolve_model(args: &[String]) -> Result<ModelSelection> {
     let mut model = None;
     let mut directory = None;
     let mut index = 0;
@@ -717,19 +963,161 @@ fn model_dir(args: &[String]) -> Result<(String, PathBuf)> {
         index += 1;
     }
     let model = model.context("--model is required")?;
-    let default = match model.as_str() {
-        "small" => "models/hf/SmolLM2-135M-Instruct",
-        "larger" => "models/hf/SmolLM2-1.7B-Instruct",
-        _ => bail!("model must be `small` or `larger`"),
-    };
-    let directory = directory.unwrap_or_else(|| PathBuf::from(default));
-    if !directory.join("config.json").exists() {
+    if let Some(directory) = directory {
+        if !directory.join("config.json").exists() {
+            bail!(
+                "developer model fixture is missing at {}; pass a directory with config.json",
+                directory.display()
+            );
+        }
+        return Ok(ModelSelection {
+            id: model,
+            directory,
+            manifest: None,
+        });
+    }
+    let manifest = load_manifest()?;
+    let mut record = manifest
+        .models
+        .into_iter()
+        .find(|record| record.id == model)
+        .with_context(|| format!("model ID `{model}` is not in {MODEL_MANIFEST}"))?;
+    record.path = safe_project_path(&record.path)?;
+    if !record.path.join("config.json").exists() {
         bail!(
-            "model fixture is missing at {}; run `scripts/download-models.sh {model}` or pass --model-dir PATH",
-            directory.display()
+            "manifest model `{model}` is missing at {}; download its pinned revision or pass --model-dir for a developer fixture",
+            record.path.display()
         );
     }
-    Ok((model, directory))
+    Ok(ModelSelection {
+        id: model,
+        directory: record.path.clone(),
+        manifest: Some(record),
+    })
+}
+
+fn model_dir(args: &[String]) -> Result<(String, PathBuf)> {
+    let selection = resolve_model(args)?;
+    Ok((selection.id, selection.directory))
+}
+
+fn safe_model_file(root: &Path, relative: &Path) -> Result<PathBuf> {
+    ensure!(
+        !relative.is_absolute()
+            && !relative
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir)),
+        "manifest file path must be relative and may not escape its model directory: {}",
+        relative.display()
+    );
+    Ok(root.join(relative))
+}
+
+fn safe_project_path(relative: &Path) -> Result<PathBuf> {
+    ensure!(
+        !relative.is_absolute()
+            && !relative
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir)),
+        "manifest model path must be relative and may not escape the repository: {}",
+        relative.display()
+    );
+    Ok(relative.to_path_buf())
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let output = Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(path)
+        .output()
+        .with_context(|| format!("run shasum for {}", path.display()))?;
+    ensure!(
+        output.status.success(),
+        "shasum failed for {}",
+        path.display()
+    );
+    let digest = std::str::from_utf8(&output.stdout)
+        .context("shasum did not emit UTF-8")?
+        .split_whitespace()
+        .next()
+        .context("shasum produced no digest")?;
+    ensure!(
+        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "invalid SHA-256 output"
+    );
+    Ok(digest.to_owned())
+}
+
+fn verify_manifest_model(record: &ModelRecord) -> Result<()> {
+    let mut total = 0u64;
+    for file in &record.files {
+        let path = safe_model_file(&record.path, &file.path)?;
+        let metadata = fs::metadata(&path).with_context(|| format!("stat {}", path.display()))?;
+        ensure!(
+            metadata.len() == file.bytes,
+            "byte size mismatch for {}",
+            path.display()
+        );
+        ensure!(
+            sha256_file(&path)? == file.sha256,
+            "SHA-256 mismatch for {}",
+            path.display()
+        );
+        total = total
+            .checked_add(metadata.len())
+            .context("model byte total overflow")?;
+    }
+    ensure!(
+        total == record.bytes,
+        "manifest byte total mismatch for `{}`",
+        record.id
+    );
+    let tokenizer = safe_model_file(&record.path, &record.tokenizer)?;
+    ensure!(
+        tokenizer.is_file(),
+        "tokenizer is missing: {}",
+        tokenizer.display()
+    );
+    let config: Value = serde_json::from_slice(&fs::read(record.path.join("config.json"))?)?;
+    let architecture = config["architectures"]
+        .as_array()
+        .and_then(|items| items.first())
+        .and_then(Value::as_str);
+    ensure!(
+        architecture == Some(record.architecture.as_str()),
+        "architecture mismatch for `{}`",
+        record.id
+    );
+    fixture_details(&record.path).map(|_| ())
+}
+
+fn model_command(args: &[String]) -> Result<()> {
+    let command = args
+        .first()
+        .context("model command requires `inspect` or `verify`")?;
+    let selection = resolve_model(&args[1..])?;
+    let record = selection
+        .manifest
+        .context("`atlas-cli model` requires a manifest-backed model ID")?;
+    match command.as_str() {
+        "inspect" => println!(
+            "{}",
+            json!({
+                "model_id": record.id, "source": record.source, "revision": record.revision,
+                "path": record.path, "architecture": record.architecture, "format": record.format,
+                "bytes": record.bytes,
+            })
+        ),
+        "verify" => {
+            verify_manifest_model(&record)?;
+            println!(
+                "{}",
+                json!({"model_id": record.id, "verified": true, "bytes": record.bytes})
+            );
+        }
+        _ => bail!("model command must be `inspect` or `verify`"),
+    }
+    Ok(())
 }
 
 fn generate(args: &[String]) -> Result<()> {
@@ -867,34 +1255,11 @@ fn metal_info() -> Result<()> {
 }
 
 fn fixture_verify(args: &[String]) -> Result<()> {
-    let mut model = None;
-    let mut model_dir = None;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--model" => {
-                index += 1;
-                model = args.get(index).cloned();
-            }
-            "--model-dir" => {
-                index += 1;
-                model_dir = args.get(index).map(PathBuf::from);
-            }
-            flag => bail!("unknown fixture option: {flag}"),
-        }
-        index += 1;
-    }
-    let model = model.context("--model is required")?;
-    let default_dir = match model.as_str() {
-        "small" => "models/hf/SmolLM2-135M-Instruct",
-        "larger" => "models/hf/SmolLM2-1.7B-Instruct",
-        _ => bail!("model must be `small` or `larger`"),
-    };
-    let model_dir = model_dir.unwrap_or_else(|| PathBuf::from(default_dir));
-    verify_fixture(&model_dir)
+    let (_, directory) = model_dir(args)?;
+    verify_fixture(&directory)
 }
 
-fn verify_fixture(model_dir: &Path) -> Result<()> {
+fn fixture_details(model_dir: &Path) -> Result<(String, usize)> {
     let config_path = model_dir.join("config.json");
     let config: Value = serde_json::from_slice(
         &fs::read(&config_path).with_context(|| format!("read {}", config_path.display()))?,
@@ -948,8 +1313,13 @@ fn verify_fixture(model_dir: &Path) -> Result<()> {
             bail!("SafeTensors header is not an object: {}", path.display());
         }
     }
+    Ok((architecture.to_owned(), shard_names.len()))
+}
+
+fn verify_fixture(model_dir: &Path) -> Result<()> {
+    let (architecture, shards) = fixture_details(model_dir)?;
     println!("fixture: {}", model_dir.display());
     println!("architecture: {architecture}");
-    println!("safetensors_shards: {}", shard_names.len());
+    println!("safetensors_shards: {shards}");
     Ok(())
 }
