@@ -5,6 +5,7 @@
 //! is deliberately deferred to Phase 6, where prefill and decode plans are
 //! introduced together.
 
+pub mod executor;
 pub mod kv_cache;
 
 use std::{
@@ -356,12 +357,20 @@ impl AtlasModel {
             &format!("{prefix}.mlp.down_proj.weight"),
             self.config.intermediate_size,
             h,
+            ExecutionMode::Prefill,
         )?;
         trace.record(format!("layer.{layer}.mlp"), &mlp);
         Ok(self.ops.add(&residual, &mlp)?.0)
     }
     fn project(&self, rows: usize, input: &[f32], name: &str, output: usize) -> Result<Vec<f32>> {
-        self.project_width(rows, input, name, self.config.hidden_size, output)
+        self.project_width(
+            rows,
+            input,
+            name,
+            self.config.hidden_size,
+            output,
+            ExecutionMode::Prefill,
+        )
     }
     fn project_width(
         &self,
@@ -370,19 +379,49 @@ impl AtlasModel {
         name: &str,
         input_width: usize,
         output: usize,
+        mode: ExecutionMode,
     ) -> Result<Vec<f32>> {
         let weights = self.weight(name)?;
         Ok(self
             .ops
-            .project(
-                ExecutionMode::Prefill,
-                input,
-                &weights,
-                rows,
-                input_width,
-                output,
-            )?
+            .project(mode, input, &weights, rows, input_width, output)?
             .0)
+    }
+    fn rope_at(
+        &self,
+        input: &[f32],
+        position: usize,
+        heads: usize,
+        dim: usize,
+    ) -> Result<Vec<f32>> {
+        ensure!(
+            input.len() == heads * dim && dim.is_multiple_of(2),
+            "invalid one-token RoPE shape"
+        );
+        let mut interleaved = vec![0.0; input.len()];
+        let mut cos = vec![0.0; dim / 2];
+        let mut sin = vec![0.0; dim / 2];
+        for pair in 0..dim / 2 {
+            let angle =
+                position as f32 / self.config.rope_theta.powf((pair * 2) as f32 / dim as f32);
+            cos[pair] = angle.cos();
+            sin[pair] = angle.sin();
+            for head in 0..heads {
+                let base = head * dim;
+                interleaved[base + pair * 2] = input[base + pair];
+                interleaved[base + pair * 2 + 1] = input[base + pair + dim / 2];
+            }
+        }
+        let rotated = self.ops.rope(&interleaved, heads, dim, &cos, &sin)?.0;
+        let mut output = vec![0.0; input.len()];
+        for head in 0..heads {
+            for pair in 0..dim / 2 {
+                let base = head * dim;
+                output[base + pair] = rotated[base + pair * 2];
+                output[base + pair + dim / 2] = rotated[base + pair * 2 + 1];
+            }
+        }
+        Ok(output)
     }
     fn rope(&self, input: &[f32], sequence: usize, heads: usize, dim: usize) -> Result<Vec<f32>> {
         ensure!(dim % 2 == 0, "RoPE head dimension must be even");

@@ -1,9 +1,10 @@
-# Phase 9: API layer
+# Phase 11: API compatibility and hardening
 
 ## Outcome
 
 CLI, Rust library, and local OpenAI-compatible HTTP requests share the same
-runtime path and accurately identify the loaded model.
+runtime path and accurately identify the loaded model after the Phase-8
+minimal server and Phase-10 scheduler are in place.
 
 ## Work
 

@@ -1,4 +1,4 @@
-# Phase 11: Recurrent working memory
+# Phase 13: Recurrent working memory
 
 ## Outcome
 

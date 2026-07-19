@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     env, fs,
-    io::Read,
+    io::{self, BufRead, Read, Write},
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -11,8 +11,14 @@ use atlas_core::{
     QuantFormat, QuantizedMatrix, read_safetensors_descriptors, read_safetensors_tensor_f32,
 };
 use atlas_metal::MetalRuntime;
-use atlas_model::{AtlasModel, validate_generation_golden};
+use atlas_model::{
+    AtlasModel,
+    executor::{AtlasExecutor, ExecutorConfig, ExecutorGeneration, ExecutorMetrics},
+    validate_generation_golden,
+};
 use serde_json::Value;
+
+mod server;
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -22,15 +28,246 @@ fn main() -> Result<()> {
             fixture_verify(&args[2..])
         }
         Some("generate") => generate(&args[1..]),
+        Some("chat") => chat(&args[1..]),
+        Some("serve") => serve(&args[1..]),
         Some("phase_03_model") => phase_03_model(&args[1..]),
         Some("phase_05_quant") => phase_05_quant(&args[1..]),
         _ => {
             eprintln!(
-                "usage: atlas-cli metal-info | atlas-cli fixture verify --model small [--model-dir PATH] | atlas-cli generate --model small --prompt TEXT --max-new-tokens N --greedy [--golden PATH] | atlas-cli phase_03_model --model larger [--model-dir PATH] | atlas-cli phase_05_quant --model small --format fp16|int8|q4 [--tensor NAME]"
+                "usage: atlas-cli chat --model small [--prompt TEXT] [--max-tokens N] | atlas-cli serve --model small [--host 127.0.0.1] [--port 8080] | atlas-cli metal-info | atlas-cli fixture verify --model small [--model-dir PATH] | atlas-cli generate --model small --prompt TEXT --max-new-tokens N --greedy [--golden PATH] | atlas-cli phase_03_model --model larger [--model-dir PATH] | atlas-cli phase_05_quant --model small --format fp16|int8|q4 [--tensor NAME]"
             );
             bail!("invalid command")
         }
     }
+}
+
+pub(crate) fn generate_completion(
+    model: &AtlasModel,
+    prompt: &str,
+    max_tokens: usize,
+) -> Result<ExecutorGeneration> {
+    AtlasExecutor::new(model, ExecutorConfig::default())?.generate_greedy(prompt, max_tokens)
+}
+
+fn chat(args: &[String]) -> Result<()> {
+    let (model_args, prompt, max_tokens) = parse_chat_args(args)?;
+    let (_, directory) = model_dir(&model_args)?;
+    let model = AtlasModel::load(directory)?;
+    if let Some(prompt) = prompt {
+        print_completion(&model, &prompt, max_tokens)?;
+        return Ok(());
+    }
+    eprintln!("Atlas chat. Commands: /reset, /help, /quit");
+    let stdin = io::stdin();
+    let mut history = String::new();
+    loop {
+        print!("you> ");
+        io::stdout().flush()?;
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line)? == 0 {
+            break;
+        }
+        match repl_command(line.trim()) {
+            ReplCommand::Quit => break,
+            ReplCommand::Help => {
+                println!("/reset clears the conversation; /quit exits");
+                continue;
+            }
+            ReplCommand::Reset => {
+                history.clear();
+                println!("conversation reset");
+                continue;
+            }
+            ReplCommand::Ignore => continue,
+            ReplCommand::Prompt(line) => {
+                append_user_turn(&mut history, line);
+            }
+        }
+        let result = print_completion(&model, &history, max_tokens)?;
+        history.push_str(&model.decode(&result.generation.generated_token_ids)?);
+        history.push('\n');
+    }
+    Ok(())
+}
+
+fn print_completion(
+    model: &AtlasModel,
+    prompt: &str,
+    max_tokens: usize,
+) -> Result<ExecutorGeneration> {
+    let result = generate_completion(model, prompt, max_tokens)?;
+    println!("{}", model.decode(&result.generation.generated_token_ids)?);
+    eprintln!("{}", metrics_line(&result.metrics));
+    Ok(result)
+}
+
+fn parse_chat_args(args: &[String]) -> Result<(Vec<String>, Option<String>, usize)> {
+    let mut model_args = Vec::new();
+    let mut prompt = None;
+    let mut max_tokens = 64;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--model" | "--model-dir" => {
+                model_args.push(args[index].clone());
+                index += 1;
+                model_args.push(
+                    args.get(index)
+                        .context("model option needs a value")?
+                        .clone(),
+                );
+            }
+            "--prompt" => {
+                index += 1;
+                prompt = Some(args.get(index).context("--prompt needs a value")?.clone());
+            }
+            "--max-tokens" => {
+                index += 1;
+                max_tokens = args
+                    .get(index)
+                    .context("--max-tokens needs a value")?
+                    .parse()
+                    .context("parse --max-tokens")?;
+                ensure!(max_tokens > 0, "--max-tokens must be positive");
+            }
+            flag => bail!("unknown chat option: {flag}"),
+        };
+        index += 1;
+    }
+    Ok((model_args, prompt, max_tokens))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReplCommand<'a> {
+    Quit,
+    Help,
+    Reset,
+    Ignore,
+    Prompt(&'a str),
+}
+
+fn repl_command(line: &str) -> ReplCommand<'_> {
+    match line {
+        "/quit" => ReplCommand::Quit,
+        "/help" => ReplCommand::Help,
+        "/reset" => ReplCommand::Reset,
+        "" => ReplCommand::Ignore,
+        line => ReplCommand::Prompt(line),
+    }
+}
+
+fn append_user_turn(history: &mut String, line: &str) {
+    history.push_str("user: ");
+    history.push_str(line);
+    history.push('\n');
+    history.push_str("assistant: ");
+}
+
+fn metrics_line(metrics: &ExecutorMetrics) -> String {
+    format!(
+        "ttft_ms={:.2} prefill_tok_s={:.2} decode_tok_s={:.2}",
+        metrics.ttft.as_secs_f64() * 1000.0,
+        metrics.prefill_tokens_per_second(),
+        metrics.decode_tokens_per_second()
+    )
+}
+
+#[cfg(test)]
+mod phase_07_tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn chat_arguments_parse_one_shot_and_reject_zero_max_tokens() {
+        let (model, prompt, max) = parse_chat_args(&[
+            "--model".into(),
+            "small".into(),
+            "--prompt".into(),
+            "hello".into(),
+            "--max-tokens".into(),
+            "7".into(),
+        ])
+        .unwrap();
+        assert_eq!(model, ["--model", "small"]);
+        assert_eq!(prompt.as_deref(), Some("hello"));
+        assert_eq!(max, 7);
+        assert!(
+            parse_chat_args(&[
+                "--model".into(),
+                "small".into(),
+                "--max-tokens".into(),
+                "0".into()
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn repl_commands_preserve_or_clear_history_as_required() {
+        let mut history = String::new();
+        assert_eq!(repl_command(""), ReplCommand::Ignore);
+        assert_eq!(repl_command("/help"), ReplCommand::Help);
+        append_user_turn(&mut history, "hello");
+        let one_shot_prompt = history.clone();
+        assert_eq!(one_shot_prompt, "user: hello\nassistant: ");
+        assert_eq!(repl_command("/reset"), ReplCommand::Reset);
+        history.clear();
+        assert!(history.is_empty());
+        assert_eq!(repl_command("/quit"), ReplCommand::Quit);
+    }
+
+    #[test]
+    fn phase_07_metrics_include_all_reported_rates() {
+        let metrics = ExecutorMetrics {
+            ttft: Duration::from_millis(12),
+            prefill: Duration::from_millis(10),
+            prefill_tokens: 5,
+            decode: Duration::from_millis(20),
+            decode_tokens: 4,
+            ..Default::default()
+        };
+        let line = metrics_line(&metrics);
+        assert!(line.contains("ttft_ms=12.00"));
+        assert!(line.contains("prefill_tok_s=500.00"));
+        assert!(line.contains("decode_tok_s=200.00"));
+    }
+}
+
+fn serve(args: &[String]) -> Result<()> {
+    let mut host = "127.0.0.1".to_owned();
+    let mut port = 8080u16;
+    let mut filtered = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--host" => {
+                index += 1;
+                host = args.get(index).context("--host needs a value")?.clone();
+            }
+            "--port" => {
+                index += 1;
+                port = args
+                    .get(index)
+                    .context("--port needs a value")?
+                    .parse()
+                    .context("parse --port")?;
+            }
+            "--model" | "--model-dir" => {
+                filtered.push(args[index].clone());
+                index += 1;
+                filtered.push(
+                    args.get(index)
+                        .context("model option needs a value")?
+                        .clone(),
+                );
+            }
+            flag => bail!("unknown serve option: {flag}"),
+        };
+        index += 1;
+    }
+    let (model, directory) = model_dir(&filtered)?;
+    server::serve(&model, &directory, &host, port)
 }
 
 fn phase_05_quant(args: &[String]) -> Result<()> {

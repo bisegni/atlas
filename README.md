@@ -106,6 +106,18 @@ header without loading the model weights:
 cargo run -p atlas-cli -- fixture verify --model small
 ```
 
+Talk to the model directly (omit `--prompt` for the REPL):
+
+```zsh
+cargo run -p atlas-cli -- chat --model small --prompt 'The capital of France is' --max-tokens 32
+```
+
+Expose the same greedy runtime on loopback at `http://127.0.0.1:8080`:
+
+```zsh
+cargo run -p atlas-cli -- serve --model small
+```
+
 ## Implementation order
 
 1. Bootstrap native Metal and validate simple kernels against CPU results.
