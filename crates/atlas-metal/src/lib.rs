@@ -1,7 +1,7 @@
 //! Native Metal bootstrap for Atlas.
 //!
 //! The API intentionally owns command submission and shared buffers in one
-//! small place. Higher-level tensor code is introduced in Phase 1.
+//! small place. Phase 1 adds classified pooled buffers for tensor storage.
 
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
@@ -11,12 +11,13 @@ compile_error!("atlas-metal currently supports macOS only");
 #[cfg(target_os = "macos")]
 mod macos {
     use std::{
-        collections::HashMap,
+        collections::{BTreeMap, HashMap},
         mem::size_of,
         ptr,
         time::{Duration, Instant},
     };
 
+    use atlas_core::Storage;
     use objc2::{rc::Retained, runtime::ProtocolObject};
     use objc2_foundation::NSString;
     use objc2_metal::{
@@ -61,6 +62,134 @@ mod macos {
         pub gpu_time: Option<Duration>,
     }
 
+    /// Lifetime class used by the Phase 1 Metal buffer pool.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub enum AllocationClass {
+        ModelWeights,
+        KvCache,
+        SessionState,
+        Activations,
+        Constants,
+    }
+
+    /// Per-class residency and allocation counters.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct ClassAllocationMetrics {
+        pub new_buffer_allocations: u64,
+        pub reused_buffer_leases: u64,
+        pub resident_bytes: usize,
+        pub active_bytes: usize,
+        pub peak_active_bytes: usize,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct AllocationTelemetry {
+        pub by_class: BTreeMap<AllocationClass, ClassAllocationMetrics>,
+    }
+
+    impl AllocationTelemetry {
+        pub fn class(&self, class: AllocationClass) -> ClassAllocationMetrics {
+            self.by_class.get(&class).copied().unwrap_or_default()
+        }
+    }
+
+    /// A checked-out shared Metal buffer. Return it with [`MetalBufferPool::release`].
+    pub struct PooledBuffer {
+        // Keeps the native Metal allocation alive while the lease is checked out
+        // or retained by the free list.
+        _buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+        class: AllocationClass,
+        capacity: usize,
+        allocation_id: u64,
+    }
+
+    impl PooledBuffer {
+        pub fn class(&self) -> AllocationClass {
+            self.class
+        }
+        pub fn capacity(&self) -> usize {
+            self.capacity
+        }
+        pub fn storage(&self, registry_id: u64, read_only: bool) -> Storage {
+            Storage::metal(registry_id, self.allocation_id, self.capacity, read_only)
+        }
+    }
+
+    /// Reuses shared-memory buffers while keeping model, cache, and activation
+    /// lifetimes in separate pools.
+    pub struct MetalBufferPool {
+        device: Retained<ProtocolObject<dyn MTLDevice>>,
+        registry_id: u64,
+        next_allocation_id: u64,
+        free: HashMap<(AllocationClass, usize), Vec<PooledBuffer>>,
+        telemetry: AllocationTelemetry,
+    }
+
+    impl MetalBufferPool {
+        fn new(device: Retained<ProtocolObject<dyn MTLDevice>>) -> Self {
+            let registry_id = device.registryID();
+            Self {
+                device,
+                registry_id,
+                next_allocation_id: 1,
+                free: HashMap::new(),
+                telemetry: AllocationTelemetry::default(),
+            }
+        }
+
+        pub fn checkout(
+            &mut self,
+            class: AllocationClass,
+            requested_bytes: usize,
+        ) -> Result<PooledBuffer, MetalError> {
+            let capacity = requested_bytes
+                .max(1)
+                .checked_next_power_of_two()
+                .ok_or_else(|| MetalError::InvalidInput("buffer capacity overflow".into()))?;
+            let metrics = self.telemetry.by_class.entry(class).or_default();
+            if let Some(buffer) = self.free.get_mut(&(class, capacity)).and_then(Vec::pop) {
+                metrics.reused_buffer_leases += 1;
+                metrics.active_bytes += capacity;
+                metrics.peak_active_bytes = metrics.peak_active_bytes.max(metrics.active_bytes);
+                return Ok(buffer);
+            }
+            let buffer = self
+                .device
+                .newBufferWithLength_options(capacity, MTLResourceOptions::StorageModeShared)
+                .ok_or_else(|| {
+                    MetalError::InvalidInput("Metal could not allocate a shared buffer".into())
+                })?;
+            let allocation_id = self.next_allocation_id;
+            self.next_allocation_id += 1;
+            metrics.new_buffer_allocations += 1;
+            metrics.resident_bytes += capacity;
+            metrics.active_bytes += capacity;
+            metrics.peak_active_bytes = metrics.peak_active_bytes.max(metrics.active_bytes);
+            Ok(PooledBuffer {
+                _buffer: buffer,
+                class,
+                capacity,
+                allocation_id,
+            })
+        }
+
+        pub fn release(&mut self, buffer: PooledBuffer) {
+            let metrics = self.telemetry.by_class.entry(buffer.class).or_default();
+            metrics.active_bytes = metrics.active_bytes.saturating_sub(buffer.capacity);
+            self.free
+                .entry((buffer.class, buffer.capacity))
+                .or_default()
+                .push(buffer);
+        }
+
+        pub fn telemetry(&self) -> AllocationTelemetry {
+            self.telemetry.clone()
+        }
+        pub fn registry_id(&self) -> u64 {
+            self.registry_id
+        }
+    }
+
     pub struct MetalRuntime {
         device: Retained<ProtocolObject<dyn MTLDevice>>,
         queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
@@ -85,6 +214,16 @@ mod macos {
                 "silu_f32",
                 "reduction_sum_f32",
                 "transpose_f32",
+                "vector_multiply_f32",
+                "embedding_lookup_f32",
+                "rms_norm_f32",
+                "matvec_f32",
+                "matmul_f32",
+                "rope_f32",
+                "masked_softmax_f32",
+                "attention_scores_f32",
+                "attention_values_f32",
+                "logits_process_f32",
             ] {
                 let function_name = NSString::from_str(kernel);
                 let function = library
@@ -112,6 +251,10 @@ mod macos {
 
         pub fn pipeline_count(&self) -> usize {
             self.pipelines.len()
+        }
+
+        pub fn buffer_pool(&self) -> MetalBufferPool {
+            MetalBufferPool::new(self.device.clone())
         }
 
         pub fn vector_add(
@@ -154,6 +297,401 @@ mod macos {
                 "scalar_multiply_f32",
                 &[&input_buffer, &output_buffer, &scalar_buffer, &count_buffer],
                 input.len(),
+            )?;
+            self.copy_buffer_to_slice(&output_buffer, &mut output)?;
+            Ok((output, timing))
+        }
+
+        pub fn vector_multiply(
+            &self,
+            lhs: &[f32],
+            rhs: &[f32],
+        ) -> Result<(Vec<f32>, DispatchTiming), MetalError> {
+            if lhs.len() != rhs.len() || lhs.is_empty() {
+                return Err(MetalError::InvalidInput(
+                    "multiply requires equally sized non-empty vectors".into(),
+                ));
+            }
+            let count = count_u32(lhs.len())?;
+            let mut output = vec![0.0; lhs.len()];
+            let lhs_buffer = self.buffer_from_slice(lhs)?;
+            let rhs_buffer = self.buffer_from_slice(rhs)?;
+            let output_buffer = self.buffer_from_slice(&output)?;
+            let count_buffer = self.buffer_from_slice(&[count])?;
+            let timing = self.dispatch_1d(
+                "vector_multiply_f32",
+                &[&lhs_buffer, &rhs_buffer, &output_buffer, &count_buffer],
+                lhs.len(),
+            )?;
+            self.copy_buffer_to_slice(&output_buffer, &mut output)?;
+            Ok((output, timing))
+        }
+
+        pub fn embedding_lookup(
+            &self,
+            table: &[f32],
+            vocabulary: usize,
+            hidden: usize,
+            token_ids: &[u32],
+        ) -> Result<(Vec<f32>, DispatchTiming), MetalError> {
+            require_len(table, vocabulary.checked_mul(hidden), "embedding table")?;
+            if hidden == 0
+                || token_ids.is_empty()
+                || token_ids.iter().any(|&token| token as usize >= vocabulary)
+            {
+                return Err(MetalError::InvalidInput(
+                    "embedding dimensions or token IDs are invalid".into(),
+                ));
+            }
+            let total = token_ids.len().checked_mul(hidden).ok_or_else(|| {
+                MetalError::InvalidInput("embedding output length overflow".into())
+            })?;
+            let mut output = vec![0.0; total];
+            let table_buffer = self.buffer_from_slice(table)?;
+            let ids_buffer = self.buffer_from_slice(token_ids)?;
+            let output_buffer = self.buffer_from_slice(&output)?;
+            let vocabulary_buffer = self.buffer_from_slice(&[count_u32(vocabulary)?])?;
+            let hidden_buffer = self.buffer_from_slice(&[count_u32(hidden)?])?;
+            let tokens_buffer = self.buffer_from_slice(&[count_u32(token_ids.len())?])?;
+            let timing = self.dispatch_1d(
+                "embedding_lookup_f32",
+                &[
+                    &table_buffer,
+                    &ids_buffer,
+                    &output_buffer,
+                    &vocabulary_buffer,
+                    &hidden_buffer,
+                    &tokens_buffer,
+                ],
+                total,
+            )?;
+            self.copy_buffer_to_slice(&output_buffer, &mut output)?;
+            Ok((output, timing))
+        }
+
+        pub fn rms_norm(
+            &self,
+            input: &[f32],
+            rows: usize,
+            hidden: usize,
+            weight: &[f32],
+            epsilon: f32,
+        ) -> Result<(Vec<f32>, DispatchTiming), MetalError> {
+            let elements = checked_product(rows, hidden, "RMSNorm dimensions")?;
+            require_len(input, Some(elements), "RMSNorm input")?;
+            require_len(weight, Some(hidden), "RMSNorm weight")?;
+            if rows == 0 || hidden == 0 || !epsilon.is_finite() || epsilon <= 0.0 {
+                return Err(MetalError::InvalidInput(
+                    "RMSNorm dimensions or epsilon are invalid".into(),
+                ));
+            }
+            let mut output = vec![0.0; elements];
+            let input_buffer = self.buffer_from_slice(input)?;
+            let weight_buffer = self.buffer_from_slice(weight)?;
+            let output_buffer = self.buffer_from_slice(&output)?;
+            let hidden_buffer = self.buffer_from_slice(&[count_u32(hidden)?])?;
+            let epsilon_buffer = self.buffer_from_slice(&[epsilon])?;
+            let timing = self.dispatch_1d(
+                "rms_norm_f32",
+                &[
+                    &input_buffer,
+                    &weight_buffer,
+                    &output_buffer,
+                    &hidden_buffer,
+                    &epsilon_buffer,
+                ],
+                rows,
+            )?;
+            self.copy_buffer_to_slice(&output_buffer, &mut output)?;
+            Ok((output, timing))
+        }
+
+        pub fn matvec(
+            &self,
+            input: &[f32],
+            weights: &[f32],
+            input_width: usize,
+            output_width: usize,
+        ) -> Result<(Vec<f32>, DispatchTiming), MetalError> {
+            require_len(input, Some(input_width), "matvec input")?;
+            require_len(
+                weights,
+                Some(checked_product(
+                    output_width,
+                    input_width,
+                    "matvec weights",
+                )?),
+                "matvec weights",
+            )?;
+            if input_width == 0 || output_width == 0 {
+                return Err(MetalError::InvalidInput(
+                    "matvec dimensions must be non-zero".into(),
+                ));
+            }
+            let mut output = vec![0.0; output_width];
+            let input_buffer = self.buffer_from_slice(input)?;
+            let weights_buffer = self.buffer_from_slice(weights)?;
+            let output_buffer = self.buffer_from_slice(&output)?;
+            let input_width_buffer = self.buffer_from_slice(&[count_u32(input_width)?])?;
+            let output_width_buffer = self.buffer_from_slice(&[count_u32(output_width)?])?;
+            let timing = self.dispatch_1d(
+                "matvec_f32",
+                &[
+                    &input_buffer,
+                    &weights_buffer,
+                    &output_buffer,
+                    &input_width_buffer,
+                    &output_width_buffer,
+                ],
+                output_width,
+            )?;
+            self.copy_buffer_to_slice(&output_buffer, &mut output)?;
+            Ok((output, timing))
+        }
+
+        pub fn matmul(
+            &self,
+            input: &[f32],
+            weights: &[f32],
+            rows: usize,
+            input_width: usize,
+            output_width: usize,
+        ) -> Result<(Vec<f32>, DispatchTiming), MetalError> {
+            let input_elements = checked_product(rows, input_width, "matmul input")?;
+            let output_elements = checked_product(rows, output_width, "matmul output")?;
+            require_len(input, Some(input_elements), "matmul input")?;
+            require_len(
+                weights,
+                Some(checked_product(
+                    output_width,
+                    input_width,
+                    "matmul weights",
+                )?),
+                "matmul weights",
+            )?;
+            if rows == 0 || input_width == 0 || output_width == 0 {
+                return Err(MetalError::InvalidInput(
+                    "matmul dimensions must be non-zero".into(),
+                ));
+            }
+            let mut output = vec![0.0; output_elements];
+            let input_buffer = self.buffer_from_slice(input)?;
+            let weights_buffer = self.buffer_from_slice(weights)?;
+            let output_buffer = self.buffer_from_slice(&output)?;
+            let rows_buffer = self.buffer_from_slice(&[count_u32(rows)?])?;
+            let input_width_buffer = self.buffer_from_slice(&[count_u32(input_width)?])?;
+            let output_width_buffer = self.buffer_from_slice(&[count_u32(output_width)?])?;
+            let timing = self.dispatch_1d(
+                "matmul_f32",
+                &[
+                    &input_buffer,
+                    &weights_buffer,
+                    &output_buffer,
+                    &rows_buffer,
+                    &input_width_buffer,
+                    &output_width_buffer,
+                ],
+                output_elements,
+            )?;
+            self.copy_buffer_to_slice(&output_buffer, &mut output)?;
+            Ok((output, timing))
+        }
+
+        pub fn rope(
+            &self,
+            input: &[f32],
+            rows: usize,
+            hidden: usize,
+            cosine: &[f32],
+            sine: &[f32],
+        ) -> Result<(Vec<f32>, DispatchTiming), MetalError> {
+            let elements = checked_product(rows, hidden, "RoPE input")?;
+            require_len(input, Some(elements), "RoPE input")?;
+            require_len(cosine, Some(hidden / 2), "RoPE cosine")?;
+            require_len(sine, Some(hidden / 2), "RoPE sine")?;
+            if rows == 0 || hidden == 0 || hidden % 2 != 0 {
+                return Err(MetalError::InvalidInput(
+                    "RoPE hidden width must be a non-zero even number".into(),
+                ));
+            }
+            let mut output = vec![0.0; elements];
+            let input_buffer = self.buffer_from_slice(input)?;
+            let cosine_buffer = self.buffer_from_slice(cosine)?;
+            let sine_buffer = self.buffer_from_slice(sine)?;
+            let output_buffer = self.buffer_from_slice(&output)?;
+            let hidden_buffer = self.buffer_from_slice(&[count_u32(hidden)?])?;
+            let timing = self.dispatch_1d(
+                "rope_f32",
+                &[
+                    &input_buffer,
+                    &cosine_buffer,
+                    &sine_buffer,
+                    &output_buffer,
+                    &hidden_buffer,
+                ],
+                rows * (hidden / 2),
+            )?;
+            self.copy_buffer_to_slice(&output_buffer, &mut output)?;
+            Ok((output, timing))
+        }
+
+        pub fn masked_softmax(
+            &self,
+            input: &[f32],
+            mask: &[f32],
+            rows: usize,
+            columns: usize,
+        ) -> Result<(Vec<f32>, DispatchTiming), MetalError> {
+            let elements = checked_product(rows, columns, "softmax input")?;
+            require_len(input, Some(elements), "softmax input")?;
+            require_len(mask, Some(elements), "softmax mask")?;
+            if rows == 0 || columns == 0 {
+                return Err(MetalError::InvalidInput(
+                    "softmax dimensions must be non-zero".into(),
+                ));
+            }
+            let mut output = vec![0.0; elements];
+            let input_buffer = self.buffer_from_slice(input)?;
+            let mask_buffer = self.buffer_from_slice(mask)?;
+            let output_buffer = self.buffer_from_slice(&output)?;
+            let columns_buffer = self.buffer_from_slice(&[count_u32(columns)?])?;
+            let timing = self.dispatch_1d(
+                "masked_softmax_f32",
+                &[&input_buffer, &mask_buffer, &output_buffer, &columns_buffer],
+                rows,
+            )?;
+            self.copy_buffer_to_slice(&output_buffer, &mut output)?;
+            Ok((output, timing))
+        }
+
+        pub fn attention_scores(
+            &self,
+            queries: &[f32],
+            keys: &[f32],
+            query_count: usize,
+            key_count: usize,
+            head_dim: usize,
+            scale: f32,
+        ) -> Result<(Vec<f32>, DispatchTiming), MetalError> {
+            require_len(
+                queries,
+                Some(checked_product(query_count, head_dim, "query dimensions")?),
+                "queries",
+            )?;
+            require_len(
+                keys,
+                Some(checked_product(key_count, head_dim, "key dimensions")?),
+                "keys",
+            )?;
+            if query_count == 0 || key_count == 0 || head_dim == 0 || !scale.is_finite() {
+                return Err(MetalError::InvalidInput(
+                    "attention score dimensions or scale are invalid".into(),
+                ));
+            }
+            let outputs = checked_product(query_count, key_count, "attention score output")?;
+            let mut output = vec![0.0; outputs];
+            let queries_buffer = self.buffer_from_slice(queries)?;
+            let keys_buffer = self.buffer_from_slice(keys)?;
+            let output_buffer = self.buffer_from_slice(&output)?;
+            let key_count_buffer = self.buffer_from_slice(&[count_u32(key_count)?])?;
+            let head_dim_buffer = self.buffer_from_slice(&[count_u32(head_dim)?])?;
+            let scale_buffer = self.buffer_from_slice(&[scale])?;
+            let timing = self.dispatch_1d(
+                "attention_scores_f32",
+                &[
+                    &queries_buffer,
+                    &keys_buffer,
+                    &output_buffer,
+                    &key_count_buffer,
+                    &head_dim_buffer,
+                    &scale_buffer,
+                ],
+                outputs,
+            )?;
+            self.copy_buffer_to_slice(&output_buffer, &mut output)?;
+            Ok((output, timing))
+        }
+
+        pub fn attention_values(
+            &self,
+            weights: &[f32],
+            values: &[f32],
+            query_count: usize,
+            key_count: usize,
+            head_dim: usize,
+        ) -> Result<(Vec<f32>, DispatchTiming), MetalError> {
+            require_len(
+                weights,
+                Some(checked_product(
+                    query_count,
+                    key_count,
+                    "attention weights",
+                )?),
+                "attention weights",
+            )?;
+            require_len(
+                values,
+                Some(checked_product(key_count, head_dim, "attention values")?),
+                "attention values",
+            )?;
+            if query_count == 0 || key_count == 0 || head_dim == 0 {
+                return Err(MetalError::InvalidInput(
+                    "attention value dimensions must be non-zero".into(),
+                ));
+            }
+            let outputs = checked_product(query_count, head_dim, "attention output")?;
+            let mut output = vec![0.0; outputs];
+            let weights_buffer = self.buffer_from_slice(weights)?;
+            let values_buffer = self.buffer_from_slice(values)?;
+            let output_buffer = self.buffer_from_slice(&output)?;
+            let key_count_buffer = self.buffer_from_slice(&[count_u32(key_count)?])?;
+            let head_dim_buffer = self.buffer_from_slice(&[count_u32(head_dim)?])?;
+            let timing = self.dispatch_1d(
+                "attention_values_f32",
+                &[
+                    &weights_buffer,
+                    &values_buffer,
+                    &output_buffer,
+                    &key_count_buffer,
+                    &head_dim_buffer,
+                ],
+                outputs,
+            )?;
+            self.copy_buffer_to_slice(&output_buffer, &mut output)?;
+            Ok((output, timing))
+        }
+
+        pub fn process_logits(
+            &self,
+            logits: &[f32],
+            bias: &[f32],
+            temperature: f32,
+        ) -> Result<(Vec<f32>, DispatchTiming), MetalError> {
+            if logits.is_empty()
+                || logits.len() != bias.len()
+                || !temperature.is_finite()
+                || temperature <= 0.0
+            {
+                return Err(MetalError::InvalidInput(
+                    "logits, bias, or temperature are invalid".into(),
+                ));
+            }
+            let mut output = vec![0.0; logits.len()];
+            let logits_buffer = self.buffer_from_slice(logits)?;
+            let bias_buffer = self.buffer_from_slice(bias)?;
+            let output_buffer = self.buffer_from_slice(&output)?;
+            let temperature_buffer = self.buffer_from_slice(&[temperature])?;
+            let count_buffer = self.buffer_from_slice(&[count_u32(logits.len())?])?;
+            let timing = self.dispatch_1d(
+                "logits_process_f32",
+                &[
+                    &logits_buffer,
+                    &bias_buffer,
+                    &output_buffer,
+                    &temperature_buffer,
+                    &count_buffer,
+                ],
+                logits.len(),
             )?;
             self.copy_buffer_to_slice(&output_buffer, &mut output)?;
             Ok((output, timing))
@@ -370,6 +908,27 @@ mod macos {
 
     fn count_u32(count: usize) -> Result<u32, MetalError> {
         u32::try_from(count).map_err(|_| MetalError::InvalidInput("input is too large".into()))
+    }
+
+    fn checked_product(left: usize, right: usize, label: &str) -> Result<usize, MetalError> {
+        left.checked_mul(right)
+            .ok_or_else(|| MetalError::InvalidInput(format!("{label} overflow")))
+    }
+
+    fn require_len<T>(
+        values: &[T],
+        expected: Option<usize>,
+        label: &str,
+    ) -> Result<(), MetalError> {
+        let expected =
+            expected.ok_or_else(|| MetalError::InvalidInput(format!("{label} length overflow")))?;
+        if values.len() != expected {
+            return Err(MetalError::InvalidInput(format!(
+                "{label} has length {}, expected {expected}",
+                values.len()
+            )));
+        }
+        Ok(())
     }
 }
 

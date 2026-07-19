@@ -10,7 +10,11 @@ fn bootstrap_kernels_match_cpu_references_and_pipelines_are_cached() {
         }
         Err(error) => panic!("Metal runtime should initialize: {error}"),
     };
-    assert_eq!(runtime.pipeline_count(), 5);
+    let cached_pipeline_count = runtime.pipeline_count();
+    assert!(
+        cached_pipeline_count >= 5,
+        "the five Phase 0 bootstrap kernels must be cached"
+    );
 
     let lhs: Vec<f32> = (0..1024).map(|value| value as f32 * 0.25).collect();
     let rhs: Vec<f32> = (0..1024).map(|value| -(value as f32) * 0.125).collect();
@@ -54,5 +58,5 @@ fn bootstrap_kernels_match_cpu_references_and_pipelines_are_cached() {
             lhs.iter().zip(&rhs).map(|(a, b)| a + b).collect::<Vec<_>>()
         );
     }
-    assert_eq!(runtime.pipeline_count(), 5);
+    assert_eq!(runtime.pipeline_count(), cached_pipeline_count);
 }

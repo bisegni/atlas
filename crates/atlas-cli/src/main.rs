@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use atlas_metal::MetalRuntime;
+use atlas_model::{AtlasModel, validate_generation_golden};
 use serde_json::Value;
 
 fn main() -> Result<()> {
@@ -16,13 +17,130 @@ fn main() -> Result<()> {
         Some("fixture") if args.get(1).map(String::as_str) == Some("verify") => {
             fixture_verify(&args[2..])
         }
+        Some("generate") => generate(&args[1..]),
+        Some("phase_03_model") => phase_03_model(&args[1..]),
         _ => {
             eprintln!(
-                "usage: atlas-cli metal-info | atlas-cli fixture verify --model small [--model-dir PATH]"
+                "usage: atlas-cli metal-info | atlas-cli fixture verify --model small [--model-dir PATH] | atlas-cli generate --model small --prompt TEXT --max-new-tokens N --greedy [--golden PATH] | atlas-cli phase_03_model --model larger [--model-dir PATH]"
             );
             bail!("invalid command")
         }
     }
+}
+
+fn model_dir(args: &[String]) -> Result<(String, PathBuf)> {
+    let mut model = None;
+    let mut directory = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--model" => {
+                index += 1;
+                model = args.get(index).cloned();
+            }
+            "--model-dir" => {
+                index += 1;
+                directory = args.get(index).map(PathBuf::from);
+            }
+            flag => bail!("unknown model option: {flag}"),
+        }
+        index += 1;
+    }
+    let model = model.context("--model is required")?;
+    let default = match model.as_str() {
+        "small" => "models/hf/SmolLM2-135M-Instruct",
+        "larger" => "models/hf/SmolLM2-1.7B-Instruct",
+        _ => bail!("model must be `small` or `larger`"),
+    };
+    Ok((model, directory.unwrap_or_else(|| PathBuf::from(default))))
+}
+
+fn generate(args: &[String]) -> Result<()> {
+    let mut model_args = Vec::new();
+    let mut prompt = None;
+    let mut max_new_tokens = None;
+    let mut greedy = false;
+    let mut golden = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--prompt" => {
+                index += 1;
+                prompt = args.get(index).cloned();
+            }
+            "--max-new-tokens" => {
+                index += 1;
+                max_new_tokens = args
+                    .get(index)
+                    .context("--max-new-tokens needs a value")?
+                    .parse::<usize>()
+                    .context("parse --max-new-tokens")
+                    .map(Some)?;
+            }
+            "--greedy" => greedy = true,
+            "--golden" => {
+                index += 1;
+                golden = Some(PathBuf::from(
+                    args.get(index).context("--golden needs a value")?,
+                ));
+            }
+            "--model" | "--model-dir" => {
+                model_args.push(args[index].clone());
+                index += 1;
+                model_args.push(
+                    args.get(index)
+                        .context("model option needs a value")?
+                        .clone(),
+                );
+            }
+            flag => bail!("unknown generate option: {flag}"),
+        }
+        index += 1;
+    }
+    if !greedy {
+        bail!("Phase 3 supports only --greedy");
+    }
+    let (_, directory) = model_dir(&model_args)?;
+    let generation = AtlasModel::load(&directory)?.generate_greedy(
+        &prompt.context("--prompt is required")?,
+        max_new_tokens.context("--max-new-tokens is required")?,
+    )?;
+    if let Some(golden) = golden {
+        validate_generation_golden(golden, &generation)?;
+    }
+    println!("prompt_token_ids: {:?}", generation.prompt_token_ids);
+    println!("generated_token_ids: {:?}", generation.generated_token_ids);
+    println!("text: {}", generation.text);
+    for entry in generation.trace.entries {
+        println!(
+            "trace {} len={} max_abs={:.7}",
+            entry.name, entry.len, entry.max_abs
+        );
+    }
+    Ok(())
+}
+
+fn phase_03_model(args: &[String]) -> Result<()> {
+    let (model, directory) = model_dir(args)?;
+    let engine = AtlasModel::load(&directory)?;
+    let tokens = engine.tokenize("The capital of France is")?;
+    let mut trace = atlas_model::LayerTrace::default();
+    let layers = if model == "larger" {
+        1
+    } else {
+        engine.config.num_hidden_layers
+    };
+    let output = engine.forward(&tokens, &mut trace, layers)?;
+    println!("fixture: {}", engine.root().display());
+    println!("layers_executed: {layers}");
+    println!("output_elements: {}", output.len());
+    for entry in trace.entries {
+        println!(
+            "layer_trace {} len={} max_abs={:.7}",
+            entry.name, entry.len, entry.max_abs
+        );
+    }
+    Ok(())
 }
 
 fn metal_info() -> Result<()> {

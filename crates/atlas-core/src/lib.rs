@@ -1,4 +1,14 @@
-//! Backend-neutral primitives shared by Atlas crates.
+//! Backend-neutral tensor metadata and SafeTensors descriptors for Atlas.
+
+mod safetensors;
+mod tensor;
+
+pub use safetensors::{
+    SafeTensorDescriptor, read_safetensors_descriptors, read_safetensors_tensor_f32,
+};
+pub use tensor::{
+    DType, Device, Shape, Storage, Strides, Tensor, f16_bits_to_f32, f32_to_f16_bits,
+};
 
 use thiserror::Error;
 
@@ -7,4 +17,10 @@ use thiserror::Error;
 pub enum CoreError {
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    #[error("invalid tensor shape: {0}")]
+    InvalidShape(String),
+    #[error("invalid tensor layout: {0}")]
+    InvalidLayout(String),
+    #[error("unsupported tensor dtype: {0}")]
+    UnsupportedDType(String),
 }

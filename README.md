@@ -17,10 +17,13 @@ of the first MVP.
 
 ## Current status
 
-Phase 0 is implemented: the workspace initializes native Metal, compiles the
-bootstrap kernels at runtime, caches their compute pipelines, validates GPU
-vector addition against the CPU, and provides Metal and model-fixture CLI
-checks. The model fixture itself is not downloaded or committed.
+Phases 0–2 are implemented: the workspace initializes native Metal,
+compiles bootstrap kernels at runtime, caches compute pipelines, validates GPU
+results against CPU references, and provides Metal/model-fixture CLI checks.
+Atlas also has validated tensor metadata, FP16 conversion, SafeTensors weight
+descriptors, classified pooled Metal allocations with telemetry, and a
+correctness-first FP32 neural operator suite with distinct prefill/decode
+projection paths. Model fixtures remain ignored by Git.
 
 ## Plan structure
 
