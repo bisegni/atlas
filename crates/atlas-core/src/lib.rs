@@ -1,9 +1,14 @@
 //! Backend-neutral tensor metadata and SafeTensors descriptors for Atlas.
 
+mod gguf;
 mod quant;
 mod safetensors;
 mod tensor;
 
+pub use gguf::{
+    GGML_QK, GGUF_ALIGNMENT, GGUF_VERSION, GgufModel, GgufTensor, GgufTensorType, GgufWriter,
+    dequantize_block, quantize_q4_0, quantize_q8_0,
+};
 pub use quant::{QuantFormat, QuantizedMatrix};
 pub use safetensors::{
     SafeTensorDescriptor, read_safetensors_descriptors, read_safetensors_tensor_f32,

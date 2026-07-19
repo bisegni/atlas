@@ -15,8 +15,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use anyhow::{Context, Result, ensure};
-use atlas_core::read_safetensors_tensor_f32;
+use anyhow::{Context, Result, bail, ensure};
+use atlas_core::{GgufModel, GgufTensorType, read_safetensors_tensor_f32};
 use atlas_metal::GpuBuffer;
 use atlas_ops::{ExecutionMode, NeuralOps};
 use serde_json::Value;
@@ -133,7 +133,7 @@ pub struct AtlasModel {
     root: PathBuf,
     pub config: ModelConfig,
     tokenizer: Tokenizer,
-    weights: HashMap<String, PathBuf>,
+    weights: HashMap<String, WeightSource>,
     weight_cache: Mutex<HashMap<String, Arc<Vec<f32>>>>,
     // Immutable buffers are deliberately owned by the model, rather than an
     // individual request.  Session executors only own mutable KV/activation
@@ -145,7 +145,18 @@ pub struct AtlasModel {
 #[derive(Default)]
 struct ResidentWeights {
     buffers: HashMap<String, GpuBuffer>,
+    formats: HashMap<String, Option<GgufTensorType>>,
     uploaded_bytes: u64,
+}
+
+#[derive(Clone)]
+enum WeightSource {
+    SafeTensor(PathBuf),
+    GgufF32(Vec<u8>),
+    GgufPacked {
+        bytes: Vec<u8>,
+        format: GgufTensorType,
+    },
 }
 
 impl AtlasModel {
@@ -154,7 +165,11 @@ impl AtlasModel {
         let config = ModelConfig::from_path(root.join("config.json"))?;
         let tokenizer = Tokenizer::from_file(root.join("tokenizer.json"))
             .map_err(|error| anyhow::anyhow!("load tokenizer.json: {error}"))?;
-        let weights = weight_map(&root)?;
+        let weights = if root.join("model.gguf").is_file() {
+            gguf_weight_map(&root)?
+        } else {
+            weight_map(&root)?
+        };
         let ops = NeuralOps::new().context("initialize Metal execution")?;
         Ok(Self {
             root,
@@ -495,11 +510,20 @@ impl AtlasModel {
         {
             return Ok(weight);
         }
-        let path = self
+        let source = self
             .weights
             .get(name)
             .with_context(|| format!("model lacks required tensor `{name}`"))?;
-        let weight = Arc::new(read_safetensors_tensor_f32(path, name)?);
+        let weight = Arc::new(match source {
+            WeightSource::SafeTensor(path) => read_safetensors_tensor_f32(path, name)?,
+            WeightSource::GgufF32(bytes) => bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("f32 chunk")))
+                .collect(),
+            WeightSource::GgufPacked { .. } => bail!(
+                "packed GGUF tensor `{name}` cannot run through the reference executor; use Resident"
+            ),
+        });
         self.weight_cache
             .lock()
             .expect("weight cache lock")
@@ -524,14 +548,22 @@ impl AtlasModel {
         if missing > 0 {
             eprintln!("atlas: uploading {missing} model tensors to Metal");
         }
-        for name in self.weights.keys() {
+        for (name, source) in &self.weights {
             if resident.buffers.contains_key(name) {
                 continue;
             }
-            let values = self.weight(name)?;
-            let buffer = self.ops.runtime().upload_f32(&values)?;
+            let (buffer, format) = match source {
+                WeightSource::SafeTensor(_) | WeightSource::GgufF32(_) => {
+                    let values = self.weight(name)?;
+                    (self.ops.runtime().upload_f32(&values)?, None)
+                }
+                WeightSource::GgufPacked { bytes, format } => {
+                    (self.ops.runtime().upload_bytes(bytes)?, Some(*format))
+                }
+            };
             uploaded = uploaded.saturating_add(buffer.bytes() as u64);
             resident.buffers.insert(name.clone(), buffer);
+            resident.formats.insert(name.clone(), format);
         }
         resident.uploaded_bytes = resident.uploaded_bytes.saturating_add(uploaded);
         Ok(uploaded)
@@ -543,6 +575,30 @@ impl AtlasModel {
             .expect("resident weight lock")
             .buffers
             .clone()
+    }
+
+    pub(crate) fn resident_weight_format(&self, name: &str) -> Option<GgufTensorType> {
+        self.resident_weights
+            .lock()
+            .expect("resident weight lock")
+            .formats
+            .get(name)
+            .copied()
+            .flatten()
+    }
+
+    pub(crate) fn is_gguf(&self) -> bool {
+        self.weights
+            .values()
+            .any(|source| !matches!(source, WeightSource::SafeTensor(_)))
+    }
+
+    pub fn format_name(&self) -> &'static str {
+        if self.is_gguf() {
+            "gguf-packed"
+        } else {
+            "safetensors-fp32"
+        }
     }
 }
 
@@ -597,7 +653,7 @@ pub fn validate_generation_golden(path: impl AsRef<Path>, generation: &Generatio
     }
     Ok(())
 }
-fn weight_map(root: &Path) -> Result<HashMap<String, PathBuf>> {
+fn weight_map(root: &Path) -> Result<HashMap<String, WeightSource>> {
     let index = root.join("model.safetensors.index.json");
     if index.exists() {
         let v: Value = serde_json::from_slice(&fs::read(&index)?)?;
@@ -608,7 +664,9 @@ fn weight_map(root: &Path) -> Result<HashMap<String, PathBuf>> {
             .map(|(name, shard)| {
                 Ok((
                     name.clone(),
-                    root.join(shard.as_str().context("weight_map shard is not a string")?),
+                    WeightSource::SafeTensor(
+                        root.join(shard.as_str().context("weight_map shard is not a string")?),
+                    ),
                 ))
             })
             .collect();
@@ -622,8 +680,67 @@ fn weight_map(root: &Path) -> Result<HashMap<String, PathBuf>> {
     let descriptors = atlas_core::read_safetensors_descriptors(&file)?;
     Ok(descriptors
         .into_iter()
-        .map(|d| (d.name, file.clone()))
+        .map(|d| (d.name, WeightSource::SafeTensor(file.clone())))
         .collect())
+}
+
+fn gguf_name_to_atlas(name: &str) -> Result<String> {
+    if name == "token_embd.weight" {
+        return Ok("model.embed_tokens.weight".into());
+    }
+    if name == "output_norm.weight" {
+        return Ok("model.norm.weight".into());
+    }
+    if name == "output.weight" {
+        return Ok("lm_head.weight".into());
+    }
+    let rest = name
+        .strip_prefix("blk.")
+        .context("unsupported GGUF tensor name")?;
+    let (layer, tail) = rest.split_once('.').context("invalid GGUF block tensor")?;
+    let tail = match tail {
+        "attn_norm.weight" => "input_layernorm.weight",
+        "ffn_norm.weight" => "post_attention_layernorm.weight",
+        "attn_q.weight" => "self_attn.q_proj.weight",
+        "attn_k.weight" => "self_attn.k_proj.weight",
+        "attn_v.weight" => "self_attn.v_proj.weight",
+        "attn_output.weight" => "self_attn.o_proj.weight",
+        "ffn_gate.weight" => "mlp.gate_proj.weight",
+        "ffn_up.weight" => "mlp.up_proj.weight",
+        "ffn_down.weight" => "mlp.down_proj.weight",
+        _ => bail!("unsupported GGUF tensor `{name}`"),
+    };
+    Ok(format!("model.layers.{layer}.{tail}"))
+}
+
+fn gguf_weight_map(root: &Path) -> Result<HashMap<String, WeightSource>> {
+    let model = GgufModel::open(root.join("model.gguf"))?;
+    ensure!(
+        model
+            .metadata
+            .get("general.architecture")
+            .map(String::as_str)
+            == Some("llama"),
+        "GGUF architecture is not Llama"
+    );
+    let mut weights = HashMap::new();
+    for tensor in &model.tensors {
+        let name = gguf_name_to_atlas(&tensor.name)?;
+        let bytes = model.tensor_data(tensor)?.to_vec();
+        let source = match tensor.tensor_type {
+            GgufTensorType::F32 => WeightSource::GgufF32(bytes),
+            GgufTensorType::Q4_0 | GgufTensorType::Q8_0 => WeightSource::GgufPacked {
+                bytes,
+                format: tensor.tensor_type,
+            },
+            GgufTensorType::F16 => bail!(
+                "GGUF F16 tensor `{}` is not supported by Atlas Phase 11a",
+                tensor.name
+            ),
+        };
+        weights.insert(name, source);
+    }
+    Ok(weights)
 }
 fn argmax(values: &[f32]) -> usize {
     values

@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use atlas_core::QuantFormat;
+use atlas_core::{GgufTensorType, QuantFormat};
 use atlas_metal::GpuBuffer;
 
 use crate::kv_cache::{ContiguousKvCache, KvCacheConfig, LayerKv, SessionId};
@@ -180,7 +180,7 @@ impl Default for ExecutorConfig {
             session: SessionId(0),
             max_context: 1024,
             quant_format: QuantFormat::Fp16,
-            mode: ExecutorMode::Reference,
+            mode: ExecutorMode::Resident,
             logits_readback: LogitsReadback::SelectedToken,
         }
     }
@@ -884,7 +884,7 @@ impl ResidentExecutor {
         let mut command = runtime.begin_resident_command()?;
         let embed = self.weight("model.embed_tokens.weight")?;
         command.dispatch_1d(
-            "embedding_lookup_f32",
+            resident_embedding_kernel(model, "model.embed_tokens.weight")?,
             &[
                 embed,
                 &self.token,
@@ -913,11 +913,12 @@ impl ResidentExecutor {
                 ("k_proj", &self.k, &self.kv_width, kv_width),
                 ("v_proj", &self.v, &self.kv_width, kv_width),
             ] {
+                let weight_name = format!("{p}.self_attn.{name}.weight");
                 command.dispatch_1d(
-                    "matvec_f32",
+                    resident_matvec_kernel(model, &weight_name)?,
                     &[
                         &self.norm,
-                        self.weight(&format!("{p}.self_attn.{name}.weight"))?,
+                        self.weight(&weight_name)?,
                         output,
                         &self.hidden,
                         width_buffer,
@@ -1024,11 +1025,12 @@ impl ResidentExecutor {
                 ],
                 model.config.hidden_size,
             )?;
+            let attention_output_name = format!("{p}.self_attn.o_proj.weight");
             command.dispatch_1d(
-                "matvec_f32",
+                resident_matvec_kernel(model, &attention_output_name)?,
                 &[
                     &self.attention,
-                    self.weight(&format!("{p}.self_attn.o_proj.weight"))?,
+                    self.weight(&attention_output_name)?,
                     &self.work,
                     &self.hidden,
                     &self.hidden,
@@ -1051,22 +1053,24 @@ impl ResidentExecutor {
                 ],
                 1,
             )?;
+            let gate_name = format!("{p}.mlp.gate_proj.weight");
             command.dispatch_1d(
-                "matvec_f32",
+                resident_matvec_kernel(model, &gate_name)?,
                 &[
                     &self.norm,
-                    self.weight(&format!("{p}.mlp.gate_proj.weight"))?,
+                    self.weight(&gate_name)?,
                     &self.gate,
                     &self.hidden,
                     &self.intermediate,
                 ],
                 model.config.intermediate_size,
             )?;
+            let up_name = format!("{p}.mlp.up_proj.weight");
             command.dispatch_1d(
-                "matvec_f32",
+                resident_matvec_kernel(model, &up_name)?,
                 &[
                     &self.norm,
-                    self.weight(&format!("{p}.mlp.up_proj.weight"))?,
+                    self.weight(&up_name)?,
                     &self.up,
                     &self.hidden,
                     &self.intermediate,
@@ -1083,11 +1087,12 @@ impl ResidentExecutor {
                 &[&self.activated, &self.up, &self.product, &self.intermediate],
                 model.config.intermediate_size,
             )?;
+            let down_name = format!("{p}.mlp.down_proj.weight");
             command.dispatch_1d(
-                "matvec_f32",
+                resident_matvec_kernel(model, &down_name)?,
                 &[
                     &self.product,
-                    self.weight(&format!("{p}.mlp.down_proj.weight"))?,
+                    self.weight(&down_name)?,
                     &self.work,
                     &self.intermediate,
                     &self.hidden,
@@ -1116,8 +1121,13 @@ impl ResidentExecutor {
         } else {
             self.weight("lm_head.weight")?
         };
+        let lm_head_name = if model.config.tie_word_embeddings {
+            "model.embed_tokens.weight"
+        } else {
+            "lm_head.weight"
+        };
         command.dispatch_1d(
-            "matvec_f32",
+            resident_matvec_kernel(model, lm_head_name)?,
             &[&self.norm, lm_head, &self.logits, &self.hidden, &self.vocab],
             model.config.vocab_size,
         )?;
@@ -1142,6 +1152,24 @@ impl ResidentExecutor {
 struct TokenStep {
     selected: u32,
     logits: Vec<f32>,
+}
+
+fn resident_matvec_kernel(model: &AtlasModel, name: &str) -> Result<&'static str> {
+    Ok(match model.resident_weight_format(name) {
+        None => "matvec_f32",
+        Some(GgufTensorType::Q4_0) => "matvec_q4_0",
+        Some(GgufTensorType::Q8_0) => "matvec_q8_0",
+        Some(other) => anyhow::bail!("unsupported packed resident tensor format {other:?}"),
+    })
+}
+
+fn resident_embedding_kernel(model: &AtlasModel, name: &str) -> Result<&'static str> {
+    Ok(match model.resident_weight_format(name) {
+        None => "embedding_lookup_f32",
+        Some(GgufTensorType::Q4_0) => "embedding_lookup_q4_0",
+        Some(GgufTensorType::Q8_0) => "embedding_lookup_q8_0",
+        Some(other) => anyhow::bail!("unsupported packed embedding format {other:?}"),
+    })
 }
 
 impl<'a> AtlasExecutor<'a> {
@@ -1227,13 +1255,13 @@ impl<'a> AtlasExecutor<'a> {
             config.max_context > 0,
             "executor max_context must be positive"
         );
-        // The Phase-5 packing format is represented in the public plan now;
-        // this correctness-first executor continues to use the model's native
-        // tensors until packed Metal projection kernels replace the reference
-        // kernels.
         ensure!(
-            config.quant_format == QuantFormat::Fp16,
-            "packed executor projections are not available yet; use fp16"
+            !model.is_gguf() || config.mode == ExecutorMode::Resident,
+            "GGUF models require the Resident executor; Atlas will not use a reference fallback"
+        );
+        ensure!(
+            model.is_gguf() || config.quant_format == QuantFormat::Fp16,
+            "Phase-5 packed executor projections are not available; use fp16"
         );
         let cache_config = KvCacheConfig {
             layers: 1,

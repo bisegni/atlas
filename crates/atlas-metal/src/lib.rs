@@ -18,7 +18,7 @@ mod macos {
         time::{Duration, Instant},
     };
 
-    use atlas_core::Storage;
+    use atlas_core::{GgufTensorType, Storage};
     use objc2::{rc::Retained, runtime::ProtocolObject};
     use objc2_foundation::NSString;
     use objc2_metal::{
@@ -379,6 +379,12 @@ mod macos {
                 "embedding_lookup_f32",
                 "rms_norm_f32",
                 "matvec_f32",
+                "matvec_q4_0",
+                "matvec_q8_0",
+                "embedding_lookup_q4_0",
+                "embedding_lookup_q8_0",
+                "quantize_q4_0",
+                "quantize_q8_0",
                 "matvec_tiled_f32",
                 "matmul_f32",
                 "rope_f32",
@@ -439,6 +445,48 @@ mod macos {
                 _buffer: buffer,
                 bytes: values.len() * size_of::<f32>(),
             })
+        }
+
+        pub fn upload_bytes(&self, values: &[u8]) -> Result<GpuBuffer, MetalError> {
+            self.buffer_from_slice(values).map(|buffer| GpuBuffer {
+                _buffer: buffer,
+                bytes: values.len(),
+            })
+        }
+
+        /// Quantize a complete block-32 matrix into the GGUF wire layout.
+        /// The result is read back only because GGUF is a disk artifact; Atlas
+        /// inference retains the same packed bytes in a resident GPU buffer.
+        pub fn quantize_gguf(
+            &self,
+            values: &[f32],
+            format: GgufTensorType,
+        ) -> Result<(Vec<u8>, DispatchTiming), MetalError> {
+            if !values.len().is_multiple_of(32)
+                || !matches!(format, GgufTensorType::Q4_0 | GgufTensorType::Q8_0)
+            {
+                return Err(MetalError::InvalidInput(
+                    "GGUF GPU quantization requires Q4_0/Q8_0 block-32 values".into(),
+                ));
+            }
+            let input = self.buffer_from_slice(values)?;
+            let mut output = vec![0u8; format.block_bytes() * (values.len() / 32)];
+            let output_buffer = self.buffer_from_slice(&output)?;
+            let blocks = u32::try_from(values.len() / 32)
+                .map_err(|_| MetalError::InvalidInput("GGUF tensor is too large".into()))?;
+            let blocks_buffer = self.buffer_from_slice(&[blocks])?;
+            let kernel = if format == GgufTensorType::Q4_0 {
+                "quantize_q4_0"
+            } else {
+                "quantize_q8_0"
+            };
+            let timing = self.dispatch_1d(
+                kernel,
+                &[&input, &output_buffer, &blocks_buffer],
+                values.len() / 32,
+            )?;
+            self.copy_buffer_to_slice(&output_buffer, &mut output)?;
+            Ok((output, timing))
         }
 
         pub fn upload_u32(&self, values: &[u32]) -> Result<GpuBuffer, MetalError> {

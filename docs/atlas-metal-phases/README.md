@@ -21,13 +21,14 @@ cross-phase exit rules.
 | 8.3 | [Resident decode parity remediation]([done]%20phase-08c-resident-decode-parity-remediation.md) |
 | 9 | [CLI model lifecycle]([done]%20phase-09-cli-model-lifecycle.md) |
 | 10 | [Sampling engine](phase-10-sampling.md) |
-| 11 | [GGUF Q4_0/Q8_0 quantized models](phase-11-gguf-quantized-models.md) |
+| 11a | [GGUF Q4_0/Q8_0 quantized models]([done]%20phase-11a-gguf-quantized-models.md) |
+| 11b | [Runtime and scheduler](phase-11b-runtime-scheduler.md) |
+| 11c | [Model providers and Hugging Face discovery](phase-11c-model-providers.md) |
 | 12 | [Quantized CLI acceptance](phase-12-quantized-cli-acceptance.md) |
-| 13 | [Runtime and scheduler](phase-11-runtime-scheduler.md) |
-| 14 | [Atlas local attention](phase-13-local-attention.md) |
-| 15 | [Recurrent working memory](phase-14-working-memory.md) |
-| 16 | [Latent graph memory](phase-15-latent-graph-memory.md) |
-| 17 | [Graph retrieval](phase-16-graph-retrieval.md) |
-| 18 | [Memory fusion](phase-17-memory-fusion.md) |
-| 19 | [Learned memory router](phase-18-memory-router.md) |
+| 13 | [Atlas local attention](phase-13-local-attention.md) |
+| 14 | [Recurrent working memory](phase-14-working-memory.md) |
+| 15 | [Latent graph memory](phase-15-latent-graph-memory.md) |
+| 16 | [Graph retrieval](phase-16-graph-retrieval.md) |
+| 17 | [Memory fusion](phase-17-memory-fusion.md) |
+| 18 | [Learned memory router](phase-18-memory-router.md) |
 | 20 | [Local API server and hardening](phase-20-local-api-server.md) |

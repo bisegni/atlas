@@ -5,12 +5,13 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicBool, Ordering},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail, ensure};
 use atlas_core::{
-    QuantFormat, QuantizedMatrix, read_safetensors_descriptors, read_safetensors_tensor_f32,
+    GgufModel, GgufTensorType, GgufWriter, QuantFormat, QuantizedMatrix, quantize_q4_0,
+    quantize_q8_0, read_safetensors_descriptors, read_safetensors_tensor_f32,
 };
 use atlas_metal::MetalRuntime;
 use atlas_model::{
@@ -91,7 +92,7 @@ fn main() -> Result<()> {
         Some("phase_08b_decode") => phase_08b_decode(&args[1..]),
         _ => {
             eprintln!(
-                "usage: atlas-cli model inspect|verify --model ID | atlas-cli chat --model ID [--executor reference|resident] [--prompt TEXT] [--max-tokens N] | atlas-cli generate --model ID --prompt TEXT --max-new-tokens N --greedy [--golden PATH] | atlas-cli phase_08b_decode --model ID --prompt TEXT [--warmup N] [--max-new-tokens N] [--trace-logits|--trace-stages] [--trace-tolerance N]"
+                "usage: atlas-cli model inspect|verify --model ID | atlas-cli model quantize --model FP32_ID --id ID --format q4_0|q8_0 [--progress human|json|quiet] | atlas-cli model import-gguf --path FILE --id ID --config FILE --tokenizer FILE --source SOURCE --revision REVISION"
             );
             bail!("invalid command")
         }
@@ -254,10 +255,13 @@ fn print_completion(
             "event": "generation_metrics",
             "model_id": model_id,
             "executor": match mode { ExecutorMode::Reference => "reference", ExecutorMode::Resident => "resident" },
-            "format": "safetensors-fp32",
+            "format": model.format_name(),
             "token_ids": result.generation.generated_token_ids,
             "finish_reason": format!("{:?}", result.finish_reason).to_lowercase(),
             "resident_bytes": result.metrics.resident_bytes,
+            "weight_upload_bytes": result.metrics.weight_upload_bytes,
+            "readback_bytes": result.metrics.readback_bytes,
+            "command_buffers": result.metrics.command_buffer_count,
             "timing": { "ttft_ms": result.metrics.ttft.as_secs_f64() * 1000.0, "host_ms": result.metrics.host_wall_time.as_secs_f64() * 1000.0 },
             "decode_tok_s": result.metrics.decode_tokens_per_second(),
         })
@@ -277,7 +281,7 @@ fn parse_chat_args(args: &[String]) -> Result<(Vec<String>, Option<String>, usiz
     let mut model_args = Vec::new();
     let mut prompt = None;
     let mut max_tokens = 64;
-    let mut mode = ExecutorMode::Reference;
+    let mut mode = ExecutorMode::Resident;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -391,7 +395,7 @@ mod phase_07_tests {
         assert_eq!(model, ["--model", "small"]);
         assert_eq!(prompt.as_deref(), Some("hello"));
         assert_eq!(max, 7);
-        assert_eq!(mode, ExecutorMode::Reference);
+        assert_eq!(mode, ExecutorMode::Resident);
         assert!(
             parse_chat_args(&[
                 "--model".into(),
@@ -1088,13 +1092,42 @@ fn verify_manifest_model(record: &ModelRecord) -> Result<()> {
         "architecture mismatch for `{}`",
         record.id
     );
-    fixture_details(&record.path).map(|_| ())
+    if matches!(record.format.as_str(), "gguf-q4_0" | "gguf-q8_0") {
+        let gguf = GgufModel::open(record.path.join("model.gguf"))?;
+        ensure!(
+            gguf.metadata
+                .get("general.architecture")
+                .map(String::as_str)
+                == Some("llama"),
+            "GGUF architecture mismatch for `{}`",
+            record.id
+        );
+        let expected = if record.format == "gguf-q4_0" {
+            GgufTensorType::Q4_0
+        } else {
+            GgufTensorType::Q8_0
+        };
+        ensure!(
+            gguf.tensors
+                .iter()
+                .any(|tensor| tensor.tensor_type == expected),
+            "GGUF format does not contain expected packed tensors"
+        );
+        Ok(())
+    } else {
+        fixture_details(&record.path).map(|_| ())
+    }
 }
 
 fn model_command(args: &[String]) -> Result<()> {
     let command = args
         .first()
-        .context("model command requires `inspect` or `verify`")?;
+        .context("model command requires a subcommand")?;
+    match command.as_str() {
+        "quantize" => return model_quantize(&args[1..]),
+        "import-gguf" => return model_import_gguf(&args[1..]),
+        _ => {}
+    }
     let selection = resolve_model(&args[1..])?;
     let record = selection
         .manifest
@@ -1115,8 +1148,421 @@ fn model_command(args: &[String]) -> Result<()> {
                 json!({"model_id": record.id, "verified": true, "bytes": record.bytes})
             );
         }
-        _ => bail!("model command must be `inspect` or `verify`"),
+        _ => bail!("model command must be `inspect`, `verify`, `quantize`, or `import-gguf`"),
     }
+    Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProgressMode {
+    Human,
+    Json,
+    Quiet,
+}
+
+impl ProgressMode {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "human" => Ok(Self::Human),
+            "json" => Ok(Self::Json),
+            "quiet" => Ok(Self::Quiet),
+            _ => bail!("--progress must be `human`, `json`, or `quiet`"),
+        }
+    }
+}
+
+struct ConversionProgress {
+    mode: ProgressMode,
+    started: Instant,
+    total_tensors: usize,
+    total_source_bytes: u64,
+    completed_tensors: usize,
+    completed_source_bytes: u64,
+    packed_bytes: u64,
+}
+impl ConversionProgress {
+    fn new(mode: ProgressMode, total_tensors: usize, total_source_bytes: u64) -> Self {
+        Self {
+            mode,
+            started: Instant::now(),
+            total_tensors,
+            total_source_bytes,
+            completed_tensors: 0,
+            completed_source_bytes: 0,
+            packed_bytes: 0,
+        }
+    }
+    fn event(&self, stage: &str, tensor: Option<&str>) {
+        if self.mode == ProgressMode::Quiet {
+            return;
+        }
+        let elapsed = self.started.elapsed();
+        let seconds = elapsed.as_secs_f64();
+        let rate = if seconds == 0.0 {
+            0.0
+        } else {
+            self.completed_source_bytes as f64 / seconds
+        };
+        let percent = if self.total_source_bytes == 0 {
+            0.0
+        } else {
+            self.completed_source_bytes as f64 * 100.0 / self.total_source_bytes as f64
+        };
+        let eta = (rate > 0.0).then(|| {
+            Duration::from_secs_f64(
+                (self
+                    .total_source_bytes
+                    .saturating_sub(self.completed_source_bytes)) as f64
+                    / rate,
+            )
+        });
+        match self.mode {
+            ProgressMode::Json => println!(
+                "{}",
+                json!({"event":"conversion_progress","stage":stage,"tensor":tensor,"tensors_completed":self.completed_tensors,"tensors_total":self.total_tensors,"source_bytes_completed":self.completed_source_bytes,"source_bytes_total":self.total_source_bytes,"packed_bytes_written":self.packed_bytes,"percent":percent,"elapsed_ms":elapsed.as_millis(),"source_bytes_per_second":rate,"eta_ms":eta.map(|value| value.as_millis())})
+            ),
+            ProgressMode::Human => eprintln!(
+                "gguf {stage}: {}/{} tensors, {:.1}% source={} MiB packed={} MiB rate={:.2} MiB/s eta={}{}",
+                self.completed_tensors,
+                self.total_tensors,
+                percent,
+                self.completed_source_bytes / 1024 / 1024,
+                self.packed_bytes / 1024 / 1024,
+                rate / 1024.0 / 1024.0,
+                eta.map(|value| format!("{:.1}s", value.as_secs_f64()))
+                    .unwrap_or_else(|| "estimating".into()),
+                tensor
+                    .map(|name| format!(" tensor={name}"))
+                    .unwrap_or_default()
+            ),
+            ProgressMode::Quiet => {}
+        }
+    }
+}
+
+fn gguf_name(name: &str) -> Result<String> {
+    if name == "model.embed_tokens.weight" {
+        return Ok("token_embd.weight".into());
+    }
+    if name == "model.norm.weight" {
+        return Ok("output_norm.weight".into());
+    }
+    if name == "lm_head.weight" {
+        return Ok("output.weight".into());
+    }
+    let rest = name
+        .strip_prefix("model.layers.")
+        .context("unsupported non-Llama SafeTensors tensor")?;
+    let (layer, tail) = rest.split_once('.').context("invalid Llama layer tensor")?;
+    let mapped = match tail {
+        "input_layernorm.weight" => "attn_norm",
+        "post_attention_layernorm.weight" => "ffn_norm",
+        "self_attn.q_proj.weight" => "attn_q",
+        "self_attn.k_proj.weight" => "attn_k",
+        "self_attn.v_proj.weight" => "attn_v",
+        "self_attn.o_proj.weight" => "attn_output",
+        "mlp.gate_proj.weight" => "ffn_gate",
+        "mlp.up_proj.weight" => "ffn_up",
+        "mlp.down_proj.weight" => "ffn_down",
+        _ => bail!("unsupported Llama tensor `{name}`"),
+    };
+    Ok(format!("blk.{layer}.{mapped}.weight"))
+}
+
+fn model_quantize(args: &[String]) -> Result<()> {
+    let mut model_args = Vec::new();
+    let mut id = None;
+    let mut format = None;
+    let mut progress_mode = ProgressMode::Human;
+    let mut quantizer = "auto";
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--model" => {
+                index += 1;
+                model_args.extend([
+                    "--model".into(),
+                    args.get(index).context("--model needs a value")?.clone(),
+                ]);
+            }
+            "--id" => {
+                index += 1;
+                id = args.get(index).cloned();
+            }
+            "--format" => {
+                index += 1;
+                format = args.get(index).cloned();
+            }
+            "--progress" => {
+                index += 1;
+                progress_mode =
+                    ProgressMode::parse(args.get(index).context("--progress needs a value")?)?;
+            }
+            "--quantizer" => {
+                index += 1;
+                quantizer = args.get(index).context("--quantizer needs a value")?;
+                ensure!(
+                    matches!(quantizer, "auto" | "cpu" | "gpu"),
+                    "--quantizer must be `auto`, `cpu`, or `gpu`"
+                );
+            }
+            flag => bail!("unknown model quantize option: {flag}"),
+        };
+        index += 1;
+    }
+    let gpu = match quantizer {
+        "gpu" => Some(MetalRuntime::new().context("initialize Metal GPU quantizer")?),
+        "auto" => MetalRuntime::new().ok(),
+        "cpu" => None,
+        _ => unreachable!(),
+    };
+    let selected_quantizer = if gpu.is_some() { "gpu" } else { "cpu" };
+    let id = id.context("--id is required")?;
+    ensure!(
+        !id.is_empty() && !id.contains('/') && !id.contains(".."),
+        "--id must be a safe model ID"
+    );
+    let kind = match format.as_deref() {
+        Some("q4_0") => GgufTensorType::Q4_0,
+        Some("q8_0") => GgufTensorType::Q8_0,
+        _ => bail!("--format must be `q4_0` or `q8_0`"),
+    };
+    let selection = resolve_model(&model_args)?;
+    let record = selection
+        .manifest
+        .context("quantize requires a manifest-backed FP32 model")?;
+    ensure!(
+        record.format == "safetensors-fp32",
+        "quantize currently accepts `safetensors-fp32` models only"
+    );
+    verify_manifest_model(&record)?;
+    let source = record.path.join("model.safetensors");
+    ensure!(
+        source.is_file(),
+        "native GGUF conversion currently requires one unsharded model.safetensors"
+    );
+    let descriptors = read_safetensors_descriptors(&source)?;
+    let total_source_bytes = descriptors
+        .iter()
+        .map(|d| (d.data_end - d.data_start) as u64)
+        .sum();
+    let mut progress =
+        ConversionProgress::new(progress_mode, descriptors.len(), total_source_bytes);
+    progress.event("scan", None);
+    let mut writer = GgufWriter::new();
+    writer.metadata("general.name", &id);
+    writer.metadata(
+        "general.file_type",
+        if kind == GgufTensorType::Q4_0 {
+            "2"
+        } else {
+            "7"
+        },
+    );
+    let config: Value = serde_json::from_slice(&fs::read(record.path.join("config.json"))?)
+        .context("parse source config")?;
+    for (key, gguf_key) in [
+        ("hidden_size", "llama.embedding_length"),
+        ("intermediate_size", "llama.feed_forward_length"),
+        ("num_hidden_layers", "llama.block_count"),
+        ("num_attention_heads", "llama.attention.head_count"),
+        ("num_key_value_heads", "llama.attention.head_count_kv"),
+    ] {
+        if let Some(value) = config.get(key).and_then(Value::as_u64) {
+            writer.metadata(gguf_key, value.to_string());
+        }
+    }
+    for descriptor in descriptors {
+        let dims = descriptor.tensor.shape.dims();
+        let values = read_safetensors_tensor_f32(&source, &descriptor.name)?;
+        let name = gguf_name(&descriptor.name)?;
+        let (tensor_type, encoded, gguf_dims) = if dims.len() == 2 {
+            ensure!(
+                dims[1].is_multiple_of(32),
+                "matrix `{}` input width must be a multiple of 32",
+                descriptor.name
+            );
+            let encoded = if let Some(runtime) = &gpu {
+                runtime.quantize_gguf(&values, kind)?.0
+            } else if kind == GgufTensorType::Q4_0 {
+                quantize_q4_0(&values)?
+            } else {
+                quantize_q8_0(&values)?
+            };
+            (kind, encoded, vec![dims[1], dims[0]])
+        } else if dims.len() == 1 {
+            let mut bytes = Vec::with_capacity(values.len() * 4);
+            for value in values {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            (GgufTensorType::F32, bytes, dims.to_vec())
+        } else {
+            bail!(
+                "unsupported tensor rank {} for {}",
+                dims.len(),
+                descriptor.name
+            );
+        };
+        progress.packed_bytes += encoded.len() as u64;
+        writer.push_tensor(name, gguf_dims, tensor_type, encoded)?;
+        progress.completed_tensors += 1;
+        progress.completed_source_bytes += (descriptor.data_end - descriptor.data_start) as u64;
+        progress.event("quantize", Some(&descriptor.name));
+    }
+    let output_dir = Path::new("models/gguf").join(&id);
+    ensure!(
+        !output_dir.exists(),
+        "GGUF output already exists: {}",
+        output_dir.display()
+    );
+    fs::create_dir_all(&output_dir)?;
+    let result = (|| -> Result<()> {
+        fs::write(output_dir.join("model.gguf"), writer.finish()?)?;
+        fs::copy(
+            record.path.join("config.json"),
+            output_dir.join("config.json"),
+        )?;
+        fs::copy(
+            record.path.join(&record.tokenizer),
+            output_dir.join("tokenizer.json"),
+        )?;
+        progress.event("write", None);
+        register_gguf_manifest(&id, &record.source, &record.revision, &output_dir, kind)?;
+        progress.event("manifest", None);
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&output_dir);
+    }
+    result?;
+    println!(
+        "{}",
+        json!({"event":"conversion_completed","model_id":id,"format": if kind == GgufTensorType::Q4_0 { "gguf-q4_0" } else { "gguf-q8_0" },"quantizer":selected_quantizer,"elapsed_ms":progress.started.elapsed().as_millis(),"source_bytes":progress.total_source_bytes,"packed_bytes":progress.packed_bytes,"output":output_dir})
+    );
+    Ok(())
+}
+
+fn model_import_gguf(args: &[String]) -> Result<()> {
+    let mut path = None;
+    let mut id = None;
+    let mut config = None;
+    let mut tokenizer = None;
+    let mut source = None;
+    let mut revision = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = &args[index];
+        index += 1;
+        let value = args
+            .get(index)
+            .context(format!("{flag} needs a value"))?
+            .clone();
+        match flag.as_str() {
+            "--path" => path = Some(PathBuf::from(value)),
+            "--id" => id = Some(value),
+            "--config" => config = Some(PathBuf::from(value)),
+            "--tokenizer" => tokenizer = Some(PathBuf::from(value)),
+            "--source" => source = Some(value),
+            "--revision" => revision = Some(value),
+            _ => bail!("unknown model import-gguf option: {flag}"),
+        };
+        index += 1;
+    }
+    let path = path.context("--path is required")?;
+    let id = id.context("--id is required")?;
+    let config = config.context("--config is required")?;
+    let tokenizer = tokenizer.context("--tokenizer is required")?;
+    let source = source.context("--source is required")?;
+    let revision = revision.context("--revision is required")?;
+    let model = GgufModel::open(&path)?;
+    ensure!(
+        model
+            .metadata
+            .get("general.architecture")
+            .map(String::as_str)
+            == Some("llama"),
+        "GGUF is not a Llama artifact"
+    );
+    let kind = model
+        .tensors
+        .iter()
+        .find_map(|tensor| {
+            matches!(
+                tensor.tensor_type,
+                GgufTensorType::Q4_0 | GgufTensorType::Q8_0
+            )
+            .then_some(tensor.tensor_type)
+        })
+        .context("GGUF has no Q4_0/Q8_0 tensors")?;
+    ensure!(
+        model.tensors.iter().all(|tensor| matches!(
+            tensor.tensor_type,
+            GgufTensorType::Q4_0 | GgufTensorType::Q8_0 | GgufTensorType::F32 | GgufTensorType::F16
+        )),
+        "GGUF has unsupported tensor encodings"
+    );
+    let output_dir = Path::new("models/gguf").join(&id);
+    ensure!(
+        !output_dir.exists(),
+        "GGUF output already exists: {}",
+        output_dir.display()
+    );
+    fs::create_dir_all(&output_dir)?;
+    let result = (|| -> Result<()> {
+        fs::copy(&path, output_dir.join("model.gguf"))?;
+        fs::copy(config, output_dir.join("config.json"))?;
+        fs::copy(tokenizer, output_dir.join("tokenizer.json"))?;
+        register_gguf_manifest(&id, &source, &revision, &output_dir, kind)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&output_dir);
+    }
+    result?;
+    println!(
+        "{}",
+        json!({"event":"gguf_imported","model_id":id,"path":output_dir})
+    );
+    Ok(())
+}
+
+fn register_gguf_manifest(
+    id: &str,
+    source: &str,
+    revision: &str,
+    directory: &Path,
+    kind: GgufTensorType,
+) -> Result<()> {
+    let manifest = load_manifest()?;
+    ensure!(
+        !manifest.models.iter().any(|model| model.id == id),
+        "model ID `{id}` already exists"
+    );
+    let format = if kind == GgufTensorType::Q4_0 {
+        "gguf-q4_0"
+    } else {
+        "gguf-q8_0"
+    };
+    let files = ["config.json", "tokenizer.json", "model.gguf"];
+    let mut text = fs::read_to_string(MODEL_MANIFEST)?;
+    text.push_str(&format!("\n[[models]]\nid = \"{id}\"\nsource = \"{source}\"\nrevision = \"{revision}\"\npath = \"{}\"\narchitecture = \"LlamaForCausalLM\"\ntokenizer = \"tokenizer.json\"\nformat = \"{format}\"\n", directory.display()));
+    let bytes: u64 = files
+        .iter()
+        .map(|file| fs::metadata(directory.join(file)).map(|metadata| metadata.len()))
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .sum();
+    text.push_str(&format!("bytes = {bytes}\n"));
+    for file in files {
+        let path = directory.join(file);
+        text.push_str(&format!(
+            "\n[[models.files]]\npath = \"{file}\"\nbytes = {}\nsha256 = \"{}\"\n",
+            fs::metadata(&path)?.len(),
+            sha256_file(&path)?
+        ));
+    }
+    let temp = Path::new("models/manifest.toml.tmp");
+    fs::write(temp, text)?;
+    fs::rename(temp, MODEL_MANIFEST)?;
     Ok(())
 }
 

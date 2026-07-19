@@ -114,8 +114,8 @@ fn phase_08a_metrics_expose_gpu_residency_observability() {
 }
 
 #[test]
-fn phase_08b_defaults_to_reference_until_resident_parity_is_proven() {
-    assert_eq!(ExecutorConfig::default().mode, ExecutorMode::Reference);
+fn phase_11a_defaults_to_resident_for_production_inference() {
+    assert_eq!(ExecutorConfig::default().mode, ExecutorMode::Resident);
     assert_eq!(
         ExecutorConfig::default().logits_readback,
         LogitsReadback::SelectedToken

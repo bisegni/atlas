@@ -34,6 +34,8 @@ projection paths. Model fixtures remain ignored by Git.
   cross-phase exit requirements.
 - [Phase-plan index](docs/atlas-metal-phases/README.md) — one executable plan
   file for each phase from Metal bootstrap through the memory router.
+- [GGUF conversion guide](docs/atlas-gguf-conversion.md) — native Q4_0/Q8_0
+  conversion, progress telemetry, import, and verification.
 
 Every phase has a concrete outcome, implementation scope, model test fixture,
 and acceptance gate. A phase is not complete until its runnable test passes on

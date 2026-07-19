@@ -100,6 +100,72 @@ kernel void matvec_f32(
     }
 }
 
+// GGUF block-32 quantizers.  The output layout is exactly block_q4_0
+// (fp16 scale + 16 packed signed nibbles) or block_q8_0 (fp16 scale + 32 i8).
+kernel void quantize_q4_0(
+    device const float *input [[buffer(0)]], device uchar *output [[buffer(1)]],
+    constant uint &blocks [[buffer(2)]], uint block_id [[thread_position_in_grid]]) {
+    if (block_id >= blocks) return;
+    float maximum = 0.0f;
+    for (uint i = 0; i < 32; ++i) maximum = max(maximum, abs(input[block_id * 32 + i]));
+    float scale = maximum == 0.0f ? 0.0f : maximum / 7.0f;
+    device half *scale_out = (device half *)(output + block_id * 18);
+    *scale_out = half(scale);
+    for (uint i = 0; i < 16; ++i) {
+        int a = scale == 0.0f ? 0 : int(round(clamp(input[block_id * 32 + i * 2] / scale, -8.0f, 7.0f)));
+        int b = scale == 0.0f ? 0 : int(round(clamp(input[block_id * 32 + i * 2 + 1] / scale, -8.0f, 7.0f)));
+        output[block_id * 18 + 2 + i] = uchar((a + 8) | ((b + 8) << 4));
+    }
+}
+
+kernel void quantize_q8_0(
+    device const float *input [[buffer(0)]], device uchar *output [[buffer(1)]],
+    constant uint &blocks [[buffer(2)]], uint block_id [[thread_position_in_grid]]) {
+    if (block_id >= blocks) return;
+    float maximum = 0.0f;
+    for (uint i = 0; i < 32; ++i) maximum = max(maximum, abs(input[block_id * 32 + i]));
+    float scale = maximum == 0.0f ? 0.0f : maximum / 127.0f;
+    device half *scale_out = (device half *)(output + block_id * 34);
+    *scale_out = half(scale);
+    for (uint i = 0; i < 32; ++i) output[block_id * 34 + 2 + i] = uchar(scale == 0.0f ? 0 : int(round(clamp(input[block_id * 32 + i] / scale, -128.0f, 127.0f))));
+}
+
+kernel void matvec_q4_0(
+    device const float *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
+    constant uint &output_width [[buffer(4)]], uint row [[thread_position_in_grid]]) {
+    if (row >= output_width) return;
+    float sum = 0.0f;
+    uint blocks = input_width / 32;
+    for (uint block = 0; block < blocks; ++block) {
+        device const uchar *base = weights + (row * blocks + block) * 18;
+        float scale = float(*(device const half *)base);
+        for (uint i = 0; i < 32; ++i) { uchar nibble = (i & 1) ? base[2 + i / 2] >> 4 : base[2 + i / 2] & 15; sum += input[block * 32 + i] * float(int(nibble) - 8) * scale; }
+    }
+    output[row] = sum;
+}
+
+kernel void matvec_q8_0(
+    device const float *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
+    constant uint &output_width [[buffer(4)]], uint row [[thread_position_in_grid]]) {
+    if (row >= output_width) return;
+    float sum = 0.0f;
+    uint blocks = input_width / 32;
+    for (uint block = 0; block < blocks; ++block) { device const uchar *base = weights + (row * blocks + block) * 34; float scale = float(*(device const half *)base); for (uint i = 0; i < 32; ++i) { char q = (char)base[2 + i]; sum += input[block * 32 + i] * float(q) * scale; } }
+    output[row] = sum;
+}
+
+kernel void embedding_lookup_q4_0(
+    device const uchar *weights [[buffer(0)]], device const uint *token_ids [[buffer(1)]], device float *output [[buffer(2)]], constant uint &vocabulary [[buffer(3)]], constant uint &hidden [[buffer(4)]], constant uint &tokens [[buffer(5)]], uint id [[thread_position_in_grid]]) {
+    if (id >= tokens * hidden) return; uint token = token_ids[id / hidden]; if (token >= vocabulary) return; uint column = id % hidden; uint block = column / 32; device const uchar *base = weights + (token * (hidden / 32) + block) * 18; float scale = float(*(device const half *)base); uchar nibble = (column & 1) ? base[2 + (column % 32) / 2] >> 4 : base[2 + (column % 32) / 2] & 15; output[id] = float(int(nibble) - 8) * scale;
+}
+
+kernel void embedding_lookup_q8_0(
+    device const uchar *weights [[buffer(0)]], device const uint *token_ids [[buffer(1)]], device float *output [[buffer(2)]], constant uint &vocabulary [[buffer(3)]], constant uint &hidden [[buffer(4)]], constant uint &tokens [[buffer(5)]], uint id [[thread_position_in_grid]]) {
+    if (id >= tokens * hidden) return; uint token = token_ids[id / hidden]; if (token >= vocabulary) return; uint column = id % hidden; uint block = column / 32; device const uchar *base = weights + (token * (hidden / 32) + block) * 34; float scale = float(*(device const half *)base); output[id] = float((char)base[2 + (column % 32)]) * scale;
+}
+
 // One-token decode projection.  The resident command path keeps input,
 // weights, and output in Metal buffers; this kernel is deliberately separate
 // from the correctness reference so it can be specialized per GPU family
