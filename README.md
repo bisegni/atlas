@@ -17,11 +17,10 @@ of the first MVP.
 
 ## Current status
 
-Planning only. No Rust crates, Metal kernels, model files, or server are in
-this repository yet.
-
-The first implementation task is Phase 0: create the Rust workspace, initialize
-Metal, and prove a vector-add compute shader from Rust.
+Phase 0 is implemented: the workspace initializes native Metal, compiles the
+bootstrap kernels at runtime, caches their compute pipelines, validates GPU
+vector addition against the CPU, and provides Metal and model-fixture CLI
+checks. The model fixture itself is not downloaded or committed.
 
 ## Plan structure
 
@@ -50,6 +49,59 @@ not hide runtime regressions:
 Model files are test fixtures and must not be committed. The shared contract
 contains the required `hf download --dry-run` and download commands, revision
 pinning, and artifact-recording requirements.
+
+## Phase 0 helper
+
+Use the helper to download only the required SafeTensors/tokenizer files:
+
+```zsh
+scripts/download-models.sh
+```
+
+The script requires the Hugging Face CLI. Install it once if `hf` is not
+already available:
+
+```zsh
+python3 -m pip install --user --upgrade huggingface_hub
+```
+
+The model is downloaded to `models/hf/SmolLM2-135M-Instruct/` and is ignored by
+Git. The script first performs a Hugging Face dry run, then downloads only the
+SafeTensors and tokenizer files needed by Atlas.
+
+## Build, test, and use the CLI
+
+Build the complete workspace:
+
+```zsh
+cargo check --workspace
+```
+
+Run all Rust tests:
+
+```zsh
+cargo test --workspace
+```
+
+The Phase 0 GPU integration test is also available directly:
+
+```zsh
+cargo test -p atlas-metal --test phase_00_bootstrap
+```
+
+Run the CLI to confirm that Atlas can create a Metal device and compile/cache
+the Phase 0 kernels:
+
+```zsh
+cargo run -p atlas-cli -- metal-info
+```
+
+After downloading the small model, validate its configuration and SafeTensors
+header without loading the model weights:
+
+```zsh
+cargo run -p atlas-cli -- fixture verify --model small
+```
 
 ## Implementation order
 

@@ -1,0 +1,5 @@
+/target/
+/models/
+/artifacts/
+/.memory/
+.DS_Store
