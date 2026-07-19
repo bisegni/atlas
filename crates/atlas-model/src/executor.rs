@@ -3,7 +3,10 @@
 //! The plans own only immutable shape and residency decisions.  A session owns
 //! the mutable KV cache, which keeps request state out of the model itself.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Result, ensure};
 use atlas_core::QuantFormat;
@@ -79,6 +82,35 @@ pub struct ExecutorGeneration {
     pub metrics: ExecutorMetrics,
 }
 
+/// Why a streaming greedy generation completed normally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationFinishReason {
+    Eos,
+    MaxTokens,
+}
+
+/// An item delivered while greedy generation is in progress.
+///
+/// A stream emits zero or more [`Token`](Self::Token) events followed by
+/// exactly one terminal [`Finished`](Self::Finished) or [`Failed`](Self::Failed)
+/// event, unless the callback itself returns an error.
+#[derive(Debug, Clone)]
+pub enum GenerationEvent {
+    Token {
+        token_id: u32,
+        text: String,
+        /// `None` for the first token, whose delivery time is reported by TTFT.
+        decode_latency: Option<Duration>,
+    },
+    Finished {
+        reason: GenerationFinishReason,
+        metrics: ExecutorMetrics,
+    },
+    Failed {
+        message: String,
+    },
+}
+
 /// Immutable plans plus session-local cache state.  The executor never
 /// rebuilds a Metal runtime or pipelines during token generation.
 pub struct AtlasExecutor<'a> {
@@ -147,10 +179,43 @@ impl<'a> AtlasExecutor<'a> {
         prompt: &str,
         max_new_tokens: usize,
     ) -> Result<ExecutorGeneration> {
+        let cancellation = AtomicBool::new(false);
+        self.generate_greedy_stream(prompt, max_new_tokens, &cancellation, |_| Ok(()))
+    }
+
+    /// Generates greedily and delivers each decoded token as soon as it is ready.
+    ///
+    /// `cancellation` is checked before prefill and between decode steps.  Model,
+    /// tokenizer, decode, context, and cancellation errors are delivered as a
+    /// terminal [`GenerationEvent::Failed`] before being returned to the caller.
+    pub fn generate_greedy_stream<F>(
+        &mut self,
+        prompt: &str,
+        max_new_tokens: usize,
+        cancellation: &AtomicBool,
+        mut callback: F,
+    ) -> Result<ExecutorGeneration>
+    where
+        F: FnMut(GenerationEvent) -> Result<()>,
+    {
         let encoding_start = Instant::now();
-        let prompt_token_ids = self.model.tokenize(prompt)?;
+        let prompt_token_ids = match self.model.tokenize(prompt) {
+            Ok(token_ids) => token_ids,
+            Err(error) => {
+                callback(GenerationEvent::Failed {
+                    message: format!("{error:#}"),
+                })?;
+                return Err(error);
+            }
+        };
         let cpu_encode = encoding_start.elapsed();
-        self.generate_token_ids(prompt_token_ids, max_new_tokens, cpu_encode)
+        self.generate_token_ids_stream(
+            prompt_token_ids,
+            max_new_tokens,
+            cpu_encode,
+            cancellation,
+            callback,
+        )
     }
 
     pub fn generate_token_ids(
@@ -159,6 +224,56 @@ impl<'a> AtlasExecutor<'a> {
         max_new_tokens: usize,
         cpu_encode: Duration,
     ) -> Result<ExecutorGeneration> {
+        let cancellation = AtomicBool::new(false);
+        self.generate_token_ids_stream(
+            prompt_token_ids,
+            max_new_tokens,
+            cpu_encode,
+            &cancellation,
+            |_| Ok(()),
+        )
+    }
+
+    /// Streaming equivalent of [`generate_token_ids`](Self::generate_token_ids).
+    pub fn generate_token_ids_stream<F>(
+        &mut self,
+        prompt_token_ids: Vec<u32>,
+        max_new_tokens: usize,
+        cpu_encode: Duration,
+        cancellation: &AtomicBool,
+        mut callback: F,
+    ) -> Result<ExecutorGeneration>
+    where
+        F: FnMut(GenerationEvent) -> Result<()>,
+    {
+        match self.generate_token_ids_stream_inner(
+            prompt_token_ids,
+            max_new_tokens,
+            cpu_encode,
+            cancellation,
+            &mut callback,
+        ) {
+            Ok(generation) => Ok(generation),
+            Err(error) => {
+                callback(GenerationEvent::Failed {
+                    message: format!("{error:#}"),
+                })?;
+                Err(error)
+            }
+        }
+    }
+
+    fn generate_token_ids_stream_inner<F>(
+        &mut self,
+        prompt_token_ids: Vec<u32>,
+        max_new_tokens: usize,
+        cpu_encode: Duration,
+        cancellation: &AtomicBool,
+        callback: &mut F,
+    ) -> Result<ExecutorGeneration>
+    where
+        F: FnMut(GenerationEvent) -> Result<()>,
+    {
         ensure!(
             !prompt_token_ids.is_empty(),
             "prompt tokenizes to no tokens"
@@ -167,6 +282,10 @@ impl<'a> AtlasExecutor<'a> {
         ensure!(
             prompt_token_ids.len() <= self.prefill_plan.max_tokens,
             "prompt exceeds executor context"
+        );
+        ensure!(
+            !cancellation.load(Ordering::Acquire),
+            "generation cancelled"
         );
         let prefill_token_count = prompt_token_ids.len();
         self.reset();
@@ -177,14 +296,34 @@ impl<'a> AtlasExecutor<'a> {
             logits = self.forward_token(token)?;
         }
         let prefill = prefill_start.elapsed();
-        let ttft = request_start.elapsed();
         let mut ids = prompt_token_ids.clone();
         let mut latencies = Vec::new();
         let decode_start = Instant::now();
+        let mut finish_reason = GenerationFinishReason::MaxTokens;
+        let mut ttft = Duration::ZERO;
         for step in 0..max_new_tokens {
+            ensure!(
+                !cancellation.load(Ordering::Acquire),
+                "generation cancelled"
+            );
             let token = argmax(&logits) as u32;
             ids.push(token);
+            let text = self.model.decode(&[token])?;
+            let decode_latency = if step == 0 {
+                None
+            } else {
+                latencies.last().copied()
+            };
+            callback(GenerationEvent::Token {
+                token_id: token,
+                text,
+                decode_latency,
+            })?;
+            if step == 0 {
+                ttft = request_start.elapsed();
+            }
             if Some(token) == self.model.config.eos_token_id {
+                finish_reason = GenerationFinishReason::Eos;
                 break;
             }
             if step + 1 < max_new_tokens {
@@ -199,9 +338,8 @@ impl<'a> AtlasExecutor<'a> {
         }
         let decode = decode_start.elapsed();
         let generated_token_ids = ids[prompt_token_ids.len()..].to_vec();
-        let generated_count = generated_token_ids.len();
         let pipelines = self.model.ops.runtime().pipeline_count();
-        Ok(ExecutorGeneration {
+        let generation = ExecutorGeneration {
             generation: Generation {
                 prompt_token_ids,
                 generated_token_ids,
@@ -215,13 +353,18 @@ impl<'a> AtlasExecutor<'a> {
                 decode,
                 ttft,
                 prefill_tokens: prefill_token_count,
-                decode_tokens: generated_count.saturating_sub(1),
+                decode_tokens: latencies.len(),
                 decode_latencies: latencies,
                 pipeline_count: self.prefill_plan.pipeline_count,
                 post_warmup_pipeline_count: pipelines,
                 post_warmup_allocations: 0,
             },
-        })
+        };
+        callback(GenerationEvent::Finished {
+            reason: finish_reason,
+            metrics: generation.metrics.clone(),
+        })?;
+        Ok(generation)
     }
 
     fn forward_token(&mut self, token: u32) -> Result<Vec<f32>> {

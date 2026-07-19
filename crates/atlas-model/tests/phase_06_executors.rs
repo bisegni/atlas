@@ -1,9 +1,11 @@
-use std::{path::Path, time::Duration};
+use std::{path::Path, sync::atomic::AtomicBool, time::Duration};
 
 use atlas_core::QuantFormat;
 use atlas_model::{
     AtlasModel,
-    executor::{AtlasExecutor, ExecutorConfig, ExecutorMetrics},
+    executor::{
+        AtlasExecutor, ExecutorConfig, ExecutorMetrics, GenerationEvent, GenerationFinishReason,
+    },
 };
 
 #[test]
@@ -81,4 +83,83 @@ fn phase_06_cached_decode_matches_phase_3_reference_and_keeps_pipelines_warm() {
     );
     assert_eq!(actual.metrics.post_warmup_allocations, 0);
     assert!(actual.metrics.ttft > Duration::ZERO);
+}
+
+#[test]
+#[ignore = "requires local Metal and the downloaded small fixture"]
+fn phase_08_streaming_matches_buffered_and_reports_terminal_metrics() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fixture = root.join("models/hf/SmolLM2-135M-Instruct");
+    let model = AtlasModel::load(&fixture).unwrap();
+    let mut buffered_executor = AtlasExecutor::new(&model, ExecutorConfig::default()).unwrap();
+    let buffered = buffered_executor.generate_greedy("Atlas", 3).unwrap();
+
+    let cancellation = AtomicBool::new(false);
+    let mut events = Vec::new();
+    let mut streamed_executor = AtlasExecutor::new(&model, ExecutorConfig::default()).unwrap();
+    let streamed = streamed_executor
+        .generate_greedy_stream("Atlas", 3, &cancellation, |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+
+    let streamed_ids = events
+        .iter()
+        .filter_map(|event| match event {
+            GenerationEvent::Token { token_id, .. } => Some(*token_id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(streamed_ids, buffered.generation.generated_token_ids);
+    assert_eq!(
+        streamed.generation.generated_token_ids,
+        buffered.generation.generated_token_ids
+    );
+    assert!(matches!(
+        events.last(),
+        Some(GenerationEvent::Finished { .. })
+    ));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, GenerationEvent::Finished { .. }))
+            .count(),
+        1
+    );
+    assert!(streamed.metrics.ttft > Duration::ZERO);
+    assert_eq!(
+        streamed.metrics.decode_latencies.len(),
+        streamed.metrics.decode_tokens
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        GenerationEvent::Finished {
+            reason: GenerationFinishReason::Eos | GenerationFinishReason::MaxTokens,
+            ..
+        }
+    )));
+}
+
+#[test]
+#[ignore = "requires local Metal and the downloaded small fixture"]
+fn phase_08_cancellation_is_a_terminal_failure_event() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fixture = root.join("models/hf/SmolLM2-135M-Instruct");
+    let model = AtlasModel::load(&fixture).unwrap();
+    let cancellation = AtomicBool::new(true);
+    let mut events = Vec::new();
+    let mut executor = AtlasExecutor::new(&model, ExecutorConfig::default()).unwrap();
+    assert!(
+        executor
+            .generate_greedy_stream("Atlas", 3, &cancellation, |event| {
+                events.push(event);
+                Ok(())
+            })
+            .is_err()
+    );
+    assert!(matches!(
+        events.as_slice(),
+        [GenerationEvent::Failed { .. }]
+    ));
 }

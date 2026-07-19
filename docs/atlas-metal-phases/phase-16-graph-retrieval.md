@@ -1,4 +1,4 @@
-# Phase 15: Graph retrieval
+# Phase 16: Graph retrieval
 
 ## Outcome
 

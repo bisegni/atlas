@@ -3,6 +3,7 @@ use std::{
     env, fs,
     io::{self, BufRead, Read, Write},
     path::{Path, PathBuf},
+    sync::atomic::AtomicBool,
     time::Instant,
 };
 
@@ -13,7 +14,9 @@ use atlas_core::{
 use atlas_metal::MetalRuntime;
 use atlas_model::{
     AtlasModel,
-    executor::{AtlasExecutor, ExecutorConfig, ExecutorGeneration, ExecutorMetrics},
+    executor::{
+        AtlasExecutor, ExecutorConfig, ExecutorGeneration, ExecutorMetrics, GenerationEvent,
+    },
     validate_generation_golden,
 };
 use serde_json::Value;
@@ -95,10 +98,24 @@ fn print_completion(
     prompt: &str,
     max_tokens: usize,
 ) -> Result<ExecutorGeneration> {
-    let result = generate_completion(model, prompt, max_tokens)?;
-    println!("{}", model.decode(&result.generation.generated_token_ids)?);
+    let cancellation = AtomicBool::new(false);
+    let mut executor = AtlasExecutor::new(model, ExecutorConfig::default())?;
+    let mut stdout = io::stdout();
+    let result = executor.generate_greedy_stream(prompt, max_tokens, &cancellation, |event| {
+        write_stream_event(&mut stdout, &event)
+    })?;
+    writeln!(stdout)?;
+    stdout.flush()?;
     eprintln!("{}", metrics_line(&result.metrics));
     Ok(result)
+}
+
+fn write_stream_event(writer: &mut impl Write, event: &GenerationEvent) -> Result<()> {
+    if let GenerationEvent::Token { text, .. } = event {
+        write!(writer, "{text}")?;
+        writer.flush()?;
+    }
+    Ok(())
 }
 
 fn parse_chat_args(args: &[String]) -> Result<(Vec<String>, Option<String>, usize)> {
@@ -231,6 +248,29 @@ mod phase_07_tests {
         assert!(line.contains("ttft_ms=12.00"));
         assert!(line.contains("prefill_tok_s=500.00"));
         assert!(line.contains("decode_tok_s=200.00"));
+    }
+
+    #[test]
+    fn streaming_writer_emits_and_flushes_token_fragments_only() {
+        let mut output = Vec::new();
+        write_stream_event(
+            &mut output,
+            &GenerationEvent::Token {
+                token_id: 7,
+                text: "hello".into(),
+                decode_latency: None,
+            },
+        )
+        .unwrap();
+        write_stream_event(
+            &mut output,
+            &GenerationEvent::Finished {
+                reason: atlas_model::executor::GenerationFinishReason::MaxTokens,
+                metrics: ExecutorMetrics::default(),
+            },
+        )
+        .unwrap();
+        assert_eq!(output, b"hello");
     }
 }
 

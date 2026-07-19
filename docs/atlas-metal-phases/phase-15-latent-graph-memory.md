@@ -1,4 +1,4 @@
-# Phase 14: Latent graph memory
+# Phase 15: Latent graph memory
 
 ## Outcome
 

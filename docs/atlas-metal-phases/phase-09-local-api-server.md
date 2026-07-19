@@ -1,9 +1,10 @@
-# Phase 8: Local API server
+# Phase 9: Local API server
 
 ## Outcome
 
 `atlas-cli serve` exposes the same greedy runtime through a loopback-only,
-OpenAI-compatible HTTP subset.
+OpenAI-compatible HTTP subset. It consumes the Phase-8 token stream rather
+than waiting for a completed response.
 
 ## Work
 

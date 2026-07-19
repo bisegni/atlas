@@ -15,13 +15,15 @@ cross-phase exit rules.
 | 5 | [Quantization](phase-05-quantization.md) |
 | 6 | [Prefill and decode executors]([done]%20phase-06-prefill-decode.md) |
 | 7 | [Interactive CLI]([done]%20phase-07-interactive-cli.md) |
-| 8 | [Local API server](phase-08-local-api-server.md) |
-| 9 | [Sampling engine](phase-09-sampling.md) |
-| 10 | [Runtime and scheduler](phase-10-runtime-scheduler.md) |
-| 11 | [API compatibility and hardening](phase-11-api-hardening.md) |
-| 12 | [Atlas local attention](phase-12-local-attention.md) |
-| 13 | [Recurrent working memory](phase-13-working-memory.md) |
-| 14 | [Latent graph memory](phase-14-latent-graph-memory.md) |
-| 15 | [Graph retrieval](phase-15-graph-retrieval.md) |
-| 16 | [Memory fusion](phase-16-memory-fusion.md) |
-| 17 | [Learned memory router](phase-17-memory-router.md) |
+| 8 | [Streaming generation]([done]%20phase-08-streaming-generation.md) |
+| 8.1 | [GPU-resident decode performance](phase-08a-gpu-resident-decode-performance.md) |
+| 9 | [Local API server](phase-09-local-api-server.md) |
+| 10 | [Sampling engine](phase-10-sampling.md) |
+| 11 | [Runtime and scheduler](phase-11-runtime-scheduler.md) |
+| 12 | [API compatibility and hardening](phase-12-api-hardening.md) |
+| 13 | [Atlas local attention](phase-13-local-attention.md) |
+| 14 | [Recurrent working memory](phase-14-working-memory.md) |
+| 15 | [Latent graph memory](phase-15-latent-graph-memory.md) |
+| 16 | [Graph retrieval](phase-16-graph-retrieval.md) |
+| 17 | [Memory fusion](phase-17-memory-fusion.md) |
+| 18 | [Learned memory router](phase-18-memory-router.md) |
