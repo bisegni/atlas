@@ -7,6 +7,7 @@
 
 pub mod executor;
 pub mod kv_cache;
+pub mod runtime;
 pub mod sampling;
 
 use std::{

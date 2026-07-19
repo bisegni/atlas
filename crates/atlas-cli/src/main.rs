@@ -20,6 +20,8 @@ use atlas_model::{
         AtlasExecutor, ExecutorConfig, ExecutorGeneration, ExecutorMetrics, ExecutorMode,
         GenerationEvent, LogitsReadback,
     },
+    runtime::{AtlasRuntime, RuntimeConfig, RuntimeEvent, RuntimeRequest},
+    sampling::SamplingConfig,
     validate_generation_golden,
 };
 use serde_json::{Value, json};
@@ -87,6 +89,7 @@ fn main() -> Result<()> {
         Some("model") => model_command(&args[1..]),
         Some("generate") => generate(&args[1..]),
         Some("chat") => chat(&args[1..]),
+        Some("runtime") => runtime_command(&args[1..]),
         Some("phase_03_model") => phase_03_model(&args[1..]),
         Some("phase_05_quant") => phase_05_quant(&args[1..]),
         Some("phase_08b_decode") => phase_08b_decode(&args[1..]),
@@ -97,6 +100,71 @@ fn main() -> Result<()> {
             bail!("invalid command")
         }
     }
+}
+
+/// Run exactly one request through the reusable bounded runtime. Multi-session
+/// admission is a library concern and is intentionally exercised by the
+/// runtime acceptance test rather than exposed as an unstable CLI protocol.
+fn runtime_command(args: &[String]) -> Result<()> {
+    CHAT_INTERRUPTED.store(false, Ordering::Release);
+    install_chat_sigint_handler();
+    let (model_args, prompt, max_tokens, mode) = parse_chat_args(args)?;
+    ensure!(
+        mode == ExecutorMode::Resident,
+        "atlas runtime requires --executor resident"
+    );
+    let prompt = prompt.context("atlas runtime requires --prompt")?;
+    let selection = resolve_model(&model_args)?;
+    let model = AtlasModel::load(&selection.directory)?;
+    let mut runtime = AtlasRuntime::new(&model, RuntimeConfig::default())?;
+    let session = runtime.submit(RuntimeRequest {
+        prompt,
+        max_new_tokens: max_tokens,
+        sampling: SamplingConfig::default(),
+    })?;
+    let mut stdout = io::stdout();
+    runtime.run_until_idle(|event| {
+        match event {
+            RuntimeEvent::Generation {
+                session: event_session,
+                event: GenerationEvent::Token { text, .. },
+            } => {
+                ensure!(
+                    event_session == session,
+                    "single-session runtime emitted unexpected session"
+                );
+                write!(stdout, "{text}")?;
+                stdout.flush()?;
+            }
+            RuntimeEvent::Generation {
+                session: event_session,
+                event: GenerationEvent::Failed { message },
+            } => {
+                bail!("runtime session {} failed: {message}", event_session.0);
+            }
+            _ => {}
+        }
+        Ok(())
+    })?;
+    let completion = runtime
+        .take_completed()
+        .context("runtime completed without a session result")?;
+    println!();
+    println!(
+        "{}",
+        json!({
+            "event": "runtime_metrics",
+            "session": completion.session.0,
+            "executor": match completion.metrics.executor_mode { ExecutorMode::Reference => "reference", ExecutorMode::Resident => "resident" },
+            "queue_wait_ms": completion.metrics.queue_wait.as_millis(),
+            "ttft_ms": completion.metrics.executor.ttft.as_millis(),
+            "decode_tokens": completion.metrics.executor.decode_tokens,
+            "cache_resident_bytes": completion.metrics.executor.resident_bytes,
+            "cancelled": completion.metrics.cancelled,
+            "error": completion.metrics.error,
+        })
+    );
+    Ok(())
 }
 
 fn chat(args: &[String]) -> Result<()> {
