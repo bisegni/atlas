@@ -2,13 +2,26 @@
 set -euo pipefail
 
 readonly REPOSITORY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-readonly MODEL_REPOSITORY="HuggingFaceTB/SmolLM2-135M-Instruct"
-readonly MODEL_DIRECTORY="$REPOSITORY_ROOT/models/hf/SmolLM2-135M-Instruct"
+readonly FIXTURE="${1:-small}"
+case "$FIXTURE" in
+  small)
+    readonly MODEL_REPOSITORY="HuggingFaceTB/SmolLM2-135M-Instruct"
+    readonly MODEL_DIRECTORY="$REPOSITORY_ROOT/models/hf/SmolLM2-135M-Instruct"
+    ;;
+  larger)
+    readonly MODEL_REPOSITORY="HuggingFaceTB/SmolLM2-1.7B-Instruct"
+    readonly MODEL_DIRECTORY="$REPOSITORY_ROOT/models/hf/SmolLM2-1.7B-Instruct"
+    ;;
+  *)
+    echo "usage: $0 [small|larger]" >&2
+    exit 2
+    ;;
+esac
 readonly MODEL_FILES=(
   --include '*.json'
   --include 'merges.txt'
   --include 'vocab.json'
-  --include 'model.safetensors'
+  --include '*.safetensors'
 )
 
 require_hf() {

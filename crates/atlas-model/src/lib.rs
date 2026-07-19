@@ -8,6 +8,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -128,6 +129,7 @@ pub struct AtlasModel {
     pub config: ModelConfig,
     tokenizer: Tokenizer,
     weights: HashMap<String, PathBuf>,
+    weight_cache: Mutex<HashMap<String, Arc<Vec<f32>>>>,
     ops: NeuralOps,
 }
 
@@ -144,6 +146,7 @@ impl AtlasModel {
             config,
             tokenizer,
             weights,
+            weight_cache: Mutex::new(HashMap::new()),
             ops,
         })
     }
@@ -169,7 +172,12 @@ impl AtlasModel {
         let prompt_token_ids = ids.clone();
         let mut trace = LayerTrace::default();
         let mut final_logits = Vec::new();
-        for _ in 0..max_new_tokens {
+        for step in 0..max_new_tokens {
+            eprintln!(
+                "atlas: generating token {}/{} (full prompt recomputation; KV cache begins in Phase 4)",
+                step + 1,
+                max_new_tokens
+            );
             let logits = self.forward(&ids, &mut trace, self.config.num_hidden_layers)?;
             let token = argmax(&logits) as u32;
             final_logits = logits;
@@ -423,12 +431,27 @@ impl AtlasModel {
         }
         Ok(output)
     }
-    fn weight(&self, name: &str) -> Result<Vec<f32>> {
+    fn weight(&self, name: &str) -> Result<Arc<Vec<f32>>> {
+        if let Some(weight) = self
+            .weight_cache
+            .lock()
+            .expect("weight cache lock")
+            .get(name)
+            .cloned()
+        {
+            return Ok(weight);
+        }
         let path = self
             .weights
             .get(name)
             .with_context(|| format!("model lacks required tensor `{name}`"))?;
-        read_safetensors_tensor_f32(path, name).map_err(Into::into)
+        eprintln!("atlas: loading weight {name}");
+        let weight = Arc::new(read_safetensors_tensor_f32(path, name)?);
+        self.weight_cache
+            .lock()
+            .expect("weight cache lock")
+            .insert(name.to_owned(), weight.clone());
+        Ok(weight)
     }
     pub fn root(&self) -> &Path {
         &self.root

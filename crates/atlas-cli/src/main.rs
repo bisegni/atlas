@@ -52,7 +52,14 @@ fn model_dir(args: &[String]) -> Result<(String, PathBuf)> {
         "larger" => "models/hf/SmolLM2-1.7B-Instruct",
         _ => bail!("model must be `small` or `larger`"),
     };
-    Ok((model, directory.unwrap_or_else(|| PathBuf::from(default))))
+    let directory = directory.unwrap_or_else(|| PathBuf::from(default));
+    if !directory.join("config.json").exists() {
+        bail!(
+            "model fixture is missing at {}; run `scripts/download-models.sh {model}` or pass --model-dir PATH",
+            directory.display()
+        );
+    }
+    Ok((model, directory))
 }
 
 fn generate(args: &[String]) -> Result<()> {
@@ -101,6 +108,7 @@ fn generate(args: &[String]) -> Result<()> {
         bail!("Phase 3 supports only --greedy");
     }
     let (_, directory) = model_dir(&model_args)?;
+    eprintln!("atlas: loading model fixture from {}", directory.display());
     let generation = AtlasModel::load(&directory)?.generate_greedy(
         &prompt.context("--prompt is required")?,
         max_new_tokens.context("--max-new-tokens is required")?,
@@ -121,15 +129,51 @@ fn generate(args: &[String]) -> Result<()> {
 }
 
 fn phase_03_model(args: &[String]) -> Result<()> {
-    let (model, directory) = model_dir(args)?;
+    let mut model_args = Vec::new();
+    let mut requested_layers = None;
+    let mut prompt = "The capital of France is".to_owned();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--model" | "--model-dir" => {
+                model_args.push(args[index].clone());
+                index += 1;
+                model_args.push(
+                    args.get(index)
+                        .context("model option needs a value")?
+                        .clone(),
+                );
+            }
+            "--layers" => {
+                index += 1;
+                requested_layers = Some(
+                    args.get(index)
+                        .context("--layers needs a value")?
+                        .parse::<usize>()
+                        .context("parse --layers")?,
+                );
+            }
+            "--prompt" => {
+                index += 1;
+                prompt = args.get(index).context("--prompt needs a value")?.clone();
+            }
+            flag => bail!("unknown phase_03_model option: {flag}"),
+        }
+        index += 1;
+    }
+    let (model, directory) = model_dir(&model_args)?;
+    eprintln!(
+        "atlas: loading {model} model fixture from {}",
+        directory.display()
+    );
     let engine = AtlasModel::load(&directory)?;
-    let tokens = engine.tokenize("The capital of France is")?;
+    let tokens = engine.tokenize(&prompt)?;
     let mut trace = atlas_model::LayerTrace::default();
-    let layers = if model == "larger" {
+    let layers = requested_layers.unwrap_or(if model == "larger" {
         1
     } else {
         engine.config.num_hidden_layers
-    };
+    });
     let output = engine.forward(&tokens, &mut trace, layers)?;
     println!("fixture: {}", engine.root().display());
     println!("layers_executed: {layers}");
