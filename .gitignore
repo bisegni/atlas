@@ -1,6 +1,5 @@
 /target/
 /models/
-!/models/
 !/models/manifest.toml
 /artifacts/
 /.memory/

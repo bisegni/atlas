@@ -23,3 +23,53 @@ sha256 = "9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c"
 path = "model.safetensors"
 bytes = 269060552
 sha256 = "5af571cbf074e6d21a03528d2330792e532ca608f24ac70a143f6b369968ab8c"
+
+[[models]]
+id = "small-q4-gpu-20260719123633"
+source = "HuggingFaceTB/SmolLM2-135M-Instruct"
+revision = "12fd25f77366fa6b3b4b768ec3050bf629380bac"
+path = "models/gguf/small-q4-gpu-20260719123633"
+architecture = "LlamaForCausalLM"
+tokenizer = "tokenizer.json"
+format = "gguf-q4_0"
+bytes = 77907497
+
+[[models.files]]
+path = "config.json"
+bytes = 861
+sha256 = "8eb740e8bbe4cff95ea7b4588d17a2432deb16e8075bc5828ff7ba9be94d982a"
+
+[[models.files]]
+path = "tokenizer.json"
+bytes = 2104556
+sha256 = "9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c"
+
+[[models.files]]
+path = "model.gguf"
+bytes = 75802080
+sha256 = "8cb54c85dbdcf90386b35f930f4e82f2a3d235c8c25c56e9aa32f45a4682cbe7"
+
+[[models]]
+id = "small-q8-gpu-20260719124407"
+source = "HuggingFaceTB/SmolLM2-135M-Instruct"
+revision = "12fd25f77366fa6b3b4b768ec3050bf629380bac"
+path = "models/gguf/small-q8-gpu-20260719124407"
+architecture = "LlamaForCausalLM"
+tokenizer = "tokenizer.json"
+format = "gguf-q8_0"
+bytes = 145147433
+
+[[models.files]]
+path = "config.json"
+bytes = 861
+sha256 = "8eb740e8bbe4cff95ea7b4588d17a2432deb16e8075bc5828ff7ba9be94d982a"
+
+[[models.files]]
+path = "tokenizer.json"
+bytes = 2104556
+sha256 = "9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c"
+
+[[models.files]]
+path = "model.gguf"
+bytes = 143042016
+sha256 = "081c7b8500b9170bde8713f674e6f103cc03fc6f7b39902d145bf7e152c14a00"

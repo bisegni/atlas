@@ -56,6 +56,7 @@ dependencies = [
  "atlas-core",
  "atlas-metal",
  "atlas-ops",
+ "rand",
  "serde_json",
  "tokenizers",
 ]

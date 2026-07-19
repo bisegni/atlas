@@ -120,6 +120,21 @@ complete, use the repository's `[done]` filename convention and update the
 link in `docs/atlas-metal-phases/README.md`; do not renumber later phases when
 a fractional phase can express the work.
 
+## Commits
+
+Write commit messages in Conventional Commits style:
+
+```text
+type(optional-scope): imperative summary
+```
+
+Use a concise, lowercase imperative summary (for example,
+`feat(atlas-model): default inference to resident executor`). Use a scope when
+it makes the affected crate or area clear, such as `atlas-metal`, `atlas-model`,
+`atlas-cli`, `docs`, or `tests`. Use `fix`, `feat`, `docs`, `test`, `refactor`,
+`perf`, `build`, or `chore` as appropriate. Do not commit unrelated user
+changes together.
+
 ## Final report
 
 State concisely:
