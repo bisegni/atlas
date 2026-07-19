@@ -6,6 +6,7 @@ use atlas_model::{
     executor::{
         AtlasExecutor, ExecutorConfig, ExecutorMetrics, ExecutorMode, GenerationEvent,
         GenerationFinishReason, LogitsReadback, ResidentStage, compare_stage,
+        resident_stage_tolerance,
     },
 };
 
@@ -77,6 +78,19 @@ fn resident_stage_comparison_is_strict_and_reports_the_first_failure() {
     assert_eq!(length.first_failing_index, Some(1));
     assert_eq!(length.expected, 2.0);
     assert!(length.actual.is_nan());
+}
+
+#[test]
+fn resident_stage_tolerance_preserves_the_caller_gate_until_a_bound_is_proven() {
+    assert_eq!(resident_stage_tolerance(ResidentStage::Q, 1e-5), 1e-5);
+    assert_eq!(
+        resident_stage_tolerance(ResidentStage::MlpDownProjection, 1e-5),
+        1e-5
+    );
+    assert_eq!(
+        resident_stage_tolerance(ResidentStage::MlpResidual, 3e-5),
+        3e-5
+    );
 }
 
 #[test]
@@ -234,7 +248,7 @@ fn phase_08a_cached_decode_is_faster_than_reference_and_keeps_greedy_parity() {
 
 #[test]
 #[ignore = "requires local Metal and the downloaded small fixture"]
-fn phase_08b_resident_matches_reference_and_keeps_the_token_boundary_resident() {
+fn phase_08c_resident_matches_reference_for_32_tokens_and_keeps_the_token_boundary_resident() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let fixture = root.join("models/hf/SmolLM2-135M-Instruct");
     let model = match AtlasModel::load(&fixture) {
@@ -242,49 +256,54 @@ fn phase_08b_resident_matches_reference_and_keeps_the_token_boundary_resident() 
         Err(error) if format!("{error:#}").contains("no Metal device is available") => return,
         Err(error) => panic!("load small fixture: {error:#}"),
     };
-    let prompt = "Atlas";
-    let max_tokens = 3;
-    let mut reference = AtlasExecutor::new(
-        &model,
-        ExecutorConfig {
-            mode: ExecutorMode::Reference,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let expected = reference.generate_greedy(prompt, max_tokens).unwrap();
-    let mut resident = AtlasExecutor::new(
-        &model,
-        ExecutorConfig {
-            mode: ExecutorMode::Resident,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let actual = resident.generate_greedy(prompt, max_tokens).unwrap();
-    assert_eq!(
-        actual.generation.generated_token_ids,
-        expected.generation.generated_token_ids
-    );
-    assert!(actual.generation.final_logits.is_empty());
-    assert_eq!(
-        actual.metrics.prefill_command_buffer_count,
-        actual.metrics.prefill_tokens as u64
-    );
-    assert_eq!(
-        actual.metrics.decode_command_buffer_count,
-        actual.metrics.decode_tokens as u64
-    );
-    assert_eq!(
-        actual.metrics.command_buffer_count,
-        actual.metrics.prefill_command_buffer_count + actual.metrics.decode_command_buffer_count
-    );
-    assert_eq!(
-        actual.metrics.readback_bytes,
-        4 * (actual.metrics.prefill_tokens + actual.metrics.decode_tokens) as u64
-    );
-    assert_eq!(actual.metrics.post_warmup_allocations, 0);
-    assert!(actual.metrics.resident_arena_allocations > 0);
+    for prompt in [
+        "The capital of France is",
+        "Atlas is a local inference engine.",
+    ] {
+        let mut reference = AtlasExecutor::new(
+            &model,
+            ExecutorConfig {
+                mode: ExecutorMode::Reference,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let expected = reference.generate_greedy(prompt, 32).unwrap();
+        let mut resident = AtlasExecutor::new(
+            &model,
+            ExecutorConfig {
+                mode: ExecutorMode::Resident,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let actual = resident.generate_greedy(prompt, 32).unwrap();
+        assert_eq!(
+            actual.generation.generated_token_ids,
+            expected.generation.generated_token_ids
+        );
+        assert_eq!(actual.finish_reason, expected.finish_reason);
+        assert!(actual.generation.final_logits.is_empty());
+        assert_eq!(
+            actual.metrics.prefill_command_buffer_count,
+            actual.metrics.prefill_tokens as u64
+        );
+        assert_eq!(
+            actual.metrics.decode_command_buffer_count,
+            actual.metrics.decode_tokens as u64
+        );
+        assert_eq!(
+            actual.metrics.command_buffer_count,
+            actual.metrics.prefill_command_buffer_count
+                + actual.metrics.decode_command_buffer_count
+        );
+        assert_eq!(
+            actual.metrics.readback_bytes,
+            4 * (actual.metrics.prefill_tokens + actual.metrics.decode_tokens) as u64
+        );
+        assert_eq!(actual.metrics.post_warmup_allocations, 0);
+        assert!(actual.metrics.resident_arena_allocations > 0);
+    }
 }
 
 #[test]
@@ -316,7 +335,7 @@ fn phase_08b_final_logits_are_explicit_diagnostics() {
 
 #[test]
 #[ignore = "requires local Metal and the downloaded small fixture"]
-fn phase_08b_single_token_stage_trace_is_exact_at_position_zero() {
+fn phase_08c_single_token_stage_trace_is_exact_at_position_zero() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let fixture = root.join("models/hf/SmolLM2-135M-Instruct");
     let model = match AtlasModel::load(&fixture) {
@@ -334,7 +353,7 @@ fn phase_08b_single_token_stage_trace_is_exact_at_position_zero() {
 
 #[test]
 #[ignore = "requires local Metal and the downloaded small fixture"]
-fn phase_08b_prompt_prefix_stage_trace_stops_at_first_mismatch() {
+fn phase_08c_prompt_prefix_stage_trace_has_no_divergence() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let fixture = root.join("models/hf/SmolLM2-135M-Instruct");
     let model = match AtlasModel::load(&fixture) {
@@ -342,16 +361,11 @@ fn phase_08b_prompt_prefix_stage_trace_stops_at_first_mismatch() {
         Err(error) if format!("{error:#}").contains("no Metal device is available") => return,
         Err(error) => panic!("load small fixture: {error:#}"),
     };
-    // When parity is restored this returns None; while a fault remains, the
-    // returned comparison is the earliest prompt token/stage in trace order.
-    let result =
-        AtlasExecutor::trace_resident_prompt(&model, "The capital of France is", 1e-5).unwrap();
-    if let Some(result) = result {
-        assert!(
-            result.prompt_token_index < model.tokenize("The capital of France is").unwrap().len()
-        );
-        assert!(result.first_failing_index.is_some());
-    }
+    assert!(
+        AtlasExecutor::trace_resident_prompt(&model, "The capital of France is", 1e-5)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]

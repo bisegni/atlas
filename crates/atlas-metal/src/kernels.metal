@@ -187,18 +187,41 @@ kernel void logits_process_f32(
 kernel void rope_llama_decode_f32(
     device const float *input [[buffer(0)]], device float *output [[buffer(1)]],
     constant uint &heads [[buffer(2)]], constant uint &head_dim [[buffer(3)]],
-    constant uint &position [[buffer(4)]], constant float &theta [[buffer(5)]],
+    device const float *cosine [[buffer(4)]], device const float *sine [[buffer(5)]],
     uint id [[thread_position_in_grid]]) {
     uint pairs = head_dim / 2;
     uint head = id / pairs;
     uint pair = id % pairs;
     if (head < heads && pair < pairs) {
         uint base = head * head_dim;
-        float angle = float(position) / pow(theta, float(pair * 2) / float(head_dim));
-        float c = cos(angle), s = sin(angle);
+        float c = cosine[pair], s = sine[pair];
         float x0 = input[base + pair], x1 = input[base + pair + pairs];
         output[base + pair] = x0 * c - x1 * s;
         output[base + pair + pairs] = x0 * s + x1 * c;
+    }
+}
+
+kernel void rope_half_to_interleaved_f32(
+    device const float *input [[buffer(0)]], device float *output [[buffer(1)]],
+    constant uint &heads [[buffer(2)]], constant uint &head_dim [[buffer(3)]],
+    uint id [[thread_position_in_grid]]) {
+    uint pairs = head_dim / 2, head = id / pairs, pair = id % pairs;
+    if (head < heads && pair < pairs) {
+        uint base = head * head_dim;
+        output[base + pair * 2] = input[base + pair];
+        output[base + pair * 2 + 1] = input[base + pair + pairs];
+    }
+}
+
+kernel void rope_interleaved_to_half_f32(
+    device const float *input [[buffer(0)]], device float *output [[buffer(1)]],
+    constant uint &heads [[buffer(2)]], constant uint &head_dim [[buffer(3)]],
+    uint id [[thread_position_in_grid]]) {
+    uint pairs = head_dim / 2, head = id / pairs, pair = id % pairs;
+    if (head < heads && pair < pairs) {
+        uint base = head * head_dim;
+        output[base + pair] = input[base + pair * 2];
+        output[base + pair + pairs] = input[base + pair * 2 + 1];
     }
 }
 
@@ -243,6 +266,51 @@ kernel void attention_decode_f32(
         value += weight * cache[value_base + pos * kv_heads * head_dim + kv_head * head_dim + dim];
     }
     output[id] = value / denominator;
+}
+
+// Resident-layout equivalents of the reference score -> softmax -> value
+// pipeline. Persistent intermediate buffers intentionally preserve the same
+// FP32 rounding boundaries as the reference kernels.
+kernel void attention_scores_resident_f32(
+    device const float *query [[buffer(0)]], device const float *cache [[buffer(1)]],
+    device float *scores [[buffer(2)]], constant uint &heads [[buffer(3)]],
+    constant uint &kv_heads [[buffer(4)]], constant uint &head_dim [[buffer(5)]],
+    constant uint &capacity [[buffer(6)]], constant uint &key_count [[buffer(7)]],
+    uint id [[thread_position_in_grid]]) {
+    uint head = id / key_count, position = id % key_count;
+    if (head >= heads || position >= key_count) return;
+    uint kv_head = head / (heads / kv_heads), base = position * kv_heads * head_dim + kv_head * head_dim;
+    float sum = 0.0f;
+    for (uint d = 0; d < head_dim; ++d) sum += query[head * head_dim + d] * cache[base + d];
+    scores[head * capacity + position] = sum * rsqrt(float(head_dim));
+}
+
+kernel void masked_softmax_resident_f32(
+    device const float *scores [[buffer(0)]], device float *weights [[buffer(1)]],
+    constant uint &heads [[buffer(2)]], constant uint &capacity [[buffer(3)]],
+    constant uint &key_count [[buffer(4)]], uint head [[thread_position_in_grid]]) {
+    if (head >= heads) return;
+    uint base = head * capacity;
+    float maximum = -INFINITY;
+    for (uint key = 0; key < key_count; ++key) maximum = max(maximum, scores[base + key]);
+    float sum = 0.0f;
+    for (uint key = 0; key < key_count; ++key) { float value = exp(scores[base + key] - maximum); weights[base + key] = value; sum += value; }
+    for (uint key = 0; key < key_count; ++key) weights[base + key] /= sum;
+}
+
+kernel void attention_values_resident_f32(
+    device const float *weights [[buffer(0)]], device const float *cache [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &heads [[buffer(3)]],
+    constant uint &kv_heads [[buffer(4)]], constant uint &head_dim [[buffer(5)]],
+    constant uint &capacity [[buffer(6)]], constant uint &key_count [[buffer(7)]],
+    uint id [[thread_position_in_grid]]) {
+    uint head = id / head_dim, dim = id % head_dim;
+    if (head >= heads || dim >= head_dim) return;
+    uint kv_head = head / (heads / kv_heads), value_base = capacity * kv_heads * head_dim;
+    float sum = 0.0f;
+    for (uint key = 0; key < key_count; ++key)
+        sum += weights[head * capacity + key] * cache[value_base + key * kv_heads * head_dim + kv_head * head_dim + dim];
+    output[id] = sum;
 }
 
 kernel void argmax_f32(

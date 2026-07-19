@@ -102,13 +102,14 @@ mod macos {
             buffers: &[&GpuBuffer],
             count: usize,
         ) -> Result<(), MetalError> {
-            if let Some(encoder) = self.encoder.take() {
-                encoder.endEncoding();
+            if self.encoder.is_none() {
+                self.encoder = Some(
+                    self.command_buffer
+                        .computeCommandEncoder()
+                        .ok_or(MetalError::CommandCreation)?,
+                );
             }
-            let encoder = self
-                .command_buffer
-                .computeCommandEncoder()
-                .ok_or(MetalError::CommandCreation)?;
+            let encoder = self.encoder.as_ref().expect("compute encoder exists");
             let pipeline = self
                 .runtime
                 .pipelines
@@ -132,7 +133,6 @@ mod macos {
                     depth: 1,
                 },
             );
-            self.encoder = Some(encoder);
             Ok(())
         }
 
@@ -145,13 +145,14 @@ mod macos {
             buffers: &[(&GpuBuffer, usize)],
             count: usize,
         ) -> Result<(), MetalError> {
-            if let Some(encoder) = self.encoder.take() {
-                encoder.endEncoding();
+            if self.encoder.is_none() {
+                self.encoder = Some(
+                    self.command_buffer
+                        .computeCommandEncoder()
+                        .ok_or(MetalError::CommandCreation)?,
+                );
             }
-            let encoder = self
-                .command_buffer
-                .computeCommandEncoder()
-                .ok_or(MetalError::CommandCreation)?;
+            let encoder = self.encoder.as_ref().expect("compute encoder exists");
             let pipeline = self
                 .runtime
                 .pipelines
@@ -180,7 +181,6 @@ mod macos {
                     depth: 1,
                 },
             );
-            self.encoder = Some(encoder);
             Ok(())
         }
 
@@ -387,8 +387,13 @@ mod macos {
                 "attention_values_f32",
                 "logits_process_f32",
                 "rope_llama_decode_f32",
+                "rope_half_to_interleaved_f32",
+                "rope_interleaved_to_half_f32",
                 "kv_append_decode_f32",
                 "attention_decode_f32",
+                "attention_scores_resident_f32",
+                "masked_softmax_resident_f32",
+                "attention_values_resident_f32",
                 "argmax_f32",
             ] {
                 let function_name = NSString::from_str(kernel);

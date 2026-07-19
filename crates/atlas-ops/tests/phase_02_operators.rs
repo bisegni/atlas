@@ -41,7 +41,7 @@ fn assert_close(operator: &str, actual: &[f32], expected: &[f32], tolerance: f32
 #[test]
 fn fp32_neural_operators_match_cpu_oracles_for_prefill_and_decode() {
     let Some(ops) = require_ops() else { return };
-    assert_eq!(ops.runtime().pipeline_count(), 15);
+    assert_eq!(ops.runtime().pipeline_count(), 25);
 
     let table = [0.0, 0.1, 0.2, 0.3, 1.0, 1.1, 1.2, 1.3, 2.0, 2.1, 2.2, 2.3];
     let (embedded, _) = ops.embedding(&table, 3, 4, &[2, 0]).unwrap();

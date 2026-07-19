@@ -55,7 +55,7 @@ fn main() -> Result<()> {
         Some("phase_08b_decode") => phase_08b_decode(&args[1..]),
         _ => {
             eprintln!(
-                "usage: atlas-cli chat --model small [--prompt TEXT] [--max-tokens N] | atlas-cli metal-info | atlas-cli fixture verify --model small [--model-dir PATH] | atlas-cli generate --model small --prompt TEXT --max-new-tokens N --greedy [--golden PATH] | atlas-cli phase_03_model --model larger [--model-dir PATH] | atlas-cli phase_05_quant --model small --format fp16|int8|q4 [--tensor NAME] | atlas-cli phase_08b_decode --model small --prompt TEXT [--warmup N] [--max-new-tokens N] [--trace-logits|--trace-stages]"
+                "usage: atlas-cli chat --model small [--prompt TEXT] [--max-tokens N] | atlas-cli metal-info | atlas-cli fixture verify --model small [--model-dir PATH] | atlas-cli generate --model small --prompt TEXT --max-new-tokens N --greedy [--golden PATH] | atlas-cli phase_03_model --model larger [--model-dir PATH] | atlas-cli phase_05_quant --model small --format fp16|int8|q4 [--tensor NAME] | atlas-cli phase_08b_decode --model small --prompt TEXT [--warmup N] [--max-new-tokens N] [--trace-logits|--trace-stages] [--trace-tolerance N]"
             );
             bail!("invalid command")
         }
@@ -425,6 +425,7 @@ fn phase_08b_decode(args: &[String]) -> Result<()> {
     let mut max_new_tokens = 16usize;
     let mut trace_logits = false;
     let mut trace_stages = false;
+    let mut trace_tolerance = 1e-5f32;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -460,6 +461,18 @@ fn phase_08b_decode(args: &[String]) -> Result<()> {
             }
             "--trace-logits" => trace_logits = true,
             "--trace-stages" => trace_stages = true,
+            "--trace-tolerance" => {
+                index += 1;
+                trace_tolerance = args
+                    .get(index)
+                    .context("--trace-tolerance needs a value")?
+                    .parse()
+                    .context("parse --trace-tolerance")?;
+                ensure!(
+                    trace_tolerance.is_finite() && trace_tolerance >= 0.0,
+                    "--trace-tolerance must be finite and non-negative"
+                );
+            }
             flag => bail!("unknown phase_08b_decode option: {flag}"),
         }
         index += 1;
@@ -473,7 +486,7 @@ fn phase_08b_decode(args: &[String]) -> Result<()> {
     let (model_name, directory) = model_dir(&model_args)?;
     let model = AtlasModel::load(directory)?;
     if trace_stages {
-        match AtlasExecutor::trace_resident_prompt(&model, &prompt, 1e-5)? {
+        match AtlasExecutor::trace_resident_prompt(&model, &prompt, trace_tolerance)? {
             Some(result) => {
                 println!(
                     "first_divergence prompt_token={} layer={} stage={} elements={} max_abs_error={:.8} first_index={} expected={:.8} actual={:.8}",

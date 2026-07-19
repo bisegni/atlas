@@ -26,12 +26,16 @@ pub enum ResidentStage {
     RopeQ,
     RopeK,
     Attention,
+    AttentionOutputProjection,
+    AttentionResidualInput,
     AttentionResidual,
     PostAttentionNorm,
     Gate,
     Up,
     SiLU,
     MlpProduct,
+    MlpDownProjection,
+    MlpResidualInput,
     MlpResidual,
     FinalNorm,
     Logits,
@@ -48,18 +52,32 @@ impl std::fmt::Display for ResidentStage {
             Self::RopeQ => "rope_q",
             Self::RopeK => "rope_k",
             Self::Attention => "attention",
+            Self::AttentionOutputProjection => "attention_output_projection",
+            Self::AttentionResidualInput => "attention_residual_input",
             Self::AttentionResidual => "attention_residual",
             Self::PostAttentionNorm => "post_attention_norm",
             Self::Gate => "gate",
             Self::Up => "up",
             Self::SiLU => "silu",
             Self::MlpProduct => "mlp_product",
+            Self::MlpDownProjection => "mlp_down_projection",
+            Self::MlpResidualInput => "mlp_residual_input",
             Self::MlpResidual => "mlp_residual",
             Self::FinalNorm => "final_norm",
             Self::Logits => "logits",
         };
         f.write_str(name)
     }
+}
+
+/// Per-stage FP32 comparison limits for the resident trace.
+///
+/// Phase 8.3 starts from the caller's elementwise threshold for every stage.
+/// A reduction-specific allowance may only be added after its input shape and
+/// error bound are established by the hardware parity suite.
+pub fn resident_stage_tolerance(stage: ResidentStage, default: f32) -> f32 {
+    let _ = stage;
+    default
 }
 
 /// The first observed difference at a resident decode diagnostic boundary.
@@ -228,6 +246,7 @@ impl ExecutorMetrics {
 pub struct ExecutorGeneration {
     pub generation: Generation,
     pub metrics: ExecutorMetrics,
+    pub finish_reason: GenerationFinishReason,
 }
 
 /// Why a streaming greedy generation completed normally.
@@ -284,10 +303,15 @@ struct ResidentExecutor {
     norm: GpuBuffer,
     q: GpuBuffer,
     q_rot: GpuBuffer,
+    rope_input: GpuBuffer,
+    rope_output: GpuBuffer,
     k: GpuBuffer,
     k_rot: GpuBuffer,
     v: GpuBuffer,
     attention: GpuBuffer,
+    attention_scores: GpuBuffer,
+    attention_weights: GpuBuffer,
+    attention_key_count: GpuBuffer,
     gate: GpuBuffer,
     up: GpuBuffer,
     activated: GpuBuffer,
@@ -302,7 +326,10 @@ struct ResidentExecutor {
     capacity: GpuBuffer,
     vocab: GpuBuffer,
     epsilon: GpuBuffer,
-    theta: GpuBuffer,
+    rope_cos: GpuBuffer,
+    rope_sin: GpuBuffer,
+    rope_cos_host: Vec<f32>,
+    rope_sin_host: Vec<f32>,
     one: GpuBuffer,
     max_context: usize,
     position_index: usize,
@@ -339,10 +366,15 @@ impl ResidentExecutor {
             norm: allocate_f32(h)?,
             q: allocate_f32(h)?,
             q_rot: allocate_f32(h)?,
+            rope_input: allocate_f32(h)?,
+            rope_output: allocate_f32(h)?,
             k: allocate_f32(kv_width)?,
             k_rot: allocate_f32(kv_width)?,
             v: allocate_f32(kv_width)?,
             attention: allocate_f32(h)?,
+            attention_scores: allocate_f32(c.num_attention_heads * capacity)?,
+            attention_weights: allocate_f32(c.num_attention_heads * capacity)?,
+            attention_key_count: runtime.allocate(4)?,
             gate: allocate_f32(c.intermediate_size)?,
             up: allocate_f32(c.intermediate_size)?,
             activated: allocate_f32(c.intermediate_size)?,
@@ -357,7 +389,10 @@ impl ResidentExecutor {
             capacity: runtime.upload_u32(&[u32::try_from(capacity)?])?,
             vocab: runtime.upload_u32(&[u32::try_from(c.vocab_size)?])?,
             epsilon: runtime.upload_f32(&[c.rms_norm_eps])?,
-            theta: runtime.upload_f32(&[c.rope_theta])?,
+            rope_cos: allocate_f32(c.head_dim() / 2)?,
+            rope_sin: allocate_f32(c.head_dim() / 2)?,
+            rope_cos_host: vec![0.0; c.head_dim() / 2],
+            rope_sin_host: vec![0.0; c.head_dim() / 2],
             one: runtime.upload_u32(&[1])?,
             max_context: capacity,
             position_index: 0,
@@ -369,7 +404,7 @@ impl ResidentExecutor {
         self.position_index = 0;
     }
     fn allocations(&self) -> u64 {
-        24 + self.kv.len() as u64
+        30 + self.kv.len() as u64
     }
     fn weight(&self, name: &str) -> Result<&GpuBuffer> {
         self.weights
@@ -390,6 +425,121 @@ impl ResidentExecutor {
         Ok(())
     }
 
+    /// Match the reference RoPE oracle's host `powf`/trigonometric evaluation
+    /// exactly, then bind those values to the half-split resident kernel. This
+    /// avoids CPU/GPU math-library drift at non-zero positions without adding a
+    /// decode-time allocation or command buffer.
+    fn write_rope_tables(&mut self, model: &AtlasModel) -> Result<()> {
+        let head_dim = model.config.head_dim();
+        for pair in 0..head_dim / 2 {
+            let angle = self.position_index as f32
+                / model
+                    .config
+                    .rope_theta
+                    .powf((pair * 2) as f32 / head_dim as f32);
+            self.rope_cos_host[pair] = angle.cos();
+            self.rope_sin_host[pair] = angle.sin();
+        }
+        let runtime = model.ops.runtime();
+        runtime.write_f32(&self.rope_cos, &self.rope_cos_host)?;
+        runtime.write_f32(&self.rope_sin, &self.rope_sin_host)?;
+        Ok(())
+    }
+
+    fn trace_rope(
+        &self,
+        runtime: &atlas_metal::MetalRuntime,
+        input: &GpuBuffer,
+        output: &GpuBuffer,
+        heads: &GpuBuffer,
+        count: usize,
+    ) -> Result<()> {
+        self.trace_dispatch(
+            runtime,
+            "rope_half_to_interleaved_f32",
+            &[input, &self.rope_input, heads, &self.head_dim],
+            count,
+        )?;
+        self.trace_dispatch(
+            runtime,
+            "rope_f32",
+            &[
+                &self.rope_input,
+                &self.rope_cos,
+                &self.rope_sin,
+                &self.rope_output,
+                &self.head_dim,
+            ],
+            count,
+        )?;
+        self.trace_dispatch(
+            runtime,
+            "rope_interleaved_to_half_f32",
+            &[&self.rope_output, output, heads, &self.head_dim],
+            count,
+        )
+    }
+
+    fn write_attention_key_count(&self, runtime: &atlas_metal::MetalRuntime) -> Result<()> {
+        runtime.write_u32(
+            &self.attention_key_count,
+            &[u32::try_from(self.position_index + 1)?],
+        )?;
+        Ok(())
+    }
+
+    fn trace_attention(
+        &self,
+        runtime: &atlas_metal::MetalRuntime,
+        cache: &GpuBuffer,
+        heads: usize,
+        hidden: usize,
+    ) -> Result<()> {
+        let keys = self.position_index + 1;
+        self.trace_dispatch(
+            runtime,
+            "attention_scores_resident_f32",
+            &[
+                &self.q_rot,
+                cache,
+                &self.attention_scores,
+                &self.heads,
+                &self.kv_heads,
+                &self.head_dim,
+                &self.capacity,
+                &self.attention_key_count,
+            ],
+            heads * keys,
+        )?;
+        self.trace_dispatch(
+            runtime,
+            "masked_softmax_resident_f32",
+            &[
+                &self.attention_scores,
+                &self.attention_weights,
+                &self.heads,
+                &self.capacity,
+                &self.attention_key_count,
+            ],
+            heads,
+        )?;
+        self.trace_dispatch(
+            runtime,
+            "attention_values_resident_f32",
+            &[
+                &self.attention_weights,
+                cache,
+                &self.attention,
+                &self.heads,
+                &self.kv_heads,
+                &self.head_dim,
+                &self.capacity,
+                &self.attention_key_count,
+            ],
+            hidden,
+        )
+    }
+
     fn trace_token(&mut self, model: &AtlasModel, token: u32) -> Result<Vec<StageSnapshot>> {
         ensure!(
             self.position_index < self.max_context,
@@ -401,6 +551,8 @@ impl ResidentExecutor {
         let kv_width = c.num_key_value_heads * c.head_dim();
         runtime.write_u32(&self.token, &[token])?;
         runtime.write_u32(&self.position, &[u32::try_from(self.position_index)?])?;
+        self.write_rope_tables(model)?;
+        self.write_attention_key_count(runtime)?;
         let mut snapshots = Vec::new();
         let capture = |stage, layer, buffer: &GpuBuffer, count| -> Result<StageSnapshot> {
             Ok(StageSnapshot {
@@ -467,33 +619,9 @@ impl ResidentExecutor {
                 )?;
                 snapshots.push(capture(stage, Some(layer), output, width)?);
             }
-            self.trace_dispatch(
-                runtime,
-                "rope_llama_decode_f32",
-                &[
-                    &self.q,
-                    &self.q_rot,
-                    &self.heads,
-                    &self.head_dim,
-                    &self.position,
-                    &self.theta,
-                ],
-                h / 2,
-            )?;
+            self.trace_rope(runtime, &self.q, &self.q_rot, &self.heads, h / 2)?;
             snapshots.push(capture(ResidentStage::RopeQ, Some(layer), &self.q_rot, h)?);
-            self.trace_dispatch(
-                runtime,
-                "rope_llama_decode_f32",
-                &[
-                    &self.k,
-                    &self.k_rot,
-                    &self.kv_heads,
-                    &self.head_dim,
-                    &self.position,
-                    &self.theta,
-                ],
-                kv_width / 2,
-            )?;
+            self.trace_rope(runtime, &self.k, &self.k_rot, &self.kv_heads, kv_width / 2)?;
             snapshots.push(capture(
                 ResidentStage::RopeK,
                 Some(layer),
@@ -513,21 +641,7 @@ impl ResidentExecutor {
                 ],
                 kv_width,
             )?;
-            self.trace_dispatch(
-                runtime,
-                "attention_decode_f32",
-                &[
-                    &self.q_rot,
-                    &self.kv[layer],
-                    &self.attention,
-                    &self.heads,
-                    &self.kv_heads,
-                    &self.head_dim,
-                    &self.capacity,
-                    &self.position,
-                ],
-                h,
-            )?;
+            self.trace_attention(runtime, &self.kv[layer], c.num_attention_heads, h)?;
             snapshots.push(capture(
                 ResidentStage::Attention,
                 Some(layer),
@@ -546,6 +660,18 @@ impl ResidentExecutor {
                 ],
                 h,
             )?;
+            snapshots.push(capture(
+                ResidentStage::AttentionOutputProjection,
+                Some(layer),
+                &self.work,
+                h,
+            )?);
+            snapshots.push(capture(
+                ResidentStage::AttentionResidualInput,
+                Some(layer),
+                &self.state,
+                h,
+            )?);
             self.trace_dispatch(
                 runtime,
                 "vector_add_f32",
@@ -630,6 +756,18 @@ impl ResidentExecutor {
                 ],
                 h,
             )?;
+            snapshots.push(capture(
+                ResidentStage::MlpDownProjection,
+                Some(layer),
+                &self.work,
+                h,
+            )?);
+            snapshots.push(capture(
+                ResidentStage::MlpResidualInput,
+                Some(layer),
+                &self.residual,
+                h,
+            )?);
             self.trace_dispatch(
                 runtime,
                 "vector_add_f32",
@@ -685,6 +823,8 @@ impl ResidentExecutor {
         let runtime = model.ops.runtime();
         runtime.write_u32(&self.token, &[token])?;
         runtime.write_u32(&self.position, &[u32::try_from(self.position_index)?])?;
+        self.write_rope_tables(model)?;
+        self.write_attention_key_count(runtime)?;
         let mut command = runtime.begin_resident_command()?;
         let embed = self.weight("model.embed_tokens.weight")?;
         command.dispatch_1d(
@@ -730,26 +870,49 @@ impl ResidentExecutor {
                 )?;
             }
             command.dispatch_1d(
-                "rope_llama_decode_f32",
+                "rope_half_to_interleaved_f32",
+                &[&self.q, &self.rope_input, &self.heads, &self.head_dim],
+                model.config.hidden_size / 2,
+            )?;
+            command.dispatch_1d(
+                "rope_f32",
                 &[
-                    &self.q,
-                    &self.q_rot,
-                    &self.heads,
+                    &self.rope_input,
+                    &self.rope_cos,
+                    &self.rope_sin,
+                    &self.rope_output,
                     &self.head_dim,
-                    &self.position,
-                    &self.theta,
                 ],
                 model.config.hidden_size / 2,
             )?;
             command.dispatch_1d(
-                "rope_llama_decode_f32",
+                "rope_interleaved_to_half_f32",
+                &[&self.rope_output, &self.q_rot, &self.heads, &self.head_dim],
+                model.config.hidden_size / 2,
+            )?;
+            command.dispatch_1d(
+                "rope_half_to_interleaved_f32",
+                &[&self.k, &self.rope_input, &self.kv_heads, &self.head_dim],
+                self.k.bytes() / 8,
+            )?;
+            command.dispatch_1d(
+                "rope_f32",
                 &[
-                    &self.k,
+                    &self.rope_input,
+                    &self.rope_cos,
+                    &self.rope_sin,
+                    &self.rope_output,
+                    &self.head_dim,
+                ],
+                self.k.bytes() / 8,
+            )?;
+            command.dispatch_1d(
+                "rope_interleaved_to_half_f32",
+                &[
+                    &self.rope_output,
                     &self.k_rot,
                     &self.kv_heads,
                     &self.head_dim,
-                    &self.position,
-                    &self.theta,
                 ],
                 self.k.bytes() / 8,
             )?;
@@ -765,17 +928,43 @@ impl ResidentExecutor {
                 ],
                 self.kv_width.bytes() / 4,
             )?;
+            let attention_keys = self.position_index + 1;
             command.dispatch_1d(
-                "attention_decode_f32",
+                "attention_scores_resident_f32",
                 &[
                     &self.q_rot,
+                    &self.kv[layer],
+                    &self.attention_scores,
+                    &self.heads,
+                    &self.kv_heads,
+                    &self.head_dim,
+                    &self.capacity,
+                    &self.attention_key_count,
+                ],
+                model.config.num_attention_heads * attention_keys,
+            )?;
+            command.dispatch_1d(
+                "masked_softmax_resident_f32",
+                &[
+                    &self.attention_scores,
+                    &self.attention_weights,
+                    &self.heads,
+                    &self.capacity,
+                    &self.attention_key_count,
+                ],
+                model.config.num_attention_heads,
+            )?;
+            command.dispatch_1d(
+                "attention_values_resident_f32",
+                &[
+                    &self.attention_weights,
                     &self.kv[layer],
                     &self.attention,
                     &self.heads,
                     &self.kv_heads,
                     &self.head_dim,
                     &self.capacity,
-                    &self.position,
+                    &self.attention_key_count,
                 ],
                 model.config.hidden_size,
             )?;
@@ -921,7 +1110,9 @@ impl<'a> AtlasExecutor<'a> {
     ) -> Result<Option<StageComparison>> {
         ensure!(tolerance >= 0.0, "stage tolerance must be non-negative");
         ensure!(!tokens.is_empty(), "prompt tokenizes to no tokens");
-        let capacity = tokens.len();
+        // Match normal decode capacity so resident diagnostic buffers use the
+        // same KV/value and attention-stride layout as generation.
+        let capacity = ExecutorConfig::default().max_context;
         let mut reference = Self::new(
             model,
             ExecutorConfig {
@@ -966,7 +1157,7 @@ impl<'a> AtlasExecutor<'a> {
                     left.layer,
                     &left.values,
                     &right.values,
-                    tolerance,
+                    resident_stage_tolerance(left.stage, tolerance),
                 ) {
                     return Ok(Some(comparison));
                 }
@@ -1264,6 +1455,7 @@ impl<'a> AtlasExecutor<'a> {
                     .as_ref()
                     .map_or(0, ResidentExecutor::allocations),
             },
+            finish_reason,
         };
         callback(GenerationEvent::Finished {
             reason: finish_reason,
@@ -1469,6 +1661,16 @@ impl<'a> AtlasExecutor<'a> {
                 h,
                 atlas_ops::ExecutionMode::Decode,
             )?;
+            snapshots.push(StageSnapshot {
+                stage: ResidentStage::AttentionOutputProjection,
+                layer: Some(layer),
+                values: projected.clone(),
+            });
+            snapshots.push(StageSnapshot {
+                stage: ResidentStage::AttentionResidualInput,
+                layer: Some(layer),
+                values: state.clone(),
+            });
             let residual = self.model.ops.add(&state, &projected)?.0;
             snapshots.push(StageSnapshot {
                 stage: ResidentStage::AttentionResidual,
@@ -1539,6 +1741,16 @@ impl<'a> AtlasExecutor<'a> {
                 h,
                 atlas_ops::ExecutionMode::Decode,
             )?;
+            snapshots.push(StageSnapshot {
+                stage: ResidentStage::MlpDownProjection,
+                layer: Some(layer),
+                values: mlp.clone(),
+            });
+            snapshots.push(StageSnapshot {
+                stage: ResidentStage::MlpResidualInput,
+                layer: Some(layer),
+                values: residual.clone(),
+            });
             state = self.model.ops.add(&residual, &mlp)?.0;
             snapshots.push(StageSnapshot {
                 stage: ResidentStage::MlpResidual,
