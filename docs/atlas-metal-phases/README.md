@@ -16,7 +16,8 @@ cross-phase exit rules.
 | 6 | [Prefill and decode executors]([done]%20phase-06-prefill-decode.md) |
 | 7 | [Interactive CLI]([done]%20phase-07-interactive-cli.md) |
 | 8 | [Streaming generation]([done]%20phase-08-streaming-generation.md) |
-| 8.1 | [GPU-resident decode performance](phase-08a-gpu-resident-decode-performance.md) |
+| 8.1 | [GPU-resident decode foundation]([done]%20phase-08a-gpu-resident-decode-foundation.md) |
+| 8.2 | [GPU-resident executor integration](phase-08b-gpu-resident-executor.md) |
 | 9 | [Local API server](phase-09-local-api-server.md) |
 | 10 | [Sampling engine](phase-10-sampling.md) |
 | 11 | [Runtime and scheduler](phase-11-runtime-scheduler.md) |
