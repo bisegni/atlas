@@ -1,8 +1,11 @@
 //! Llama-compatible, correctness-first transformer execution for Atlas Phase 3.
 //!
 //! This module deliberately recomputes the complete prompt for each greedy
-//! token. Phase 4 replaces that behavior with a KV cache; keeping it explicit
-//! prevents Phase 3 from claiming cache coverage it does not have.
+//! token.  The Phase-4 cache types live in [`kv_cache`]; executor integration
+//! is deliberately deferred to Phase 6, where prefill and decode plans are
+//! introduced together.
+
+pub mod kv_cache;
 
 use std::{
     collections::HashMap,

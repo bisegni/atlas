@@ -1,8 +1,10 @@
 //! Backend-neutral tensor metadata and SafeTensors descriptors for Atlas.
 
+mod quant;
 mod safetensors;
 mod tensor;
 
+pub use quant::{QuantFormat, QuantizedMatrix};
 pub use safetensors::{
     SafeTensorDescriptor, read_safetensors_descriptors, read_safetensors_tensor_f32,
 };

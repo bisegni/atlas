@@ -3,9 +3,13 @@ use std::{
     env, fs,
     io::Read,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
+use atlas_core::{
+    QuantFormat, QuantizedMatrix, read_safetensors_descriptors, read_safetensors_tensor_f32,
+};
 use atlas_metal::MetalRuntime;
 use atlas_model::{AtlasModel, validate_generation_golden};
 use serde_json::Value;
@@ -19,13 +23,122 @@ fn main() -> Result<()> {
         }
         Some("generate") => generate(&args[1..]),
         Some("phase_03_model") => phase_03_model(&args[1..]),
+        Some("phase_05_quant") => phase_05_quant(&args[1..]),
         _ => {
             eprintln!(
-                "usage: atlas-cli metal-info | atlas-cli fixture verify --model small [--model-dir PATH] | atlas-cli generate --model small --prompt TEXT --max-new-tokens N --greedy [--golden PATH] | atlas-cli phase_03_model --model larger [--model-dir PATH]"
+                "usage: atlas-cli metal-info | atlas-cli fixture verify --model small [--model-dir PATH] | atlas-cli generate --model small --prompt TEXT --max-new-tokens N --greedy [--golden PATH] | atlas-cli phase_03_model --model larger [--model-dir PATH] | atlas-cli phase_05_quant --model small --format fp16|int8|q4 [--tensor NAME]"
             );
             bail!("invalid command")
         }
     }
+}
+
+fn phase_05_quant(args: &[String]) -> Result<()> {
+    let mut model_args = Vec::new();
+    let mut format = None;
+    let mut tensor_name = "lm_head.weight".to_owned();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--model" | "--model-dir" => {
+                model_args.push(args[index].clone());
+                index += 1;
+                model_args.push(
+                    args.get(index)
+                        .context("model option needs a value")?
+                        .clone(),
+                );
+            }
+            "--format" => {
+                index += 1;
+                format = Some(QuantFormat::parse(
+                    args.get(index).context("--format needs a value")?,
+                )?);
+            }
+            "--tensor" => {
+                index += 1;
+                tensor_name = args.get(index).context("--tensor needs a value")?.clone();
+            }
+            flag => bail!("unknown phase_05_quant option: {flag}"),
+        }
+        index += 1;
+    }
+    let format = format.context("--format is required")?;
+    let (_, directory) = model_dir(&model_args)?;
+    let path = directory.join("model.safetensors");
+    ensure!(
+        path.exists(),
+        "phase_05_quant currently requires an unsharded model.safetensors fixture"
+    );
+    let descriptor = read_safetensors_descriptors(&path)?
+        .into_iter()
+        .find(|item| item.name == tensor_name)
+        .with_context(|| format!("tensor `{tensor_name}` is missing from {}", path.display()))?;
+    let dims = descriptor.tensor.shape.dims();
+    ensure!(dims.len() == 2, "phase_05_quant tensor must be rank 2");
+    let values = read_safetensors_tensor_f32(&path, &tensor_name)?;
+    let packed = QuantizedMatrix::quantize(&values, dims[0], dims[1], format)?;
+    let input: Vec<f32> = (0..dims[1])
+        .map(|index| ((index as f32) * 0.013).sin())
+        .collect();
+    let baseline_start = Instant::now();
+    let baseline = (0..64)
+        .map(|_| {
+            (0..dims[0])
+                .map(|row| {
+                    (0..dims[1])
+                        .map(|column| input[column] * values[row * dims[1] + column])
+                        .sum::<f32>()
+                })
+                .collect::<Vec<_>>()
+        })
+        .last()
+        .unwrap();
+    let baseline_time = baseline_start.elapsed();
+    let quant_start = Instant::now();
+    let quantized = (0..64)
+        .map(|_| packed.matvec_cpu(&input))
+        .collect::<Result<Vec<_>, _>>()?
+        .pop()
+        .unwrap();
+    let quant_time = quant_start.elapsed();
+    let max_delta = baseline
+        .iter()
+        .zip(&quantized)
+        .map(|(left, right)| (left - right).abs())
+        .fold(0.0, f32::max);
+    let baseline_token = baseline
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(index, _)| index);
+    let quantized_token = quantized
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(index, _)| index);
+    println!("format: {}", format.name());
+    println!("tensor: {tensor_name} shape={:?}", dims);
+    println!("source_bytes: {}", values.len() * 4);
+    println!("packed_bytes: {}", packed.resident_bytes());
+    println!("max_logit_delta: {:.8}", max_delta);
+    println!("token_agreement: {}", baseline_token == quantized_token);
+    println!("baseline_tok_s: {:.2}", 64.0 / baseline_time.as_secs_f64());
+    println!("quantized_tok_s: {:.2}", 64.0 / quant_time.as_secs_f64());
+    ensure!(
+        baseline_token == quantized_token,
+        "quantized greedy token differs from FP16 baseline"
+    );
+    ensure!(
+        max_delta
+            <= if format == QuantFormat::Q4Block32 {
+                0.20
+            } else {
+                0.02
+            },
+        "logit delta exceeds Phase 5 threshold: {max_delta}"
+    );
+    Ok(())
 }
 
 fn model_dir(args: &[String]) -> Result<(String, PathBuf)> {
