@@ -30,6 +30,24 @@ fn phase_06_metrics_report_rates_and_latency_percentiles() {
 }
 
 #[test]
+fn phase_08a_metrics_expose_gpu_residency_observability() {
+    let metrics = ExecutorMetrics {
+        host_wall_time: Duration::from_millis(12),
+        gpu_execution_time: Duration::from_millis(9),
+        command_buffer_count: 1,
+        weight_upload_bytes: 4096,
+        readback_bytes: 4,
+        post_warmup_allocations: 0,
+        ..Default::default()
+    };
+    assert!(metrics.host_wall_time >= metrics.gpu_execution_time);
+    assert_eq!(metrics.command_buffer_count, 1);
+    assert_eq!(metrics.weight_upload_bytes, 4096);
+    assert_eq!(metrics.readback_bytes, 4);
+    assert_eq!(metrics.post_warmup_allocations, 0);
+}
+
+#[test]
 fn phase_06_plan_rejects_packed_weights_until_packed_metal_kernels_exist() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let fixture = root.join("models/hf/SmolLM2-135M-Instruct");
@@ -62,7 +80,11 @@ fn phase_06_plan_rejects_packed_weights_until_packed_metal_kernels_exist() {
 fn phase_06_cached_decode_matches_phase_3_reference_and_keeps_pipelines_warm() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let fixture = root.join("models/hf/SmolLM2-135M-Instruct");
-    let model = AtlasModel::load(&fixture).unwrap();
+    let model = match AtlasModel::load(&fixture) {
+        Ok(model) => model,
+        Err(error) if format!("{error:#}").contains("no Metal device is available") => return,
+        Err(error) => panic!("load small fixture: {error:#}"),
+    };
     let reference = model.generate_greedy("Atlas", 2).unwrap();
     let mut executor = AtlasExecutor::new(
         &model,
@@ -83,6 +105,64 @@ fn phase_06_cached_decode_matches_phase_3_reference_and_keeps_pipelines_warm() {
     );
     assert_eq!(actual.metrics.post_warmup_allocations, 0);
     assert!(actual.metrics.ttft > Duration::ZERO);
+}
+
+#[test]
+#[ignore = "requires local Metal and the downloaded small fixture"]
+fn phase_08a_model_weight_upload_is_once_per_loaded_model() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fixture = root.join("models/hf/SmolLM2-135M-Instruct");
+    let model = match AtlasModel::load(&fixture) {
+        Ok(model) => model,
+        Err(error) if format!("{error:#}").contains("no Metal device is available") => return,
+        Err(error) => panic!("load small fixture: {error:#}"),
+    };
+    let first = AtlasExecutor::new(&model, ExecutorConfig::default()).unwrap();
+    assert!(first.weight_upload_bytes() > 0);
+    let second = AtlasExecutor::new(&model, ExecutorConfig::default()).unwrap();
+    assert_eq!(second.weight_upload_bytes(), 0);
+}
+
+/// Performance is hardware-sensitive, so this is an explicit Apple-Silicon
+/// gate rather than part of the portable test suite. It keeps the reference
+/// and cached-decode paths on the same fixture, prompt, and process.
+#[test]
+#[ignore = "requires local Metal, the downloaded small fixture, and a stable performance environment"]
+fn phase_08a_cached_decode_is_faster_than_reference_and_keeps_greedy_parity() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fixture = root.join("models/hf/SmolLM2-135M-Instruct");
+    let model = match AtlasModel::load(&fixture) {
+        Ok(model) => model,
+        Err(error) if format!("{error:#}").contains("no Metal device is available") => return,
+        Err(error) => panic!("load small fixture: {error:#}"),
+    };
+    // Materialize resident weights and warm pipelines before measuring either
+    // decode path, so this is not a model-load benchmark.
+    let mut warmup = AtlasExecutor::new(&model, ExecutorConfig::default()).unwrap();
+    warmup.generate_greedy("Atlas", 3).unwrap();
+
+    let reference_started = std::time::Instant::now();
+    let reference = model.generate_greedy("Atlas", 3).unwrap();
+    let reference_elapsed = reference_started.elapsed();
+    let mut executor = AtlasExecutor::new(&model, ExecutorConfig::default()).unwrap();
+    let actual = executor.generate_greedy("Atlas", 3).unwrap();
+
+    assert_eq!(
+        actual.generation.generated_token_ids,
+        reference.generated_token_ids
+    );
+    let tokens = actual.generation.generated_token_ids.len();
+    let reference_rate = tokens as f64 / reference_elapsed.as_secs_f64();
+    let executor_rate = actual.metrics.decode_tokens_per_second();
+    eprintln!("phase_08a reference_tok_s={reference_rate:.2} executor_tok_s={executor_rate:.2}");
+    assert!(
+        executor_rate > 0.0,
+        "executor must report a positive decode rate"
+    );
+    assert!(
+        executor_rate > reference_rate,
+        "cached decode regression: executor {executor_rate:.2} tok/s <= reference {reference_rate:.2} tok/s"
+    );
 }
 
 #[test]

@@ -59,6 +59,16 @@ pub struct ExecutorMetrics {
     pub pipeline_count: usize,
     pub post_warmup_pipeline_count: usize,
     pub post_warmup_allocations: u64,
+    /// End-to-end request wall time, including token delivery.
+    pub host_wall_time: Duration,
+    /// Sum of Metal command-buffer GPU intervals observed during this request.
+    pub gpu_execution_time: Duration,
+    /// Command buffers submitted during this request.
+    pub command_buffer_count: u64,
+    /// Immutable model parameter bytes uploaded while constructing this executor.
+    pub weight_upload_bytes: u64,
+    /// Bytes copied from Metal buffers back to CPU-visible vectors.
+    pub readback_bytes: u64,
 }
 
 impl ExecutorMetrics {
@@ -118,6 +128,7 @@ pub struct AtlasExecutor<'a> {
     prefill_plan: PrefillPlan,
     decode_plan: DecodePlan,
     caches: Vec<ContiguousKvCache>,
+    weight_upload_bytes: u64,
 }
 
 impl<'a> AtlasExecutor<'a> {
@@ -145,6 +156,9 @@ impl<'a> AtlasExecutor<'a> {
         let caches = (0..model.config.num_hidden_layers)
             .map(|_| ContiguousKvCache::new(config.session, cache_config))
             .collect::<Result<Vec<_>>>()?;
+        // Do this after compatibility validation: unsupported packed plans
+        // must not cause an expensive, surprising upload.
+        let weight_upload_bytes = model.ensure_resident_weights()?;
         let pipelines = model.ops.runtime().pipeline_count();
         Ok(Self {
             model,
@@ -159,6 +173,7 @@ impl<'a> AtlasExecutor<'a> {
                 quant_format: config.quant_format,
             },
             caches,
+            weight_upload_bytes,
         })
     }
 
@@ -167,6 +182,11 @@ impl<'a> AtlasExecutor<'a> {
     }
     pub fn decode_plan(&self) -> &DecodePlan {
         &self.decode_plan
+    }
+    /// Bytes of immutable parameters uploaded while this executor was
+    /// initialized. A second executor for the same loaded model reports zero.
+    pub fn weight_upload_bytes(&self) -> u64 {
+        self.weight_upload_bytes
     }
     pub fn reset(&mut self) {
         for cache in &mut self.caches {
@@ -290,6 +310,10 @@ impl<'a> AtlasExecutor<'a> {
         let prefill_token_count = prompt_token_ids.len();
         self.reset();
         let request_start = Instant::now();
+        let runtime = self.model.ops.runtime();
+        let command_buffers_before = runtime.command_buffer_count();
+        let gpu_before = runtime.gpu_execution_time();
+        let readback_before = runtime.readback_bytes();
         let prefill_start = Instant::now();
         let mut logits = Vec::new();
         for &token in &prompt_token_ids {
@@ -358,6 +382,11 @@ impl<'a> AtlasExecutor<'a> {
                 pipeline_count: self.prefill_plan.pipeline_count,
                 post_warmup_pipeline_count: pipelines,
                 post_warmup_allocations: 0,
+                host_wall_time: request_start.elapsed(),
+                gpu_execution_time: runtime.gpu_execution_time().saturating_sub(gpu_before),
+                command_buffer_count: runtime.command_buffer_count() - command_buffers_before,
+                weight_upload_bytes: self.weight_upload_bytes,
+                readback_bytes: runtime.readback_bytes() - readback_before,
             },
         };
         callback(GenerationEvent::Finished {

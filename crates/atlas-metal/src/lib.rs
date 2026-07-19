@@ -14,6 +14,7 @@ mod macos {
         collections::{BTreeMap, HashMap},
         mem::size_of,
         ptr,
+        sync::atomic::{AtomicU64, Ordering},
         time::{Duration, Instant},
     };
 
@@ -60,6 +61,103 @@ mod macos {
     pub struct DispatchTiming {
         pub wall_time: Duration,
         pub gpu_time: Option<Duration>,
+    }
+
+    /// An owned, GPU-visible buffer used by the resident decode path.
+    ///
+    /// Atlas currently uses shared storage on Apple Silicon: this is still a
+    /// Metal allocation (and is bound directly to compute encoders), while
+    /// making the one-token result cheap to inspect at the token boundary.
+    #[derive(Clone)]
+    pub struct GpuBuffer {
+        _buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+        bytes: usize,
+    }
+
+    impl GpuBuffer {
+        pub fn bytes(&self) -> usize {
+            self.bytes
+        }
+
+        fn native(&self) -> &ProtocolObject<dyn MTLBuffer> {
+            &self._buffer
+        }
+    }
+
+    /// A single compute encoder that can contain all dependent dispatches for
+    /// one decode token. It is completed only by [`Self::finish`].
+    pub struct ResidentCommand<'a> {
+        runtime: &'a MetalRuntime,
+        command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+        encoder: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
+    }
+
+    impl<'a> ResidentCommand<'a> {
+        pub fn dispatch_1d(
+            &mut self,
+            kernel: &'static str,
+            buffers: &[&GpuBuffer],
+            count: usize,
+        ) -> Result<(), MetalError> {
+            let pipeline = self
+                .runtime
+                .pipelines
+                .get(kernel)
+                .ok_or_else(|| MetalError::MissingKernel(kernel.into()))?;
+            self.encoder.setComputePipelineState(&**pipeline);
+            for (index, buffer) in buffers.iter().enumerate() {
+                unsafe {
+                    self.encoder
+                        .setBuffer_offset_atIndex(Some(buffer.native()), 0, index);
+                }
+            }
+            self.encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: count.max(1),
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: self.runtime.pipeline_thread_width(kernel),
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            Ok(())
+        }
+
+        pub fn finish(self) -> Result<DispatchTiming, MetalError> {
+            self.encoder.endEncoding();
+            let started = Instant::now();
+            self.runtime
+                .command_buffer_count
+                .fetch_add(1, Ordering::Relaxed);
+            self.command_buffer.commit();
+            self.command_buffer.waitUntilCompleted();
+            let wall_time = started.elapsed();
+            if self.command_buffer.status() == objc2_metal::MTLCommandBufferStatus::Error {
+                return Err(MetalError::CommandFailed(
+                    self.command_buffer
+                        .error()
+                        .map(|error| error.to_string())
+                        .unwrap_or_else(|| "unknown command-buffer error".into()),
+                ));
+            }
+            let gpu_start = self.command_buffer.GPUStartTime();
+            let gpu_end = self.command_buffer.GPUEndTime();
+            let gpu_time = (gpu_end > gpu_start && gpu_start > 0.0)
+                .then(|| Duration::from_secs_f64(gpu_end - gpu_start));
+            if let Some(gpu_time) = gpu_time {
+                self.runtime.gpu_execution_nanos.fetch_add(
+                    u64::try_from(gpu_time.as_nanos()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+            }
+            Ok(DispatchTiming {
+                wall_time,
+                gpu_time,
+            })
+        }
     }
 
     /// Lifetime class used by the Phase 1 Metal buffer pool.
@@ -194,6 +292,9 @@ mod macos {
         device: Retained<ProtocolObject<dyn MTLDevice>>,
         queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
         pipelines: HashMap<&'static str, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+        command_buffer_count: AtomicU64,
+        gpu_execution_nanos: AtomicU64,
+        readback_bytes: AtomicU64,
     }
 
     impl MetalRuntime {
@@ -218,12 +319,17 @@ mod macos {
                 "embedding_lookup_f32",
                 "rms_norm_f32",
                 "matvec_f32",
+                "matvec_tiled_f32",
                 "matmul_f32",
                 "rope_f32",
                 "masked_softmax_f32",
                 "attention_scores_f32",
                 "attention_values_f32",
                 "logits_process_f32",
+                "rope_llama_decode_f32",
+                "kv_append_decode_f32",
+                "attention_decode_f32",
+                "argmax_f32",
             ] {
                 let function_name = NSString::from_str(kernel);
                 let function = library
@@ -239,6 +345,9 @@ mod macos {
                 device,
                 queue,
                 pipelines,
+                command_buffer_count: AtomicU64::new(0),
+                gpu_execution_nanos: AtomicU64::new(0),
+                readback_bytes: AtomicU64::new(0),
             })
         }
 
@@ -255,6 +364,88 @@ mod macos {
 
         pub fn buffer_pool(&self) -> MetalBufferPool {
             MetalBufferPool::new(self.device.clone())
+        }
+
+        /// Upload immutable model data once and retain the resulting Metal
+        /// buffer for the lifetime of the owning model/executor.
+        pub fn upload_f32(&self, values: &[f32]) -> Result<GpuBuffer, MetalError> {
+            let buffer = self.buffer_from_slice(values)?;
+            Ok(GpuBuffer {
+                _buffer: buffer,
+                bytes: values.len() * size_of::<f32>(),
+            })
+        }
+
+        pub fn upload_u32(&self, values: &[u32]) -> Result<GpuBuffer, MetalError> {
+            self.buffer_from_slice(values).map(|buffer| GpuBuffer {
+                _buffer: buffer,
+                bytes: values.len() * size_of::<u32>(),
+            })
+        }
+
+        pub fn allocate(&self, bytes: usize) -> Result<GpuBuffer, MetalError> {
+            let bytes = bytes.max(1);
+            let buffer = self
+                .device
+                .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
+                .ok_or_else(|| {
+                    MetalError::InvalidInput("Metal could not allocate a shared buffer".into())
+                })?;
+            Ok(GpuBuffer {
+                _buffer: buffer,
+                bytes,
+            })
+        }
+
+        pub fn write_f32(&self, buffer: &GpuBuffer, values: &[f32]) -> Result<(), MetalError> {
+            self.write_buffer(buffer, values)
+        }
+
+        pub fn write_u32(&self, buffer: &GpuBuffer, values: &[u32]) -> Result<(), MetalError> {
+            self.write_buffer(buffer, values)
+        }
+
+        pub fn read_u32(&self, buffer: &GpuBuffer) -> Result<u32, MetalError> {
+            if buffer.bytes < size_of::<u32>() {
+                return Err(MetalError::InvalidInput(
+                    "u32 readback buffer is too small".into(),
+                ));
+            }
+            let value =
+                unsafe { ptr::read_unaligned(buffer.native().contents().as_ptr().cast::<u32>()) };
+            self.readback_bytes
+                .fetch_add(size_of::<u32>() as u64, Ordering::Relaxed);
+            Ok(value)
+        }
+
+        pub fn begin_resident_command(&self) -> Result<ResidentCommand<'_>, MetalError> {
+            let command_buffer = self
+                .queue
+                .commandBuffer()
+                .ok_or(MetalError::CommandCreation)?;
+            let encoder = command_buffer
+                .computeCommandEncoder()
+                .ok_or(MetalError::CommandCreation)?;
+            Ok(ResidentCommand {
+                runtime: self,
+                command_buffer,
+                encoder,
+            })
+        }
+
+        /// Number of submitted command buffers since runtime creation.  This
+        /// is intentionally cumulative so callers can take token boundaries
+        /// by subtraction without perturbing the runtime.
+        pub fn command_buffer_count(&self) -> u64 {
+            self.command_buffer_count.load(Ordering::Relaxed)
+        }
+
+        pub fn gpu_execution_time(&self) -> Duration {
+            Duration::from_nanos(self.gpu_execution_nanos.load(Ordering::Relaxed))
+        }
+
+        pub fn readback_bytes(&self) -> u64 {
+            self.readback_bytes.load(Ordering::Relaxed)
         }
 
         pub fn vector_add(
@@ -783,6 +974,30 @@ mod macos {
             Ok(buffer)
         }
 
+        fn write_buffer<T: Copy>(
+            &self,
+            buffer: &GpuBuffer,
+            values: &[T],
+        ) -> Result<(), MetalError> {
+            let bytes = values
+                .len()
+                .checked_mul(size_of::<T>())
+                .ok_or_else(|| MetalError::InvalidInput("buffer size overflow".into()))?;
+            if bytes > buffer.bytes {
+                return Err(MetalError::InvalidInput(
+                    "resident buffer is too small for write".into(),
+                ));
+            }
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    values.as_ptr().cast::<u8>(),
+                    buffer.native().contents().as_ptr().cast::<u8>(),
+                    bytes,
+                );
+            }
+            Ok(())
+        }
+
         fn copy_buffer_to_slice<T: Copy>(
             &self,
             buffer: &ProtocolObject<dyn MTLBuffer>,
@@ -799,6 +1014,8 @@ mod macos {
                     bytes,
                 );
             }
+            self.readback_bytes
+                .fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
             Ok(())
         }
 
@@ -884,6 +1101,7 @@ mod macos {
             encoder.endEncoding();
 
             let start = Instant::now();
+            self.command_buffer_count.fetch_add(1, Ordering::Relaxed);
             command_buffer.commit();
             command_buffer.waitUntilCompleted();
             let wall_time = start.elapsed();
@@ -899,6 +1117,12 @@ mod macos {
             let gpu_end = command_buffer.GPUEndTime();
             let gpu_time = (gpu_end > gpu_start && gpu_start > 0.0)
                 .then(|| Duration::from_secs_f64(gpu_end - gpu_start));
+            if let Some(gpu_time) = gpu_time {
+                self.gpu_execution_nanos.fetch_add(
+                    u64::try_from(gpu_time.as_nanos()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+            }
             Ok(DispatchTiming {
                 wall_time,
                 gpu_time,

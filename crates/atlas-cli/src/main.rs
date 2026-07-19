@@ -3,7 +3,7 @@ use std::{
     env, fs,
     io::{self, BufRead, Read, Write},
     path::{Path, PathBuf},
-    sync::atomic::AtomicBool,
+    sync::atomic::{AtomicBool, Ordering},
     time::Instant,
 };
 
@@ -23,6 +23,25 @@ use serde_json::Value;
 
 mod server;
 
+static CHAT_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn chat_sigint_handler(_: i32) {
+    // Signal handlers may only perform async-signal-safe work. Atomic stores
+    // are sufficient here; generation observes this flag between tokens.
+    CHAT_INTERRUPTED.store(true, Ordering::Release);
+}
+
+unsafe extern "C" {
+    fn signal(signal: i32, handler: extern "C" fn(i32)) -> usize;
+}
+
+fn install_chat_sigint_handler() {
+    const SIGINT: i32 = 2;
+    // The CLI is macOS-only through atlas-metal. Replacing the default handler
+    // lets `/quit`, EOF, and Ctrl-C share the same metrics handoff.
+    unsafe { signal(SIGINT, chat_sigint_handler) };
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -35,9 +54,10 @@ fn main() -> Result<()> {
         Some("serve") => serve(&args[1..]),
         Some("phase_03_model") => phase_03_model(&args[1..]),
         Some("phase_05_quant") => phase_05_quant(&args[1..]),
+        Some("phase_08a_decode") => phase_08a_decode(&args[1..]),
         _ => {
             eprintln!(
-                "usage: atlas-cli chat --model small [--prompt TEXT] [--max-tokens N] | atlas-cli serve --model small [--host 127.0.0.1] [--port 8080] | atlas-cli metal-info | atlas-cli fixture verify --model small [--model-dir PATH] | atlas-cli generate --model small --prompt TEXT --max-new-tokens N --greedy [--golden PATH] | atlas-cli phase_03_model --model larger [--model-dir PATH] | atlas-cli phase_05_quant --model small --format fp16|int8|q4 [--tensor NAME]"
+                "usage: atlas-cli chat --model small [--prompt TEXT] [--max-tokens N] | atlas-cli serve --model small [--host 127.0.0.1] [--port 8080] | atlas-cli metal-info | atlas-cli fixture verify --model small [--model-dir PATH] | atlas-cli generate --model small --prompt TEXT --max-new-tokens N --greedy [--golden PATH] | atlas-cli phase_03_model --model larger [--model-dir PATH] | atlas-cli phase_05_quant --model small --format fp16|int8|q4 [--tensor NAME] | atlas-cli phase_08a_decode --model small --prompt TEXT [--warmup N] [--max-new-tokens N]"
             );
             bail!("invalid command")
         }
@@ -53,21 +73,37 @@ pub(crate) fn generate_completion(
 }
 
 fn chat(args: &[String]) -> Result<()> {
+    CHAT_INTERRUPTED.store(false, Ordering::Release);
+    install_chat_sigint_handler();
     let (model_args, prompt, max_tokens) = parse_chat_args(args)?;
     let (_, directory) = model_dir(&model_args)?;
     let model = AtlasModel::load(directory)?;
     if let Some(prompt) = prompt {
-        print_completion(&model, &prompt, max_tokens)?;
+        let mut turn_metrics = ChatTurnMetrics::new();
+        print_completion(&model, &prompt, max_tokens, &mut turn_metrics)?;
         return Ok(());
     }
     eprintln!("Atlas chat. Commands: /reset, /help, /quit");
     let stdin = io::stdin();
     let mut history = String::new();
+    let mut session_metrics = ChatSessionMetrics::default();
     loop {
+        if CHAT_INTERRUPTED.load(Ordering::Acquire) {
+            eprintln!("generation interrupted");
+            break;
+        }
         print!("you> ");
         io::stdout().flush()?;
         let mut line = String::new();
-        if stdin.lock().read_line(&mut line)? == 0 {
+        let bytes = match stdin.lock().read_line(&mut line) {
+            Ok(bytes) => bytes,
+            Err(_) if CHAT_INTERRUPTED.load(Ordering::Acquire) => {
+                eprintln!("generation interrupted");
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if bytes == 0 {
             break;
         }
         match repl_command(line.trim()) {
@@ -86,24 +122,81 @@ fn chat(args: &[String]) -> Result<()> {
                 append_user_turn(&mut history, line);
             }
         }
-        let result = print_completion(&model, &history, max_tokens)?;
+        let mut turn_metrics = ChatTurnMetrics::new();
+        let result = match print_completion(&model, &history, max_tokens, &mut turn_metrics) {
+            Ok(result) => result,
+            Err(_) if CHAT_INTERRUPTED.load(Ordering::Acquire) => {
+                session_metrics.record(&turn_metrics);
+                eprintln!("generation interrupted");
+                break;
+            }
+            Err(error) => return Err(error),
+        };
+        session_metrics.record(&turn_metrics);
         history.push_str(&model.decode(&result.generation.generated_token_ids)?);
         history.push('\n');
     }
+    eprintln!("{}", session_metrics_line(&session_metrics));
     Ok(())
+}
+
+#[derive(Debug, Default)]
+struct ChatSessionMetrics {
+    turns: usize,
+    generated_tokens: usize,
+    active_turn_time: std::time::Duration,
+}
+
+impl ChatSessionMetrics {
+    fn record(&mut self, turn: &ChatTurnMetrics) {
+        self.turns += 1;
+        self.generated_tokens += turn.generated_tokens;
+        self.active_turn_time += turn.started.elapsed();
+    }
+
+    fn generated_tokens_per_second(&self) -> f64 {
+        if self.active_turn_time.is_zero() {
+            0.0
+        } else {
+            self.generated_tokens as f64 / self.active_turn_time.as_secs_f64()
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ChatTurnMetrics {
+    started: std::time::Instant,
+    generated_tokens: usize,
+}
+
+impl ChatTurnMetrics {
+    fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            generated_tokens: 0,
+        }
+    }
+
+    fn record_event(&mut self, event: &GenerationEvent) {
+        if matches!(event, GenerationEvent::Token { .. }) {
+            self.generated_tokens += 1;
+        }
+    }
 }
 
 fn print_completion(
     model: &AtlasModel,
     prompt: &str,
     max_tokens: usize,
+    turn_metrics: &mut ChatTurnMetrics,
 ) -> Result<ExecutorGeneration> {
-    let cancellation = AtomicBool::new(false);
     let mut executor = AtlasExecutor::new(model, ExecutorConfig::default())?;
     let mut stdout = io::stdout();
-    let result = executor.generate_greedy_stream(prompt, max_tokens, &cancellation, |event| {
-        write_stream_event(&mut stdout, &event)
-    })?;
+    let result =
+        executor.generate_greedy_stream(prompt, max_tokens, &CHAT_INTERRUPTED, |event| {
+            turn_metrics.record_event(&event);
+            write_stream_event(&mut stdout, &event)
+        })?;
     writeln!(stdout)?;
     stdout.flush()?;
     eprintln!("{}", metrics_line(&result.metrics));
@@ -182,10 +275,25 @@ fn append_user_turn(history: &mut String, line: &str) {
 
 fn metrics_line(metrics: &ExecutorMetrics) -> String {
     format!(
-        "ttft_ms={:.2} prefill_tok_s={:.2} decode_tok_s={:.2}",
+        "ttft_ms={:.2} prefill_tok_s={:.2} decode_tok_s={:.2} host_ms={:.2} gpu_ms={:.2} command_buffers={} weight_upload_bytes={} readback_bytes={} post_warmup_allocations={}",
         metrics.ttft.as_secs_f64() * 1000.0,
         metrics.prefill_tokens_per_second(),
-        metrics.decode_tokens_per_second()
+        metrics.decode_tokens_per_second(),
+        metrics.host_wall_time.as_secs_f64() * 1000.0,
+        metrics.gpu_execution_time.as_secs_f64() * 1000.0,
+        metrics.command_buffer_count,
+        metrics.weight_upload_bytes,
+        metrics.readback_bytes,
+        metrics.post_warmup_allocations,
+    )
+}
+
+fn session_metrics_line(metrics: &ChatSessionMetrics) -> String {
+    format!(
+        "session_turns={} session_generated_tokens={} session_tok_s={:.2}",
+        metrics.turns,
+        metrics.generated_tokens,
+        metrics.generated_tokens_per_second(),
     )
 }
 
@@ -251,6 +359,49 @@ mod phase_07_tests {
     }
 
     #[test]
+    fn chat_exit_reports_visible_tokens_from_completed_and_interrupted_turns() {
+        let mut session = ChatSessionMetrics::default();
+        let mut completed = ChatTurnMetrics::new();
+        completed.record_event(&GenerationEvent::Token {
+            token_id: 1,
+            text: "one".into(),
+            decode_latency: None,
+        });
+        session.record(&completed);
+
+        let mut interrupted = ChatTurnMetrics::new();
+        for token_id in 2..=4 {
+            interrupted.record_event(&GenerationEvent::Token {
+                token_id,
+                text: "partial".into(),
+                decode_latency: None,
+            });
+        }
+        // The caller records this before breaking on the terminal cancellation
+        // error, preserving text that was already delivered to stdout.
+        session.record(&interrupted);
+
+        assert_eq!(session.turns, 2);
+        assert_eq!(session.generated_tokens, 4);
+        assert!(session.generated_tokens_per_second() > 0.0);
+        assert!(session_metrics_line(&session).contains("session_tok_s="));
+    }
+
+    #[test]
+    fn a_failed_stream_after_tokens_still_has_countable_turn_metrics() {
+        let mut turn = ChatTurnMetrics::new();
+        turn.record_event(&GenerationEvent::Token {
+            token_id: 9,
+            text: "visible".into(),
+            decode_latency: None,
+        });
+        turn.record_event(&GenerationEvent::Failed {
+            message: "generation cancelled".into(),
+        });
+        assert_eq!(turn.generated_tokens, 1);
+    }
+
+    #[test]
     fn streaming_writer_emits_and_flushes_token_fragments_only() {
         let mut output = Vec::new();
         write_stream_event(
@@ -308,6 +459,90 @@ fn serve(args: &[String]) -> Result<()> {
     }
     let (model, directory) = model_dir(&filtered)?;
     server::serve(&model, &directory, &host, port)
+}
+
+fn phase_08a_decode(args: &[String]) -> Result<()> {
+    let mut model_args = Vec::new();
+    let mut prompt = None;
+    let mut warmup = 1usize;
+    let mut max_new_tokens = 16usize;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--model" | "--model-dir" => {
+                model_args.push(args[index].clone());
+                index += 1;
+                model_args.push(
+                    args.get(index)
+                        .context("model option needs a value")?
+                        .clone(),
+                );
+            }
+            "--prompt" => {
+                index += 1;
+                prompt = Some(args.get(index).context("--prompt needs a value")?.clone());
+            }
+            "--warmup" => {
+                index += 1;
+                warmup = args
+                    .get(index)
+                    .context("--warmup needs a value")?
+                    .parse()
+                    .context("parse --warmup")?;
+            }
+            "--max-new-tokens" => {
+                index += 1;
+                max_new_tokens = args
+                    .get(index)
+                    .context("--max-new-tokens needs a value")?
+                    .parse()
+                    .context("parse --max-new-tokens")?;
+                ensure!(max_new_tokens > 0, "--max-new-tokens must be positive");
+            }
+            flag => bail!("unknown phase_08a_decode option: {flag}"),
+        }
+        index += 1;
+    }
+    let prompt = prompt.context("phase_08a_decode requires --prompt")?;
+    let (model_name, directory) = model_dir(&model_args)?;
+    let model = AtlasModel::load(directory)?;
+
+    // Warm each implementation separately.  The measured runs begin only
+    // after pipeline creation and resident weight materialization.
+    for _ in 0..warmup {
+        let _ = model.generate_greedy(&prompt, max_new_tokens)?;
+        let mut executor = AtlasExecutor::new(&model, ExecutorConfig::default())?;
+        let _ = executor.generate_greedy(&prompt, max_new_tokens)?;
+    }
+
+    let reference_start = Instant::now();
+    let reference = model.generate_greedy(&prompt, max_new_tokens)?;
+    let reference_elapsed = reference_start.elapsed();
+    let mut executor = AtlasExecutor::new(&model, ExecutorConfig::default())?;
+    let resident = executor.generate_greedy(&prompt, max_new_tokens)?;
+    ensure!(
+        resident.generation.generated_token_ids == reference.generated_token_ids,
+        "resident decode token IDs differ from reference: reference={:?} resident={:?}",
+        reference.generated_token_ids,
+        resident.generation.generated_token_ids
+    );
+    let tokens = resident.generation.generated_token_ids.len();
+    let reference_rate = if reference_elapsed.is_zero() {
+        0.0
+    } else {
+        tokens as f64 / reference_elapsed.as_secs_f64()
+    };
+    let resident_rate = resident.metrics.decode_tokens_per_second();
+    println!("model: {model_name}");
+    println!("token_agreement: true");
+    println!("reference_decode_tok_s: {reference_rate:.2}");
+    println!("resident_decode_tok_s: {resident_rate:.2}");
+    println!("{}", metrics_line(&resident.metrics));
+    ensure!(
+        resident_rate > reference_rate,
+        "GPU-resident decode did not improve over the reference baseline ({resident_rate:.2} <= {reference_rate:.2} tok/s)"
+    );
+    Ok(())
 }
 
 fn phase_05_quant(args: &[String]) -> Result<()> {

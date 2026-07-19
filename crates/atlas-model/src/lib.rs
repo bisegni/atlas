@@ -17,6 +17,7 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use atlas_core::read_safetensors_tensor_f32;
+use atlas_metal::GpuBuffer;
 use atlas_ops::{ExecutionMode, NeuralOps};
 use serde_json::Value;
 use tokenizers::Tokenizer;
@@ -134,7 +135,17 @@ pub struct AtlasModel {
     tokenizer: Tokenizer,
     weights: HashMap<String, PathBuf>,
     weight_cache: Mutex<HashMap<String, Arc<Vec<f32>>>>,
+    // Immutable buffers are deliberately owned by the model, rather than an
+    // individual request.  Session executors only own mutable KV/activation
+    // state and therefore cannot trigger a model-weight re-upload per token.
+    resident_weights: Mutex<ResidentWeights>,
     ops: NeuralOps,
+}
+
+#[derive(Default)]
+struct ResidentWeights {
+    buffers: HashMap<String, GpuBuffer>,
+    uploaded_bytes: u64,
 }
 
 impl AtlasModel {
@@ -151,6 +162,7 @@ impl AtlasModel {
             tokenizer,
             weights,
             weight_cache: Mutex::new(HashMap::new()),
+            resident_weights: Mutex::new(ResidentWeights::default()),
             ops,
         })
     }
@@ -487,7 +499,6 @@ impl AtlasModel {
             .weights
             .get(name)
             .with_context(|| format!("model lacks required tensor `{name}`"))?;
-        eprintln!("atlas: loading weight {name}");
         let weight = Arc::new(read_safetensors_tensor_f32(path, name)?);
         self.weight_cache
             .lock()
@@ -497,6 +508,41 @@ impl AtlasModel {
     }
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Materialize every immutable parameter in a GPU-visible buffer once.
+    /// Repeated calls are idempotent and return only bytes uploaded by this
+    /// invocation, which makes executor warm-up telemetry unambiguous.
+    pub(crate) fn ensure_resident_weights(&self) -> Result<u64> {
+        let mut resident = self.resident_weights.lock().expect("resident weight lock");
+        let mut uploaded = 0u64;
+        let missing = self
+            .weights
+            .keys()
+            .filter(|name| !resident.buffers.contains_key(*name))
+            .count();
+        if missing > 0 {
+            eprintln!("atlas: uploading {missing} model tensors to Metal");
+        }
+        for name in self.weights.keys() {
+            if resident.buffers.contains_key(name) {
+                continue;
+            }
+            let values = self.weight(name)?;
+            let buffer = self.ops.runtime().upload_f32(&values)?;
+            uploaded = uploaded.saturating_add(buffer.bytes() as u64);
+            resident.buffers.insert(name.clone(), buffer);
+        }
+        resident.uploaded_bytes = resident.uploaded_bytes.saturating_add(uploaded);
+        Ok(uploaded)
+    }
+
+    pub(crate) fn resident_weights_snapshot(&self) -> HashMap<String, GpuBuffer> {
+        self.resident_weights
+            .lock()
+            .expect("resident weight lock")
+            .buffers
+            .clone()
     }
 }
 

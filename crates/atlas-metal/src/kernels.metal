@@ -100,6 +100,30 @@ kernel void matvec_f32(
     }
 }
 
+// One-token decode projection.  The resident command path keeps input,
+// weights, and output in Metal buffers; this kernel is deliberately separate
+// from the correctness reference so it can be specialized per GPU family
+// without changing that oracle.
+kernel void matvec_tiled_f32(
+    device const float *input [[buffer(0)]], device const float *weights [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
+    constant uint &output_width [[buffer(4)]], uint output_id [[thread_position_in_grid]]) {
+    if (output_id < output_width) {
+        float sum = 0.0f;
+        uint column = 0;
+        for (; column + 3 < input_width; column += 4) {
+            sum += input[column] * weights[output_id * input_width + column];
+            sum += input[column + 1] * weights[output_id * input_width + column + 1];
+            sum += input[column + 2] * weights[output_id * input_width + column + 2];
+            sum += input[column + 3] * weights[output_id * input_width + column + 3];
+        }
+        for (; column < input_width; ++column) {
+            sum += input[column] * weights[output_id * input_width + column];
+        }
+        output[output_id] = sum;
+    }
+}
+
 kernel void matmul_f32(
     device const float *input [[buffer(0)]], device const float *weights [[buffer(1)]],
     device float *output [[buffer(2)]], constant uint &rows [[buffer(3)]],
@@ -158,4 +182,75 @@ kernel void logits_process_f32(
     device float *output [[buffer(2)]], constant float &temperature [[buffer(3)]],
     constant uint &count [[buffer(4)]], uint id [[thread_position_in_grid]]) {
     if (id < count) { output[id] = (logits[id] + bias[id]) / temperature; }
+}
+
+kernel void rope_llama_decode_f32(
+    device const float *input [[buffer(0)]], device float *output [[buffer(1)]],
+    constant uint &heads [[buffer(2)]], constant uint &head_dim [[buffer(3)]],
+    constant uint &position [[buffer(4)]], constant float &theta [[buffer(5)]],
+    uint id [[thread_position_in_grid]]) {
+    uint pairs = head_dim / 2;
+    uint head = id / pairs;
+    uint pair = id % pairs;
+    if (head < heads && pair < pairs) {
+        uint base = head * head_dim;
+        float angle = float(position) / pow(theta, float(pair * 2) / float(head_dim));
+        float c = cos(angle), s = sin(angle);
+        float x0 = input[base + pair], x1 = input[base + pair + pairs];
+        output[base + pair] = x0 * c - x1 * s;
+        output[base + pair + pairs] = x0 * s + x1 * c;
+    }
+}
+
+// KV layout: [K|V][kv_head][position][dimension].
+kernel void kv_append_decode_f32(
+    device const float *key [[buffer(0)]], device const float *value [[buffer(1)]],
+    device float *cache [[buffer(2)]], constant uint &kv_width [[buffer(3)]],
+    constant uint &capacity [[buffer(4)]], constant uint &position [[buffer(5)]],
+    uint id [[thread_position_in_grid]]) {
+    if (id < kv_width && position < capacity) {
+        cache[position * kv_width + id] = key[id];
+        cache[capacity * kv_width + position * kv_width + id] = value[id];
+    }
+}
+
+// One thread produces one attention output dimension.  This favors resident
+// single-token correctness and eliminates CPU head gathering/readbacks.
+kernel void attention_decode_f32(
+    device const float *query [[buffer(0)]], device const float *cache [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &heads [[buffer(3)]],
+    constant uint &kv_heads [[buffer(4)]], constant uint &head_dim [[buffer(5)]],
+    constant uint &capacity [[buffer(6)]], constant uint &count [[buffer(7)]],
+    uint id [[thread_position_in_grid]]) {
+    uint head = id / head_dim, dim = id % head_dim;
+    if (head >= heads || dim >= head_dim) return;
+    uint group = heads / kv_heads, kv_head = head / group;
+    float maximum = -INFINITY;
+    for (uint pos = 0; pos < count; ++pos) {
+        float score = 0.0f;
+        for (uint d = 0; d < head_dim; ++d)
+            score += query[head * head_dim + d] * cache[(kv_head * capacity + pos) * head_dim + d];
+        maximum = max(maximum, score * rsqrt(float(head_dim)));
+    }
+    float denominator = 0.0f, value = 0.0f;
+    uint value_base = capacity * kv_heads * head_dim;
+    for (uint pos = 0; pos < count; ++pos) {
+        float score = 0.0f;
+        for (uint d = 0; d < head_dim; ++d)
+            score += query[head * head_dim + d] * cache[(kv_head * capacity + pos) * head_dim + d];
+        float weight = exp(score * rsqrt(float(head_dim)) - maximum);
+        denominator += weight;
+        value += weight * cache[value_base + (kv_head * capacity + pos) * head_dim + dim];
+    }
+    output[id] = value / denominator;
+}
+
+kernel void argmax_f32(
+    device const float *values [[buffer(0)]], device uint *output [[buffer(1)]],
+    constant uint &count [[buffer(2)]], uint id [[thread_position_in_grid]]) {
+    if (id == 0) {
+        uint best = 0;
+        for (uint i = 1; i < count; ++i) if (values[i] >= values[best]) best = i;
+        output[0] = best;
+    }
 }
