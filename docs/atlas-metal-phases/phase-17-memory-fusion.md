@@ -1,4 +1,4 @@
-# Phase 17: Memory fusion
+# Phase 18: Memory fusion
 
 ## Outcome
 
@@ -20,5 +20,5 @@ fixture for added decode latency and GPU allocation stability.
 
 ## Exit gate
 
-`phase_14_fusion` proves zero-gate parity, records latency/bytes per slot
+`phase_18_fusion` proves zero-gate parity, records latency/bytes per slot
 count, and retains a switchable normal-transformer control path.

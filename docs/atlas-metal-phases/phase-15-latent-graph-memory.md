@@ -1,4 +1,4 @@
-# Phase 15: Latent graph memory
+# Phase 16: Latent graph memory
 
 ## Outcome
 
@@ -19,5 +19,5 @@ fixture for multi-session graph writing and restart-recovery soak testing.
 
 ## Exit gate
 
-`phase_12_graph_store` writes, snapshots, restarts, and replays a checksummed
+`phase_16_graph_store` writes, snapshots, restarts, and replays a checksummed
 graph with stable IDs/no cross-session data, reporting write/recovery metrics.

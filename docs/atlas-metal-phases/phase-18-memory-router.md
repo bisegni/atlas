@@ -1,4 +1,4 @@
-# Phase 18: Learned memory router
+# Phase 19: Learned memory router
 
 ## Outcome
 
@@ -19,6 +19,6 @@ the larger fixture for a long session reporting actions, GPU bound, and delay.
 
 ## Exit gate
 
-`phase_15_router` exactly reproduces its deterministic trace. Disabled routing
+`phase_19_router` exactly reproduces its deterministic trace. Disabled routing
 matches the standard engine; learned mode records version/evaluation and obeys
 latency and retrieval budgets.

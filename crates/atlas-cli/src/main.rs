@@ -15,13 +15,12 @@ use atlas_metal::MetalRuntime;
 use atlas_model::{
     AtlasModel,
     executor::{
-        AtlasExecutor, ExecutorConfig, ExecutorGeneration, ExecutorMetrics, GenerationEvent,
+        AtlasExecutor, ExecutorConfig, ExecutorGeneration, ExecutorMetrics, ExecutorMode,
+        GenerationEvent, LogitsReadback,
     },
     validate_generation_golden,
 };
 use serde_json::Value;
-
-mod server;
 
 static CHAT_INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
@@ -51,25 +50,16 @@ fn main() -> Result<()> {
         }
         Some("generate") => generate(&args[1..]),
         Some("chat") => chat(&args[1..]),
-        Some("serve") => serve(&args[1..]),
         Some("phase_03_model") => phase_03_model(&args[1..]),
         Some("phase_05_quant") => phase_05_quant(&args[1..]),
-        Some("phase_08a_decode") => phase_08a_decode(&args[1..]),
+        Some("phase_08b_decode") => phase_08b_decode(&args[1..]),
         _ => {
             eprintln!(
-                "usage: atlas-cli chat --model small [--prompt TEXT] [--max-tokens N] | atlas-cli serve --model small [--host 127.0.0.1] [--port 8080] | atlas-cli metal-info | atlas-cli fixture verify --model small [--model-dir PATH] | atlas-cli generate --model small --prompt TEXT --max-new-tokens N --greedy [--golden PATH] | atlas-cli phase_03_model --model larger [--model-dir PATH] | atlas-cli phase_05_quant --model small --format fp16|int8|q4 [--tensor NAME] | atlas-cli phase_08a_decode --model small --prompt TEXT [--warmup N] [--max-new-tokens N]"
+                "usage: atlas-cli chat --model small [--prompt TEXT] [--max-tokens N] | atlas-cli metal-info | atlas-cli fixture verify --model small [--model-dir PATH] | atlas-cli generate --model small --prompt TEXT --max-new-tokens N --greedy [--golden PATH] | atlas-cli phase_03_model --model larger [--model-dir PATH] | atlas-cli phase_05_quant --model small --format fp16|int8|q4 [--tensor NAME] | atlas-cli phase_08b_decode --model small --prompt TEXT [--warmup N] [--max-new-tokens N] [--trace-logits|--trace-stages]"
             );
             bail!("invalid command")
         }
     }
-}
-
-pub(crate) fn generate_completion(
-    model: &AtlasModel,
-    prompt: &str,
-    max_tokens: usize,
-) -> Result<ExecutorGeneration> {
-    AtlasExecutor::new(model, ExecutorConfig::default())?.generate_greedy(prompt, max_tokens)
 }
 
 fn chat(args: &[String]) -> Result<()> {
@@ -275,15 +265,18 @@ fn append_user_turn(history: &mut String, line: &str) {
 
 fn metrics_line(metrics: &ExecutorMetrics) -> String {
     format!(
-        "ttft_ms={:.2} prefill_tok_s={:.2} decode_tok_s={:.2} host_ms={:.2} gpu_ms={:.2} command_buffers={} weight_upload_bytes={} readback_bytes={} post_warmup_allocations={}",
+        "ttft_ms={:.2} prefill_tok_s={:.2} decode_tok_s={:.2} host_ms={:.2} gpu_ms={:.2} command_buffers={} prefill_command_buffers={} decode_command_buffers={} weight_upload_bytes={} readback_bytes={} resident_arena_allocations={} post_warmup_allocations={}",
         metrics.ttft.as_secs_f64() * 1000.0,
         metrics.prefill_tokens_per_second(),
         metrics.decode_tokens_per_second(),
         metrics.host_wall_time.as_secs_f64() * 1000.0,
         metrics.gpu_execution_time.as_secs_f64() * 1000.0,
         metrics.command_buffer_count,
+        metrics.prefill_command_buffer_count,
+        metrics.decode_command_buffer_count,
         metrics.weight_upload_bytes,
         metrics.readback_bytes,
+        metrics.resident_arena_allocations,
         metrics.post_warmup_allocations,
     )
 }
@@ -425,47 +418,13 @@ mod phase_07_tests {
     }
 }
 
-fn serve(args: &[String]) -> Result<()> {
-    let mut host = "127.0.0.1".to_owned();
-    let mut port = 8080u16;
-    let mut filtered = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--host" => {
-                index += 1;
-                host = args.get(index).context("--host needs a value")?.clone();
-            }
-            "--port" => {
-                index += 1;
-                port = args
-                    .get(index)
-                    .context("--port needs a value")?
-                    .parse()
-                    .context("parse --port")?;
-            }
-            "--model" | "--model-dir" => {
-                filtered.push(args[index].clone());
-                index += 1;
-                filtered.push(
-                    args.get(index)
-                        .context("model option needs a value")?
-                        .clone(),
-                );
-            }
-            flag => bail!("unknown serve option: {flag}"),
-        };
-        index += 1;
-    }
-    let (model, directory) = model_dir(&filtered)?;
-    server::serve(&model, &directory, &host, port)
-}
-
-fn phase_08a_decode(args: &[String]) -> Result<()> {
+fn phase_08b_decode(args: &[String]) -> Result<()> {
     let mut model_args = Vec::new();
     let mut prompt = None;
     let mut warmup = 1usize;
     let mut max_new_tokens = 16usize;
+    let mut trace_logits = false;
+    let mut trace_stages = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -499,31 +458,104 @@ fn phase_08a_decode(args: &[String]) -> Result<()> {
                     .context("parse --max-new-tokens")?;
                 ensure!(max_new_tokens > 0, "--max-new-tokens must be positive");
             }
-            flag => bail!("unknown phase_08a_decode option: {flag}"),
+            "--trace-logits" => trace_logits = true,
+            "--trace-stages" => trace_stages = true,
+            flag => bail!("unknown phase_08b_decode option: {flag}"),
         }
         index += 1;
     }
-    let prompt = prompt.context("phase_08a_decode requires --prompt")?;
+    let prompt = prompt.context("phase_08b_decode requires --prompt")?;
+    let logits_readback = if trace_logits {
+        LogitsReadback::FinalLogits
+    } else {
+        LogitsReadback::SelectedToken
+    };
     let (model_name, directory) = model_dir(&model_args)?;
     let model = AtlasModel::load(directory)?;
+    if trace_stages {
+        match AtlasExecutor::trace_resident_prompt(&model, &prompt, 1e-5)? {
+            Some(result) => {
+                println!(
+                    "first_divergence prompt_token={} layer={} stage={} elements={} max_abs_error={:.8} first_index={} expected={:.8} actual={:.8}",
+                    result.prompt_token_index,
+                    result
+                        .layer
+                        .map_or_else(|| "final".to_owned(), |layer| layer.to_string()),
+                    result.stage,
+                    result.element_count,
+                    result.max_abs_error,
+                    result.first_failing_index.unwrap_or(0),
+                    result.expected,
+                    result.actual,
+                );
+                std::process::exit(1);
+            }
+            None => {
+                println!("stage_trace: no divergence");
+                return Ok(());
+            }
+        }
+    }
 
     // Warm each implementation separately.  The measured runs begin only
     // after pipeline creation and resident weight materialization.
     for _ in 0..warmup {
-        let _ = model.generate_greedy(&prompt, max_new_tokens)?;
-        let mut executor = AtlasExecutor::new(&model, ExecutorConfig::default())?;
+        let mut reference = AtlasExecutor::new(
+            &model,
+            ExecutorConfig {
+                mode: ExecutorMode::Reference,
+                logits_readback,
+                ..Default::default()
+            },
+        )?;
+        let _ = reference.generate_greedy(&prompt, max_new_tokens)?;
+        let mut executor = AtlasExecutor::new(
+            &model,
+            ExecutorConfig {
+                mode: ExecutorMode::Resident,
+                logits_readback,
+                ..Default::default()
+            },
+        )?;
         let _ = executor.generate_greedy(&prompt, max_new_tokens)?;
     }
 
     let reference_start = Instant::now();
-    let reference = model.generate_greedy(&prompt, max_new_tokens)?;
+    let mut reference_executor = AtlasExecutor::new(
+        &model,
+        ExecutorConfig {
+            mode: ExecutorMode::Reference,
+            logits_readback,
+            ..Default::default()
+        },
+    )?;
+    let reference = reference_executor.generate_greedy(&prompt, max_new_tokens)?;
     let reference_elapsed = reference_start.elapsed();
-    let mut executor = AtlasExecutor::new(&model, ExecutorConfig::default())?;
+    let mut executor = AtlasExecutor::new(
+        &model,
+        ExecutorConfig {
+            mode: ExecutorMode::Resident,
+            logits_readback,
+            ..Default::default()
+        },
+    )?;
     let resident = executor.generate_greedy(&prompt, max_new_tokens)?;
+    if trace_logits {
+        let (index, delta) = reference
+            .generation
+            .final_logits
+            .iter()
+            .zip(&resident.generation.final_logits)
+            .enumerate()
+            .map(|(index, (reference, resident))| (index, (reference - resident).abs()))
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .context("trace logits are unexpectedly empty")?;
+        println!("max_logit_abs_delta: {delta:.6} at_token_id={index}");
+    }
     ensure!(
-        resident.generation.generated_token_ids == reference.generated_token_ids,
+        resident.generation.generated_token_ids == reference.generation.generated_token_ids,
         "resident decode token IDs differ from reference: reference={:?} resident={:?}",
-        reference.generated_token_ids,
+        reference.generation.generated_token_ids,
         resident.generation.generated_token_ids
     );
     let tokens = resident.generation.generated_token_ids.len();

@@ -202,7 +202,7 @@ kernel void rope_llama_decode_f32(
     }
 }
 
-// KV layout: [K|V][kv_head][position][dimension].
+// KV layout: [K|V][position][kv_head][dimension].
 kernel void kv_append_decode_f32(
     device const float *key [[buffer(0)]], device const float *value [[buffer(1)]],
     device float *cache [[buffer(2)]], constant uint &kv_width [[buffer(3)]],
@@ -220,27 +220,27 @@ kernel void attention_decode_f32(
     device const float *query [[buffer(0)]], device const float *cache [[buffer(1)]],
     device float *output [[buffer(2)]], constant uint &heads [[buffer(3)]],
     constant uint &kv_heads [[buffer(4)]], constant uint &head_dim [[buffer(5)]],
-    constant uint &capacity [[buffer(6)]], constant uint &count [[buffer(7)]],
+    constant uint &capacity [[buffer(6)]], constant uint &position [[buffer(7)]],
     uint id [[thread_position_in_grid]]) {
     uint head = id / head_dim, dim = id % head_dim;
     if (head >= heads || dim >= head_dim) return;
     uint group = heads / kv_heads, kv_head = head / group;
     float maximum = -INFINITY;
-    for (uint pos = 0; pos < count; ++pos) {
+    for (uint pos = 0; pos <= position; ++pos) {
         float score = 0.0f;
         for (uint d = 0; d < head_dim; ++d)
-            score += query[head * head_dim + d] * cache[(kv_head * capacity + pos) * head_dim + d];
+            score += query[head * head_dim + d] * cache[pos * kv_heads * head_dim + kv_head * head_dim + d];
         maximum = max(maximum, score * rsqrt(float(head_dim)));
     }
     float denominator = 0.0f, value = 0.0f;
     uint value_base = capacity * kv_heads * head_dim;
-    for (uint pos = 0; pos < count; ++pos) {
+    for (uint pos = 0; pos <= position; ++pos) {
         float score = 0.0f;
         for (uint d = 0; d < head_dim; ++d)
-            score += query[head * head_dim + d] * cache[(kv_head * capacity + pos) * head_dim + d];
+            score += query[head * head_dim + d] * cache[pos * kv_heads * head_dim + kv_head * head_dim + d];
         float weight = exp(score * rsqrt(float(head_dim)) - maximum);
         denominator += weight;
-        value += weight * cache[value_base + (kv_head * capacity + pos) * head_dim + dim];
+        value += weight * cache[value_base + pos * kv_heads * head_dim + kv_head * head_dim + dim];
     }
     output[id] = value / denominator;
 }

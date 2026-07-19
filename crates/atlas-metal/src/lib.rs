@@ -89,7 +89,10 @@ mod macos {
     pub struct ResidentCommand<'a> {
         runtime: &'a MetalRuntime,
         command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
-        encoder: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
+        // A token still uses one command buffer.  Each dependent dispatch gets
+        // its own compute encoder so producer writes are an explicit pass
+        // boundary before the next kernel consumes them.
+        encoder: Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
     }
 
     impl<'a> ResidentCommand<'a> {
@@ -99,19 +102,25 @@ mod macos {
             buffers: &[&GpuBuffer],
             count: usize,
         ) -> Result<(), MetalError> {
+            if let Some(encoder) = self.encoder.take() {
+                encoder.endEncoding();
+            }
+            let encoder = self
+                .command_buffer
+                .computeCommandEncoder()
+                .ok_or(MetalError::CommandCreation)?;
             let pipeline = self
                 .runtime
                 .pipelines
                 .get(kernel)
                 .ok_or_else(|| MetalError::MissingKernel(kernel.into()))?;
-            self.encoder.setComputePipelineState(&**pipeline);
+            encoder.setComputePipelineState(&**pipeline);
             for (index, buffer) in buffers.iter().enumerate() {
                 unsafe {
-                    self.encoder
-                        .setBuffer_offset_atIndex(Some(buffer.native()), 0, index);
+                    encoder.setBuffer_offset_atIndex(Some(buffer.native()), 0, index);
                 }
             }
-            self.encoder.dispatchThreads_threadsPerThreadgroup(
+            encoder.dispatchThreads_threadsPerThreadgroup(
                 MTLSize {
                     width: count.max(1),
                     height: 1,
@@ -123,11 +132,62 @@ mod macos {
                     depth: 1,
                 },
             );
+            self.encoder = Some(encoder);
             Ok(())
         }
 
-        pub fn finish(self) -> Result<DispatchTiming, MetalError> {
-            self.encoder.endEncoding();
+        /// Dispatch with byte offsets into resident buffers.  Decode keeps
+        /// scalar constants in a small set of persistent buffers, so offsets
+        /// avoid allocating a buffer for every kernel argument.
+        pub fn dispatch_1d_at(
+            &mut self,
+            kernel: &'static str,
+            buffers: &[(&GpuBuffer, usize)],
+            count: usize,
+        ) -> Result<(), MetalError> {
+            if let Some(encoder) = self.encoder.take() {
+                encoder.endEncoding();
+            }
+            let encoder = self
+                .command_buffer
+                .computeCommandEncoder()
+                .ok_or(MetalError::CommandCreation)?;
+            let pipeline = self
+                .runtime
+                .pipelines
+                .get(kernel)
+                .ok_or_else(|| MetalError::MissingKernel(kernel.into()))?;
+            encoder.setComputePipelineState(&**pipeline);
+            for (index, (buffer, offset)) in buffers.iter().enumerate() {
+                if *offset > buffer.bytes {
+                    return Err(MetalError::InvalidInput(
+                        "resident buffer offset is out of range".into(),
+                    ));
+                }
+                unsafe {
+                    encoder.setBuffer_offset_atIndex(Some(buffer.native()), *offset, index);
+                }
+            }
+            encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: count.max(1),
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: self.runtime.pipeline_thread_width(kernel),
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.encoder = Some(encoder);
+            Ok(())
+        }
+
+        pub fn finish(mut self) -> Result<DispatchTiming, MetalError> {
+            if let Some(encoder) = self.encoder.take() {
+                encoder.endEncoding();
+            }
             let started = Instant::now();
             self.runtime
                 .command_buffer_count
@@ -418,18 +478,29 @@ mod macos {
             Ok(value)
         }
 
+        pub fn read_f32(&self, buffer: &GpuBuffer, count: usize) -> Result<Vec<f32>, MetalError> {
+            let bytes = count
+                .checked_mul(size_of::<f32>())
+                .ok_or_else(|| MetalError::InvalidInput("f32 readback size overflow".into()))?;
+            if bytes > buffer.bytes {
+                return Err(MetalError::InvalidInput(
+                    "f32 readback buffer is too small".into(),
+                ));
+            }
+            let mut values = vec![0.0; count];
+            self.copy_buffer_to_slice(buffer.native(), &mut values)?;
+            Ok(values)
+        }
+
         pub fn begin_resident_command(&self) -> Result<ResidentCommand<'_>, MetalError> {
             let command_buffer = self
                 .queue
                 .commandBuffer()
                 .ok_or(MetalError::CommandCreation)?;
-            let encoder = command_buffer
-                .computeCommandEncoder()
-                .ok_or(MetalError::CommandCreation)?;
             Ok(ResidentCommand {
                 runtime: self,
                 command_buffer,
-                encoder,
+                encoder: None,
             })
         }
 

@@ -1,4 +1,4 @@
-# Phase 14: Recurrent working memory
+# Phase 15: Recurrent working memory
 
 ## Outcome
 
@@ -19,5 +19,5 @@ use the larger fixture for overhead and session-memory bounds.
 
 ## Exit gate
 
-`phase_11_working_memory` has standard-path parity at zero gate, restores
+`phase_15_working_memory` has standard-path parity at zero gate, restores
 correctly, leaks no session data, and holds stable memory for 10,000 steps.

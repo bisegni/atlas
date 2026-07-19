@@ -1,4 +1,4 @@
-# Phase 16: Graph retrieval
+# Phase 17: Graph retrieval
 
 ## Outcome
 
@@ -19,5 +19,5 @@ for long-generation latency, overlap, and retrieval-cache measurements.
 
 ## Exit gate
 
-`phase_13_retrieval` returns expected IDs/scores, invalidates on mutation,
+`phase_17_retrieval` returns expected IDs/scores, invalidates on mutation,
 caps transfer bytes, and reports retrieval/upload/decode-stall time separately.

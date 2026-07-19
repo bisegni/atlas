@@ -10,8 +10,8 @@ dequantized-weight copy.
 - Freeze FP16 logit/performance baselines.
 - Implement packed blocks, scale/zero metadata, and fused in-register or
   threadgroup dequantization with FP32 accumulation.
-- Add project-owned SafeTensors conversion first; add GGUF only after that
-  format is validated. Measure loading independently from decode.
+- This phase is a packed-tensor foundation only. Persisted-model reduction and
+  GGUF loading are deferred to Phase 11, after resident packed kernels exist.
 
 ## Model fixture
 

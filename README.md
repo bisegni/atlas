@@ -112,20 +112,20 @@ Talk to the model directly (omit `--prompt` for the REPL):
 cargo run -p atlas-cli -- chat --model small --prompt 'The capital of France is' --max-tokens 32
 ```
 
-Expose the same greedy runtime on loopback at `http://127.0.0.1:8080`:
-
-```zsh
-cargo run -p atlas-cli -- serve --model small
-```
+The supported product interface is currently the local CLI. HTTP serving is
+intentionally deferred until the final API phase, after sampling, quantized
+model loading, scheduling, and the memory runtime have stable CLI contracts.
 
 ## Implementation order
 
 1. Bootstrap native Metal and validate simple kernels against CPU results.
 2. Build tensors, allocation pools, and essential Transformer operators.
 3. Load the small model and validate complete Metal inference.
-4. Add KV cache, quantization, executors, sampling, runtime scheduling, and
-   API serving.
+4. Complete the local CLI with sampling, GGUF Q4_0/Q8_0 model loading,
+   quantized resident inference, diagnostics, and runtime scheduling.
 5. Add bounded local attention, then the Atlas memory system incrementally.
+6. Add the loopback OpenAI-compatible server only after the local runtime and
+   CLI contracts are complete.
 
 For the complete sequence and exact gates, begin with
 [Phase 0](docs/atlas-metal-phases/phase-00-metal-runtime-bootstrap.md).

@@ -1,4 +1,4 @@
-# Phase 13: Atlas local attention
+# Phase 14: Atlas local attention
 
 ## Outcome
 
@@ -19,5 +19,5 @@ for a long-generation bounded-memory profile.
 
 ## Exit gate
 
-`phase_10_local_attention` shows fixed maximum KV bytes beyond the window,
+`phase_14_local_attention` shows fixed maximum KV bytes beyond the window,
 lossless ordered expired chunks, and Phase-4 parity with eviction disabled.

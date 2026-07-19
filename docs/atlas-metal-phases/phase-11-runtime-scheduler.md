@@ -1,4 +1,4 @@
-# Phase 11: Runtime and scheduler
+# Phase 13: Runtime and scheduler
 
 ## Outcome
 
@@ -19,5 +19,5 @@ larger fixture for a sustained multi-session memory/latency soak.
 
 ## Exit gate
 
-`phase_08_runtime` runs three sessions, cancels one, preserves the other two,
+`phase_13_runtime` runs three sessions, cancels one, preserves the other two,
 proves queue bounds and cache release, and emits token-ordered events/metrics.
