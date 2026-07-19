@@ -17,9 +17,17 @@ format, and a selected revision becomes a verified local manifest record.
   structured candidates with provider ID, repository ID, immutable revision,
   architecture, compatible format, artifact size, and any gated-model/auth
   requirement.
+- Add provider-scoped login state with `atlas-cli provider login|status|logout
+  huggingface`. Store validated credentials outside the repository and never
+  write them to manifests or diagnostics. `HF_TOKEN` overrides the stored
+  credential for automation. Provider selection is optional when exactly one
+  provider is registered; otherwise `atlas-cli provider default <provider>`
+  persists the user-local default and `--provider` remains an explicit
+  override.
 - Filter Hugging Face results to artifacts Atlas can load: a Llama-compatible
   architecture, required config/tokenizer files, and either the supported
-  FP32 SafeTensors layout or the Phase 11a Q4_0/Q8_0 GGUF layout. Exclude
+  SafeTensors layouts using Atlas-supported FP32/FP16/BF16/I8 dtypes or the
+  Phase 11a Q4_0/Q8_0 GGUF layout. Exclude
   unknown architectures, unsupported quantizations, incomplete repositories,
   and mixed tensor encodings rather than presenting them as downloadable.
 - Add `atlas-cli model download <provider-model-id> --id <manifest-id>`.
@@ -40,3 +48,40 @@ and excludes unsupported candidates, and that downloading a pinned public
 candidate creates a manifest record accepted by `atlas-cli model verify`.
 A gated-model test proves that missing credentials fail without modifying the
 manifest or leaving a destination directory behind.
+
+## Acceptance evidence
+
+Phase 11c completed on 2026-07-19. The focused CLI/provider regression suite
+passed, including default-provider selection and Hugging Face's string-valued
+`gated = "manual"` metadata:
+
+```text
+cargo test -p atlas-cli
+15 passed; 0 failed
+```
+
+A pinned public Hugging Face download was registered and verified locally:
+
+```text
+cargo run -p atlas-cli -- model download \
+  'huggingface:HuggingFaceTB/SmolLM2-135M-Instruct@12fd25f77366fa6b3b4b768ec3050bf629380bac:safetensors-fp32' \
+  --id phase11c-public-smollm2
+{"event":"model_downloaded","model_id":"phase11c-public-smollm2",...}
+
+cargo run -p atlas-cli -- model verify --model phase11c-public-smollm2
+{"bytes":271165969,"model_id":"phase11c-public-smollm2","verified":true}
+```
+
+The gated rollback path was checked using the access-enabled
+`meta-llama/Llama-3.2-1B-Instruct` revision, deliberately with `--no-auth`:
+
+```text
+cargo run -p atlas-cli -- model download \
+  'huggingface:meta-llama/Llama-3.2-1B-Instruct@9213176726f574b556790deb65791e0c5aa438b6:safetensors-fp32' \
+  --id phase11c-gated-negative --no-auth
+Error: Hugging Face credentials are required for this gated/private artifact
+```
+
+After that expected failure, the manifest contained no
+`phase11c-gated-negative` record and neither its destination nor staging
+directory existed.

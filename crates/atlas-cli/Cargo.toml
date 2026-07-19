@@ -11,3 +11,8 @@ atlas-core = { path = "../atlas-core" }
 atlas-metal = { path = "../atlas-metal" }
 atlas-model = { path = "../atlas-model" }
 serde_json.workspace = true
+sha2.workspace = true
+ureq.workspace = true
+keyring.workspace = true
+rpassword.workspace = true
+ratatui.workspace = true

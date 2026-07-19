@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     env, fs,
-    io::{self, BufRead, Read, Write},
+    io::{self, BufRead, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicBool, Ordering},
@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use atlas_core::{
-    GgufModel, GgufTensorType, GgufWriter, QuantFormat, QuantizedMatrix, quantize_q4_0,
+    DType, GgufModel, GgufTensorType, GgufWriter, QuantFormat, QuantizedMatrix, quantize_q4_0,
     quantize_q8_0, read_safetensors_descriptors, read_safetensors_tensor_f32,
 };
 use atlas_metal::MetalRuntime;
@@ -24,7 +24,21 @@ use atlas_model::{
     sampling::SamplingConfig,
     validate_generation_golden,
 };
+use ratatui::{
+    Terminal,
+    backend::CrosstermBackend,
+    crossterm::{
+        event::{self, Event, KeyCode, KeyEventKind},
+        execute,
+        terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    },
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Style},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
+};
 use serde_json::{Value, json};
+
+mod providers;
 
 static CHAT_INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
@@ -86,6 +100,7 @@ fn main() -> Result<()> {
         Some("fixture") if args.get(1).map(String::as_str) == Some("verify") => {
             fixture_verify(&args[2..])
         }
+        Some("provider") => provider_command(&args[1..]),
         Some("model") => model_command(&args[1..]),
         Some("generate") => generate(&args[1..]),
         Some("chat") => chat(&args[1..]),
@@ -95,11 +110,75 @@ fn main() -> Result<()> {
         Some("phase_08b_decode") => phase_08b_decode(&args[1..]),
         _ => {
             eprintln!(
-                "usage: atlas-cli model inspect|verify --model ID | atlas-cli model quantize --model FP32_ID --id ID --format q4_0|q8_0 [--progress human|json|quiet] | atlas-cli model import-gguf --path FILE --id ID --config FILE --tokenizer FILE --source SOURCE --revision REVISION"
+                "usage: atlas-cli provider login|logout|status|default [huggingface] | atlas-cli model search [--provider huggingface] [--json] QUERY | atlas-cli model download PROVIDER_MODEL_ID --id ID | atlas-cli model inspect|verify --model ID"
             );
             bail!("invalid command")
         }
     }
+}
+
+fn provider_command(args: &[String]) -> Result<()> {
+    let command = args
+        .first()
+        .context("provider command requires a subcommand")?;
+    match command.as_str() {
+        "default" => {
+            let value = args
+                .get(1)
+                .context("provider default requires a provider ID or --clear")?;
+            if value == "--clear" {
+                providers::set_default_provider(None)?;
+                println!("{}", json!({"default_provider":null}));
+            } else {
+                providers::set_default_provider(Some(value))?;
+                println!("{}", json!({"default_provider":value}));
+            }
+        }
+        "status" => {
+            let provider = args
+                .get(1)
+                .map(String::as_str)
+                .unwrap_or(providers::HUGGING_FACE);
+            let (source, _) = providers::token(provider)?;
+            let state = match source {
+                providers::AuthSource::Environment => "environment",
+                providers::AuthSource::Keychain => "keychain",
+                providers::AuthSource::Missing => "unauthenticated",
+            };
+            println!(
+                "{}",
+                json!({"provider":provider,"authentication":state,"default_provider":providers::load_default_provider()?})
+            );
+        }
+        "login" => {
+            let provider = args
+                .get(1)
+                .map(String::as_str)
+                .unwrap_or(providers::HUGGING_FACE);
+            ensure!(
+                provider == providers::HUGGING_FACE,
+                "provider `{provider}` does not support login"
+            );
+            eprint!("Hugging Face access token (read or fine-grained): ");
+            let value = rpassword::read_password().context("read Hugging Face access token")?;
+            providers::validate_hugging_face_token(&value)?;
+            providers::store_token(provider, &value)?;
+            println!(
+                "{}",
+                json!({"provider":provider,"authenticated":true,"credential_store":"keychain"})
+            );
+        }
+        "logout" => {
+            let provider = args
+                .get(1)
+                .map(String::as_str)
+                .unwrap_or(providers::HUGGING_FACE);
+            providers::logout(provider)?;
+            println!("{}", json!({"provider":provider,"authenticated":false}));
+        }
+        _ => bail!("provider command must be `login`, `logout`, `status`, or `default`"),
+    }
+    Ok(())
 }
 
 /// Run exactly one request through the reusable bounded runtime. Multi-session
@@ -507,6 +586,21 @@ mod phase_07_tests {
         );
         assert!(safe_project_path(Path::new("models/hf/small")).is_ok());
         assert!(safe_project_path(Path::new("../models/hf/small")).is_err());
+    }
+
+    #[test]
+    fn downloaded_manifest_id_cannot_escape_the_model_root() {
+        assert!(valid_manifest_id("small-q4.1"));
+        assert!(!valid_manifest_id(""));
+        assert!(!valid_manifest_id("../escape"));
+        assert!(!valid_manifest_id("line\nbreak"));
+    }
+
+    #[test]
+    fn model_search_sizes_are_human_readable() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(1_048_576), "1.0 MiB");
     }
 
     #[test]
@@ -1194,6 +1288,8 @@ fn model_command(args: &[String]) -> Result<()> {
     match command.as_str() {
         "quantize" => return model_quantize(&args[1..]),
         "import-gguf" => return model_import_gguf(&args[1..]),
+        "search" => return model_search(&args[1..]),
+        "download" => return model_download(&args[1..]),
         _ => {}
     }
     let selection = resolve_model(&args[1..])?;
@@ -1216,8 +1312,528 @@ fn model_command(args: &[String]) -> Result<()> {
                 json!({"model_id": record.id, "verified": true, "bytes": record.bytes})
             );
         }
-        _ => bail!("model command must be `inspect`, `verify`, `quantize`, or `import-gguf`"),
+        _ => bail!(
+            "model command must be `search`, `download`, `inspect`, `verify`, `quantize`, or `import-gguf`"
+        ),
     }
+    Ok(())
+}
+
+fn model_search(args: &[String]) -> Result<()> {
+    let mut requested = None;
+    let mut query = None;
+    let mut json_output = false;
+    let mut no_ui = false;
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--provider" {
+            index += 1;
+            requested = Some(
+                args.get(index)
+                    .context("--provider needs a value")?
+                    .as_str(),
+            );
+        } else if args[index] == "--json" {
+            json_output = true;
+        } else if args[index] == "--no-ui" {
+            no_ui = true;
+        } else if query.is_none() {
+            query = Some(args[index].as_str());
+        } else {
+            bail!("model search accepts one query");
+        }
+        index += 1;
+    }
+    let selection = providers::selected(requested)?;
+    let provider = providers::provider(selection.id())?;
+    let query = query.unwrap_or("");
+    let first_page = if query.is_empty() {
+        providers::SearchPage {
+            candidates: Vec::new(),
+            next_cursor: None,
+        }
+    } else {
+        provider.search(query, None)?
+    };
+    let candidates = first_page.candidates;
+    if json_output {
+        for candidate in candidates {
+            println!("{}", candidate.json());
+        }
+    } else if !no_ui && io::stdin().is_terminal() && io::stdout().is_terminal() {
+        model_browser(
+            query,
+            candidates,
+            load_manifest().map(|m| m.models).unwrap_or_default(),
+            first_page.next_cursor,
+        )?;
+    } else if candidates.is_empty() {
+        println!("Enter a query, for example: atlas-cli model search SmolLM2");
+    } else {
+        println!(
+            "Found {} Atlas-compatible model{} from {}:\n",
+            candidates.len(),
+            if candidates.len() == 1 { "" } else { "s" },
+            selection.id()
+        );
+        for (index, candidate) in candidates.iter().enumerate() {
+            println!("{}. {}", index + 1, candidate.repository);
+            println!("   Format: {}", candidate.format);
+            println!("   Size: {}", human_bytes(candidate.bytes));
+            println!("   Revision: {}", candidate.revision);
+            println!(
+                "   Access: {}",
+                if candidate.requires_auth {
+                    "login required"
+                } else {
+                    "public"
+                }
+            );
+            println!(
+                "   Download: atlas-cli model download '{}' --id <name>",
+                candidate.id()
+            );
+            println!();
+        }
+    }
+    Ok(())
+}
+
+fn model_browser(
+    query: &str,
+    mut candidates: Vec<providers::ModelCandidate>,
+    models: Vec<ModelRecord>,
+    mut next_cursor: Option<String>,
+) -> Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    let mut focus = if query.is_empty() { 0usize } else { 1usize };
+    let mut selected = 0usize;
+    let mut local = 0usize;
+    let mut input = query.to_owned();
+    let mut status = String::new();
+    let mut offset = 0usize;
+    let mut cursors = vec![None];
+    let result = loop {
+        terminal.draw(|frame| {
+            let outer = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Min(1)])
+                .split(frame.area());
+            let input_style = if focus == 0 {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            };
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "Search: {input}  page {}  [/ edit] [←/→ pages] [Tab switch tables] [q quit]  {status}", offset / providers::SEARCH_PAGE_SIZE + 1
+                ))
+                .style(input_style)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Atlas Model Explorer"),
+                ),
+                outer[0],
+            );
+            let rows = candidates.iter().map(|c| {
+                Row::new(vec![
+                    Cell::from(c.repository.clone()),
+                    Cell::from(c.format.clone()),
+                    Cell::from(human_bytes(c.bytes)),
+                    Cell::from(c.reason.clone().unwrap_or_else(|| if c.requires_auth { "login".into() } else { "public".into() })),
+                ]).style(if c.downloadable { Style::default() } else { Style::default().fg(Color::DarkGray) })
+            });
+            let mut state = TableState::default();
+            state.select(Some(selected.min(candidates.len().saturating_sub(1))));
+            let style = if focus == 1 {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default()
+            };
+            let table = Table::new(
+                rows,
+                [
+                    Constraint::Percentage(52),
+                    Constraint::Length(20),
+                    Constraint::Length(12),
+                    Constraint::Length(10),
+                ],
+            )
+            .header(
+                Row::new(["Downloadable model", "Format", "Size", "Access"])
+                    .style(Style::default().fg(Color::Green)),
+            )
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Downloadable models"),
+            )
+            .row_highlight_style(style);
+            if focus != 2 {
+                frame.render_stateful_widget(table, outer[1], &mut state);
+                return;
+            }
+            let rows = models.iter().map(|m| {
+                Row::new(vec![
+                    Cell::from(m.id.clone()),
+                    Cell::from(m.format.clone()),
+                    Cell::from(human_bytes(m.bytes)),
+                    Cell::from(if m.path.exists() {
+                        "present"
+                    } else {
+                        "missing"
+                    }),
+                ])
+            });
+            let mut state = TableState::default();
+            state.select(Some(local.min(models.len().saturating_sub(1))));
+            let style = if focus == 2 {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default()
+            };
+            let table = Table::new(
+                rows,
+                [
+                    Constraint::Percentage(52),
+                    Constraint::Length(20),
+                    Constraint::Length(12),
+                    Constraint::Length(10),
+                ],
+            )
+            .header(
+                Row::new(["Manifest ID", "Format", "Size", "State"])
+                    .style(Style::default().fg(Color::Green)),
+            )
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Downloaded models"),
+            )
+            .row_highlight_style(style);
+            frame.render_stateful_widget(table, outer[1], &mut state);
+        })?;
+        if let Event::Key(key) = event::read()? {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
+                KeyCode::Tab => focus = if focus == 2 { 1 } else { 2 },
+                KeyCode::Char('/') => focus = 0,
+                KeyCode::Up | KeyCode::Char('k') if focus == 1 => {
+                    selected = selected.saturating_sub(1)
+                }
+                KeyCode::Down | KeyCode::Char('j') if focus == 1 => {
+                    selected = (selected + 1).min(candidates.len().saturating_sub(1))
+                }
+                KeyCode::Up | KeyCode::Char('k') if focus == 2 => local = local.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') if focus == 2 => {
+                    local = (local + 1).min(models.len().saturating_sub(1))
+                }
+                KeyCode::Backspace if focus == 0 => {
+                    input.pop();
+                }
+                KeyCode::Char(ch) if focus == 0 => input.push(ch),
+                KeyCode::Enter if focus == 0 => {
+                    terminal.draw(|frame| {
+                        frame.render_widget(
+                            Paragraph::new(format!("Searching Hugging Face for `{input}`…"))
+                                .style(Style::default().fg(Color::Yellow))
+                                .block(
+                                    Block::default()
+                                        .borders(Borders::ALL)
+                                        .title("Atlas Model Explorer"),
+                                ),
+                            frame.area(),
+                        )
+                    })?;
+                    match providers::selected(None)
+                        .and_then(|selection| providers::provider(selection.id()))
+                        .and_then(|provider| provider.search(&input, None))
+                    {
+                        Ok(page) => {
+                            candidates = page.candidates;
+                            next_cursor = page.next_cursor;
+                            cursors = vec![None];
+                            selected = 0;
+                            offset = 0;
+                            focus = 1;
+                            status = format!("{} result(s)", candidates.len());
+                        }
+                        Err(error) => {
+                            status = format!("Search failed: {error:#}");
+                        }
+                    }
+                }
+                KeyCode::Right if focus == 1 && !input.is_empty() => {
+                    let Some(cursor) = next_cursor.clone() else {
+                        status = "No more results".into();
+                        continue;
+                    };
+                    match providers::selected(None)
+                        .and_then(|s| providers::provider(s.id()))
+                        .and_then(|p| p.search(&input, Some(&cursor)))
+                    {
+                        Ok(page) if !page.candidates.is_empty() => {
+                            candidates = page.candidates;
+                            cursors.push(Some(cursor));
+                            next_cursor = page.next_cursor;
+                            offset += providers::SEARCH_PAGE_SIZE;
+                            selected = 0;
+                            status = format!("page {}", offset / providers::SEARCH_PAGE_SIZE + 1);
+                        }
+                        Ok(_) => status = "No more results".into(),
+                        Err(error) => status = format!("Search failed: {error:#}"),
+                    }
+                }
+                KeyCode::Left if focus == 1 && offset >= providers::SEARCH_PAGE_SIZE => {
+                    let previous = offset - providers::SEARCH_PAGE_SIZE;
+                    let previous_cursor = cursors[cursors.len() - 2].as_deref();
+                    match providers::selected(None)
+                        .and_then(|s| providers::provider(s.id()))
+                        .and_then(|p| p.search(&input, previous_cursor))
+                    {
+                        Ok(page) => {
+                            candidates = page.candidates;
+                            next_cursor = cursors.pop().flatten();
+                            offset = previous;
+                            selected = 0;
+                            status = format!("page {}", offset / providers::SEARCH_PAGE_SIZE + 1);
+                        }
+                        Err(error) => status = format!("Search failed: {error:#}"),
+                    }
+                }
+                KeyCode::Enter
+                    if focus == 1
+                        && !candidates.is_empty()
+                        && candidates[selected].downloadable =>
+                {
+                    break Ok(println!(
+                        "atlas-cli model download '{}' --id <name>",
+                        candidates[selected].id()
+                    ));
+                }
+                KeyCode::Enter if focus == 1 && !candidates.is_empty() => {
+                    status = candidates[selected]
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "This model cannot be downloaded by Atlas".into());
+                }
+                KeyCode::Enter if focus == 2 && !models.is_empty() => {
+                    break Ok(println!(
+                        "atlas-cli model verify --model {}",
+                        models[local].id
+                    ));
+                }
+                _ => {}
+            }
+        }
+    };
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    result
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn valid_manifest_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn model_download(args: &[String]) -> Result<()> {
+    let candidate = args
+        .first()
+        .context("model download requires a provider model ID")?;
+    let mut id = None;
+    let mut allow_auth = true;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--id" => {
+                index += 1;
+                id = args.get(index).cloned();
+            }
+            "--no-auth" => allow_auth = false,
+            flag => bail!("unknown model download option: {flag}"),
+        }
+        index += 1;
+    }
+    let id = id.context("model download requires --id")?;
+    ensure!(
+        valid_manifest_id(&id),
+        "--id may contain only letters, digits, '.', '_' and '-'"
+    );
+    ensure!(
+        candidate.starts_with("huggingface:"),
+        "unsupported provider model ID"
+    );
+    let manifest = load_manifest()?;
+    ensure!(
+        !manifest.models.iter().any(|model| model.id == id),
+        "model ID `{id}` already exists"
+    );
+    let destination = Path::new("models/hf").join(&id);
+    ensure!(
+        !destination.exists(),
+        "model destination already exists: {}",
+        destination.display()
+    );
+    let staging = Path::new("models/hf").join(format!(".{id}.staging-{}", std::process::id()));
+    ensure!(
+        !staging.exists(),
+        "model staging directory already exists: {}",
+        staging.display()
+    );
+    let result = (|| -> Result<()> {
+        let downloaded = providers::download_hugging_face(candidate, &staging, allow_auth)?;
+        let gguf_file = downloaded
+            .files
+            .iter()
+            .find(|file| file.ends_with(".gguf"))
+            .cloned();
+        let format = if let Some(file) = gguf_file {
+            fs::rename(staging.join(file), staging.join("model.gguf"))?;
+            let gguf = GgufModel::open(staging.join("model.gguf"))?;
+            ensure!(
+                gguf.metadata
+                    .get("general.architecture")
+                    .map(String::as_str)
+                    == Some("llama"),
+                "GGUF architecture is not Llama"
+            );
+            let has_q4 = gguf
+                .tensors
+                .iter()
+                .any(|tensor| tensor.tensor_type == GgufTensorType::Q4_0);
+            let has_q8 = gguf
+                .tensors
+                .iter()
+                .any(|tensor| tensor.tensor_type == GgufTensorType::Q8_0);
+            let q4_only = gguf.tensors.iter().all(|tensor| {
+                matches!(
+                    tensor.tensor_type,
+                    GgufTensorType::Q4_0 | GgufTensorType::F32
+                )
+            });
+            let q8_only = gguf.tensors.iter().all(|tensor| {
+                matches!(
+                    tensor.tensor_type,
+                    GgufTensorType::Q8_0 | GgufTensorType::F32
+                )
+            });
+            if q4_only && has_q4 {
+                "gguf-q4_0"
+            } else if q8_only && has_q8 {
+                "gguf-q8_0"
+            } else {
+                bail!("GGUF contains mixed or unsupported tensor encodings")
+            }
+        } else {
+            fixture_details(&staging)?;
+            for entry in fs::read_dir(&staging)? {
+                let path = entry?.path();
+                if path.extension().and_then(|extension| extension.to_str()) == Some("safetensors")
+                {
+                    ensure!(
+                        read_safetensors_descriptors(&path)?
+                            .iter()
+                            .all(|descriptor| matches!(
+                                descriptor.tensor.dtype,
+                                DType::F32 | DType::F16 | DType::BF16 | DType::I8
+                            )),
+                        "SafeTensors artifact contains an unsupported tensor dtype: {}",
+                        path.display()
+                    );
+                }
+            }
+            "safetensors-fp32"
+        };
+        fs::rename(&staging, &destination)?;
+        if let Err(error) = register_download_manifest(
+            &id,
+            &downloaded.repository,
+            &downloaded.revision,
+            &destination,
+            format,
+        ) {
+            let _ = fs::remove_dir_all(&destination);
+            return Err(error);
+        }
+        verify_manifest_model(
+            &load_manifest()?
+                .models
+                .into_iter()
+                .find(|record| record.id == id)
+                .context("registered model missing from manifest")?,
+        )?;
+        println!(
+            "{}",
+            json!({"event":"model_downloaded","provider":"huggingface","model_id":id,"source":downloaded.repository,"revision":downloaded.revision,"format":format,"path":destination})
+        );
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result
+}
+
+fn register_download_manifest(
+    id: &str,
+    source: &str,
+    revision: &str,
+    directory: &Path,
+    format: &str,
+) -> Result<()> {
+    let files: Vec<String> = fs::read_dir(directory)?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<std::io::Result<_>>()?;
+    ensure!(
+        files.contains(&"config.json".into()) && files.contains(&"tokenizer.json".into()),
+        "download is missing config.json or tokenizer.json"
+    );
+    let mut text = fs::read_to_string(MODEL_MANIFEST)?;
+    let bytes: u64 = files
+        .iter()
+        .map(|file| fs::metadata(directory.join(file)).map(|metadata| metadata.len()))
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .sum();
+    text.push_str(&format!("\n[[models]]\nid = \"{id}\"\nsource = \"{source}\"\nrevision = \"{revision}\"\npath = \"{}\"\narchitecture = \"LlamaForCausalLM\"\ntokenizer = \"tokenizer.json\"\nformat = \"{format}\"\nbytes = {bytes}\n", directory.display()));
+    for file in files {
+        let path = directory.join(&file);
+        text.push_str(&format!(
+            "\n[[models.files]]\npath = \"{file}\"\nbytes = {}\nsha256 = \"{}\"\n",
+            fs::metadata(&path)?.len(),
+            sha256_file(&path)?
+        ));
+    }
+    let temporary = Path::new("models/manifest.toml.tmp");
+    fs::write(temporary, text)?;
+    fs::rename(temporary, MODEL_MANIFEST)?;
     Ok(())
 }
 

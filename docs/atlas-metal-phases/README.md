@@ -23,7 +23,7 @@ cross-phase exit rules.
 | 10 | [Sampling engine](phase-10-sampling.md) |
 | 11a | [GGUF Q4_0/Q8_0 quantized models]([done]%20phase-11a-gguf-quantized-models.md) |
 | 11b | [Runtime and scheduler]([done]%20phase-11b-runtime-scheduler.md) |
-| 11c | [Model providers and Hugging Face discovery](phase-11c-model-providers.md) |
+| 11c | [Model providers and Hugging Face discovery]([done]%20phase-11c-model-providers.md) |
 | 12 | [Quantized CLI acceptance](phase-12-quantized-cli-acceptance.md) |
 | 13 | [Atlas local attention](phase-13-local-attention.md) |
 | 14 | [Recurrent working memory](phase-14-working-memory.md) |
