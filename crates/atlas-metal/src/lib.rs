@@ -509,8 +509,10 @@ mod macos {
                 "vector_multiply_f32",
                 "embedding_lookup_f32",
                 "rms_norm_f32",
+                "rms_norm_decode_f32",
                 "matvec_f32",
                 "matvec_q4_0",
+                "matvec_q4_0_blocked",
                 "matvec_q8_0",
                 "embedding_lookup_q4_0",
                 "embedding_lookup_q8_0",
@@ -960,6 +962,33 @@ mod macos {
             )?;
             self.copy_buffer_to_slice(&output_buffer, &mut output)?;
             Ok((output, timing))
+        }
+
+        #[cfg(test)]
+        fn argmax_for_test(&self, values: &[f32]) -> Result<(u32, DispatchTiming), MetalError> {
+            if values.is_empty() {
+                return Err(MetalError::InvalidInput(
+                    "argmax requires at least one value".into(),
+                ));
+            }
+            let input = self.upload_f32(values)?;
+            let output = self.upload_u32(&[0])?;
+            let count = self.upload_u32(&[count_u32(values.len())?])?;
+            let timing = self.dispatch(
+                "argmax_f32",
+                &[input.native(), output.native(), count.native()],
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            )?;
+            Ok((self.read_u32(&output)?, timing))
         }
 
         pub fn matmul(
@@ -1478,6 +1507,27 @@ mod macos {
             )));
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{MetalError, MetalRuntime};
+
+        #[test]
+        fn argmax_reduction_preserves_large_vocabulary_and_highest_tie() {
+            let runtime = match MetalRuntime::new() {
+                Ok(runtime) => runtime,
+                Err(MetalError::NoDevice) => return,
+                Err(error) => panic!("initialize Metal runtime: {error}"),
+            };
+            let mut values = vec![-10.0; 65_537];
+            values[7] = 3.5;
+            values[31_111] = 9.0;
+            values[65_536] = 9.0;
+            let (selected, timing) = runtime.argmax_for_test(&values).unwrap();
+            assert_eq!(selected, 65_536);
+            assert!(timing.gpu_time.is_some());
+        }
     }
 }
 

@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use atlas_core::{GgufTensorType, QuantFormat};
-use atlas_metal::GpuBuffer;
+use atlas_metal::{GpuBuffer, ResidentCommand};
 
 use crate::kv_cache::{ContiguousKvCache, KvCacheConfig, LayerKv, SessionId};
 use crate::{AtlasModel, Generation, LayerTrace, argmax, gather_head, scatter_head};
@@ -169,6 +169,10 @@ pub struct ExecutorConfig {
     /// explicit diagnostic/acceptance selector only.
     #[doc(hidden)]
     pub resident_attention_path: ResidentAttentionPath,
+    /// Fixture-only A/B selector for validating the Q4 packed-block decode
+    /// kernel. Production always uses the packed-block path.
+    #[doc(hidden)]
+    pub resident_q4_matvec_path: ResidentQ4MatvecPath,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -189,6 +193,16 @@ pub enum ResidentAttentionPath {
     Fused,
 }
 
+/// Resident Q4 decode projection implementation. Scalar is retained only as a
+/// behavioral oracle for fixture coverage; it is never a production fallback.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResidentQ4MatvecPath {
+    #[default]
+    PackedBlock,
+    Scalar,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LogitsReadback {
     #[default]
@@ -207,6 +221,7 @@ impl Default for ExecutorConfig {
             stop_on_eos: true,
             resident_decode_profile: false,
             resident_attention_path: ResidentAttentionPath::LegacyThreePass,
+            resident_q4_matvec_path: ResidentQ4MatvecPath::PackedBlock,
         }
     }
 }
@@ -448,6 +463,7 @@ struct ResidentExecutor {
     position_index: usize,
     logits_readback: LogitsReadback,
     attention_path: ResidentAttentionPath,
+    q4_matvec_path: ResidentQ4MatvecPath,
 }
 
 impl ResidentExecutor {
@@ -456,6 +472,7 @@ impl ResidentExecutor {
         capacity: usize,
         logits_readback: LogitsReadback,
         attention_path: ResidentAttentionPath,
+        q4_matvec_path: ResidentQ4MatvecPath,
     ) -> Result<Self> {
         let runtime = model.ops.runtime();
         let c = &model.config;
@@ -521,6 +538,7 @@ impl ResidentExecutor {
             position_index: 0,
             logits_readback,
             attention_path,
+            q4_matvec_path,
         })
     }
 
@@ -1059,8 +1077,8 @@ impl ResidentExecutor {
         }
         for layer in 0..model.config.num_hidden_layers {
             let p = format!("model.layers.{layer}");
-            command.dispatch_1d(
-                "rms_norm_f32",
+            dispatch_decode_rms_norm(
+                &mut command,
                 &[
                     &self.state,
                     self.weight(&format!("{p}.input_layernorm.weight"))?,
@@ -1068,7 +1086,6 @@ impl ResidentExecutor {
                     &self.hidden,
                     &self.epsilon,
                 ],
-                1,
             )?;
             let stage_started = Instant::now();
             for (name, output, width_buffer, output_width) in [
@@ -1077,8 +1094,11 @@ impl ResidentExecutor {
                 ("v_proj", &self.v, &self.kv_width, kv_width),
             ] {
                 let weight_name = format!("{p}.self_attn.{name}.weight");
-                command.dispatch_1d(
-                    resident_matvec_kernel(model, &weight_name)?,
+                dispatch_decode_matvec(
+                    &mut command,
+                    model,
+                    self.q4_matvec_path,
+                    &weight_name,
                     &[
                         &self.norm,
                         self.weight(&weight_name)?,
@@ -1221,8 +1241,11 @@ impl ResidentExecutor {
                 }
             }
             let attention_output_name = format!("{p}.self_attn.o_proj.weight");
-            command.dispatch_1d(
-                resident_matvec_kernel(model, &attention_output_name)?,
+            dispatch_decode_matvec(
+                &mut command,
+                model,
+                self.q4_matvec_path,
+                &attention_output_name,
                 &[
                     &self.attention,
                     self.weight(&attention_output_name)?,
@@ -1251,8 +1274,8 @@ impl ResidentExecutor {
                     dispatches,
                 );
             }
-            command.dispatch_1d(
-                "rms_norm_f32",
+            dispatch_decode_rms_norm(
+                &mut command,
                 &[
                     &self.residual,
                     self.weight(&format!("{p}.post_attention_layernorm.weight"))?,
@@ -1260,12 +1283,14 @@ impl ResidentExecutor {
                     &self.hidden,
                     &self.epsilon,
                 ],
-                1,
             )?;
             let gate_name = format!("{p}.mlp.gate_proj.weight");
             let stage_started = Instant::now();
-            command.dispatch_1d(
-                resident_matvec_kernel(model, &gate_name)?,
+            dispatch_decode_matvec(
+                &mut command,
+                model,
+                self.q4_matvec_path,
+                &gate_name,
                 &[
                     &self.norm,
                     self.weight(&gate_name)?,
@@ -1276,8 +1301,11 @@ impl ResidentExecutor {
                 model.config.intermediate_size,
             )?;
             let up_name = format!("{p}.mlp.up_proj.weight");
-            command.dispatch_1d(
-                resident_matvec_kernel(model, &up_name)?,
+            dispatch_decode_matvec(
+                &mut command,
+                model,
+                self.q4_matvec_path,
+                &up_name,
                 &[
                     &self.norm,
                     self.weight(&up_name)?,
@@ -1298,8 +1326,11 @@ impl ResidentExecutor {
                 model.config.intermediate_size,
             )?;
             let down_name = format!("{p}.mlp.down_proj.weight");
-            command.dispatch_1d(
-                resident_matvec_kernel(model, &down_name)?,
+            dispatch_decode_matvec(
+                &mut command,
+                model,
+                self.q4_matvec_path,
+                &down_name,
                 &[
                     &self.product,
                     self.weight(&down_name)?,
@@ -1319,8 +1350,8 @@ impl ResidentExecutor {
             }
         }
         let stage_started = Instant::now();
-        command.dispatch_1d(
-            "rms_norm_f32",
+        dispatch_decode_rms_norm(
+            &mut command,
             &[
                 &self.state,
                 self.weight("model.norm.weight")?,
@@ -1328,7 +1359,6 @@ impl ResidentExecutor {
                 &self.hidden,
                 &self.epsilon,
             ],
-            1,
         )?;
         let lm_head = if model.config.tie_word_embeddings {
             embed
@@ -1340,16 +1370,15 @@ impl ResidentExecutor {
         } else {
             "lm_head.weight"
         };
-        command.dispatch_1d(
-            resident_matvec_kernel(model, lm_head_name)?,
+        dispatch_decode_matvec(
+            &mut command,
+            model,
+            self.q4_matvec_path,
+            lm_head_name,
             &[&self.norm, lm_head, &self.logits, &self.hidden, &self.vocab],
             model.config.vocab_size,
         )?;
-        command.dispatch_1d(
-            "argmax_f32",
-            &[&self.logits, &self.selected, &self.vocab],
-            1,
-        )?;
+        dispatch_decode_argmax(&mut command, &[&self.logits, &self.selected, &self.vocab])?;
         if let Some(profile) = profile.as_deref_mut() {
             ResidentDecodeProfile::record(&mut profile.lm_head, stage_started.elapsed(), 3);
         }
@@ -1419,7 +1448,9 @@ fn record_exact_kernel_trace(
             | "rope_f32"
             | "rope_half_to_interleaved_f32"
             | "rope_interleaved_to_half_f32" => ("attention", "prefill_or_decode"),
-            "matvec_f32" | "matvec_q4_0" | "matvec_q8_0" => ("projection", "prefill_or_decode"),
+            "matvec_f32" | "matvec_q4_0" | "matvec_q4_0_blocked" | "matvec_q8_0" => {
+                ("projection", "prefill_or_decode")
+            }
             "silu_f32" | "vector_multiply_f32" => ("mlp", "prefill_or_decode"),
             "argmax_f32" => ("lm_head", "prefill_or_decode"),
             "rms_norm_f32" | "vector_add_f32" => ("normalization_or_residual", "prefill_or_decode"),
@@ -1467,6 +1498,45 @@ fn resident_matvec_kernel(model: &AtlasModel, name: &str) -> Result<&'static str
         Some(GgufTensorType::Q8_0) => "matvec_q8_0",
         Some(other) => anyhow::bail!("unsupported packed resident tensor format {other:?}"),
     })
+}
+
+/// Decode-only specializations retain the resident buffers and the enclosing
+/// one-token command buffer. Trace diagnostics deliberately continue using the
+/// scalar kernels as their stable stage-parity oracle.
+fn dispatch_decode_rms_norm(
+    command: &mut ResidentCommand<'_>,
+    buffers: &[&GpuBuffer],
+) -> Result<()> {
+    command
+        .dispatch_threadgroups_1d("rms_norm_decode_f32", buffers, 1, 32)
+        .map_err(Into::into)
+}
+
+fn dispatch_decode_argmax(command: &mut ResidentCommand<'_>, buffers: &[&GpuBuffer]) -> Result<()> {
+    command
+        .dispatch_threadgroups_1d("argmax_f32", buffers, 1, 256)
+        .map_err(Into::into)
+}
+
+fn dispatch_decode_matvec(
+    command: &mut ResidentCommand<'_>,
+    model: &AtlasModel,
+    q4_path: ResidentQ4MatvecPath,
+    name: &str,
+    buffers: &[&GpuBuffer],
+    output_width: usize,
+) -> Result<()> {
+    if model.resident_weight_format(name) == Some(GgufTensorType::Q4_0)
+        && q4_path == ResidentQ4MatvecPath::PackedBlock
+    {
+        command
+            .dispatch_threadgroups_1d("matvec_q4_0_blocked", buffers, output_width, 32)
+            .map_err(Into::into)
+    } else {
+        command
+            .dispatch_1d(resident_matvec_kernel(model, name)?, buffers, output_width)
+            .map_err(Into::into)
+    }
 }
 
 fn resident_embedding_kernel(model: &AtlasModel, name: &str) -> Result<&'static str> {
@@ -1600,6 +1670,7 @@ impl<'a> AtlasExecutor<'a> {
                     config.max_context,
                     config.logits_readback,
                     config.resident_attention_path,
+                    config.resident_q4_matvec_path,
                 )
             })
             .transpose()?;

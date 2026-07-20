@@ -89,6 +89,24 @@ kernel void rms_norm_f32(
     for (uint column = 0; column < hidden; ++column) { output[row * hidden + column] = input[row * hidden + column] * inverse_rms * weight[column]; }
 }
 
+// Decode normalizes one hidden-state row at a time.  A single scalar thread
+// made this a serial bubble between resident projections; keep the same FP32
+// reduction/order per lane but spread the row across one Apple SIMD-group.
+kernel void rms_norm_decode_f32(
+    device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &hidden [[buffer(3)]],
+    constant float &epsilon [[buffer(4)]], uint lane [[thread_index_in_threadgroup]]) {
+    float squared_sum = 0.0f;
+    for (uint column = lane; column < hidden; column += 32) {
+        float x = input[column];
+        squared_sum += x * x;
+    }
+    float inverse_rms = rsqrt(simd_sum(squared_sum) / float(hidden) + epsilon);
+    for (uint column = lane; column < hidden; column += 32) {
+        output[column] = input[column] * inverse_rms * weight[column];
+    }
+}
+
 kernel void matvec_f32(
     device const float *input [[buffer(0)]], device const float *weights [[buffer(1)]],
     device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
@@ -143,6 +161,27 @@ kernel void matvec_q4_0(
         for (uint i = 0; i < 32; ++i) { uchar nibble = (i & 1) ? base[2 + i / 2] >> 4 : base[2 + i / 2] & 15; sum += input[block * 32 + i] * float(int(nibble) - 8) * scale; }
     }
     output[row] = sum;
+}
+
+// One SIMD-group owns one output row.  Each lane consumes the same lane of
+// every Q4 block, so packed GGUF weights stay resident and adjacent lanes read
+// adjacent nibbles instead of one scalar thread walking the entire row.
+kernel void matvec_q4_0_blocked(
+    device const float *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
+    constant uint &output_width [[buffer(4)]], uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    if (row >= output_width) return;
+    float sum = 0.0f;
+    uint blocks = input_width / 32;
+    for (uint block = 0; block < blocks; ++block) {
+        device const uchar *base = weights + (row * blocks + block) * 18;
+        uchar packed = base[2 + lane / 2];
+        uchar nibble = (lane & 1) ? packed >> 4 : packed & 15;
+        sum += input[block * 32 + lane] * float(int(nibble) - 8) * float(*(device const half *)base);
+    }
+    float total = simd_sum(sum);
+    if (lane == 0) output[row] = total;
 }
 
 kernel void matvec_q8_0(
@@ -439,10 +478,35 @@ kernel void attention_values_resident_f32(
 
 kernel void argmax_f32(
     device const float *values [[buffer(0)]], device uint *output [[buffer(1)]],
-    constant uint &count [[buffer(2)]], uint id [[thread_position_in_grid]]) {
-    if (id == 0) {
-        uint best = 0;
-        for (uint i = 1; i < count; ++i) if (values[i] >= values[best]) best = i;
-        output[0] = best;
+    constant uint &count [[buffer(2)]], uint lane [[thread_index_in_threadgroup]]) {
+    threadgroup float candidates[256];
+    threadgroup uint candidate_ids[256];
+    float best_value = -INFINITY;
+    uint best_id = 0;
+    for (uint i = lane; i < count; i += 256) {
+        float value = values[i];
+        // Match the old greedy tie rule: the later (higher) token ID wins.
+        if (value >= best_value) {
+            best_value = value;
+            best_id = i;
+        }
+    }
+    candidates[lane] = best_value;
+    candidate_ids[lane] = best_id;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            float other_value = candidates[lane + stride];
+            uint other_id = candidate_ids[lane + stride];
+            if (other_value > candidates[lane]
+                || (other_value == candidates[lane] && other_id >= candidate_ids[lane])) {
+                candidates[lane] = other_value;
+                candidate_ids[lane] = other_id;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+        output[0] = candidate_ids[0];
     }
 }

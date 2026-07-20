@@ -1,14 +1,15 @@
-use std::{path::Path, sync::atomic::AtomicBool, time::Duration};
+use std::{collections::BTreeMap, path::Path, sync::atomic::AtomicBool, time::Duration};
 
 use atlas_core::QuantFormat;
 use atlas_model::{
     AtlasModel,
     executor::{
         AtlasExecutor, ExecutorConfig, ExecutorMetrics, ExecutorMode, GenerationEvent,
-        GenerationFinishReason, LogitsReadback, ResidentAttentionPath, ResidentStage,
-        compare_stage, resident_stage_tolerance,
+        GenerationFinishReason, LogitsReadback, ResidentAttentionPath, ResidentQ4MatvecPath,
+        ResidentStage, compare_stage, resident_stage_tolerance,
     },
 };
+use serde_json::json;
 
 #[test]
 fn phase_06_metrics_report_rates_and_latency_percentiles() {
@@ -119,6 +120,10 @@ fn phase_11a_defaults_to_resident_for_production_inference() {
     assert_eq!(
         ExecutorConfig::default().resident_attention_path,
         ResidentAttentionPath::LegacyThreePass
+    );
+    assert_eq!(
+        ExecutorConfig::default().resident_q4_matvec_path,
+        ResidentQ4MatvecPath::PackedBlock
     );
     assert_eq!(
         ExecutorConfig::default().logits_readback,
@@ -420,6 +425,164 @@ fn phase_12a_resident_decode_profile_is_observational() {
             "selected_token_readback" | "request_tokenization" | "resident_weight_upload"
         ) || entry.gpu_execution.is_some()
     }));
+}
+
+/// Prints exact, decode-only GPU timing by resident kernel.  It intentionally
+/// lives in ignored fixture coverage rather than restoring a public profiling
+/// CLI command, because every profiled dispatch uses its own command buffer.
+#[test]
+#[ignore = "requires local Metal and the downloaded larger Q4 fixture"]
+fn phase_12a_larger_q4_profile_reports_decode_kernel_costs() {
+    larger_decode_kernel_profile("larger-q4", "larger_q4_decode_kernel_profile");
+}
+
+#[test]
+#[ignore = "requires local Metal and the downloaded larger Q8 fixture"]
+fn phase_12a_larger_q8_profile_reports_decode_kernel_costs() {
+    larger_decode_kernel_profile("larger-q8", "larger_q8_decode_kernel_profile");
+}
+
+fn larger_decode_kernel_profile(fixture_id: &str, event: &str) {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fixture = root.join("models/gguf").join(fixture_id);
+    let model = AtlasModel::load(&fixture).expect("load larger quantized fixture");
+    let mut executor = AtlasExecutor::new(
+        &model,
+        ExecutorConfig {
+            mode: ExecutorMode::Resident,
+            resident_decode_profile: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let result = executor
+        .generate_greedy("The capital of France is", 3)
+        .unwrap();
+    let profile = result.metrics.resident_decode_profile.as_ref().unwrap();
+    let mut kernels = BTreeMap::<&str, (u64, u128, u128)>::new();
+    for entry in profile.trace.iter().filter(|entry| entry.phase == "decode") {
+        let aggregate = kernels.entry(entry.kernel).or_default();
+        aggregate.0 += 1;
+        aggregate.1 += entry.gpu_execution.unwrap_or_default().as_nanos();
+        aggregate.2 += entry.cpu_encode.as_nanos();
+    }
+    let total_gpu_nanos = kernels.values().map(|(_, gpu, _)| gpu).sum::<u128>();
+    let report = kernels
+        .into_iter()
+        .map(|(kernel, (dispatches, gpu_nanos, cpu_encode_nanos))| {
+            json!({
+                "kernel": kernel,
+                "dispatches": dispatches,
+                "gpu_ms": gpu_nanos as f64 / 1_000_000.0,
+                "cpu_encode_ms": cpu_encode_nanos as f64 / 1_000_000.0,
+                "decode_gpu_share": if total_gpu_nanos == 0 { 0.0 } else { gpu_nanos as f64 / total_gpu_nanos as f64 },
+            })
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "{}",
+        json!({
+            "event": event,
+            "executor": "resident",
+            "generated_tokens": result.generation.generated_token_ids.len(),
+            "decode_tokens_profiled": profile.tokens,
+            "resident_bytes": result.metrics.resident_bytes,
+            "readback_bytes": result.metrics.readback_bytes,
+            "kernels": report,
+        })
+    );
+    assert_eq!(profile.tokens, result.metrics.decode_tokens);
+    assert_eq!(
+        result.metrics.readback_bytes,
+        4 * (result.metrics.prefill_tokens + result.metrics.decode_tokens) as u64
+    );
+}
+
+#[test]
+#[ignore = "requires local Metal and the downloaded larger Q4 fixture"]
+fn phase_12a_larger_q4_packed_block_preserves_greedy_behavior() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let model =
+        AtlasModel::load(root.join("models/gguf/larger-q4")).expect("load larger Q4 fixture");
+    for prompt in [
+        "The capital of France is",
+        "Atlas resident inference performance check: explain why GPU-resident decode matters in one sentence.",
+        "Write one concise sentence about GPU-resident inference.",
+    ] {
+        let mut scalar = AtlasExecutor::new(
+            &model,
+            ExecutorConfig {
+                mode: ExecutorMode::Resident,
+                resident_q4_matvec_path: ResidentQ4MatvecPath::Scalar,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let expected = scalar.generate_greedy(prompt, 32).unwrap();
+        let mut packed = AtlasExecutor::new(&model, ExecutorConfig::default()).unwrap();
+        let actual = packed.generate_greedy(prompt, 32).unwrap();
+        assert_eq!(
+            actual.generation.generated_token_ids, expected.generation.generated_token_ids,
+            "Q4 token IDs changed for {prompt:?}"
+        );
+        assert_eq!(
+            actual.finish_reason, expected.finish_reason,
+            "Q4 finish reason changed for {prompt:?}"
+        );
+        assert_eq!(
+            actual.metrics.resident_bytes,
+            expected.metrics.resident_bytes
+        );
+        assert_eq!(
+            actual.metrics.decode_command_buffer_count,
+            actual.metrics.decode_tokens as u64
+        );
+        assert_eq!(actual.metrics.weight_upload_bytes, 0);
+    }
+}
+
+#[test]
+#[ignore = "requires local Metal, the downloaded larger Q4 fixture, and a stable performance environment"]
+fn phase_12a_larger_q4_128_token_resident_throughput_gate() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let model =
+        AtlasModel::load(root.join("models/gguf/larger-q4")).expect("load larger Q4 fixture");
+    let prompt = "Atlas resident inference performance check: explain why GPU-resident decode matters in one sentence.";
+    let max_tokens = 128;
+    // The final prefill forward selects generated token one.  Each remaining
+    // generated token requires one post-prefill decode forward, so the
+    // decode-only metrics intentionally cover 127 forwards for this
+    // 128-token response.
+    let expected_decode_tokens = max_tokens - 1;
+    let config = ExecutorConfig {
+        mode: ExecutorMode::Resident,
+        stop_on_eos: false,
+        ..Default::default()
+    };
+    // Materialize weights and pipelines before taking the decode measurement.
+    AtlasExecutor::new(&model, config)
+        .unwrap()
+        .generate_greedy(prompt, 1)
+        .unwrap();
+    let mut executor = AtlasExecutor::new(&model, config).unwrap();
+    let result = executor.generate_greedy(prompt, max_tokens).unwrap();
+    assert_eq!(result.generation.generated_token_ids.len(), max_tokens);
+    assert_eq!(result.metrics.decode_tokens, expected_decode_tokens);
+    assert_eq!(result.metrics.weight_upload_bytes, 0);
+    assert!(result.metrics.resident_bytes <= 1_366_335_800);
+    assert_eq!(
+        result.metrics.decode_command_buffer_count,
+        expected_decode_tokens as u64
+    );
+    assert_eq!(
+        result.metrics.readback_bytes,
+        4 * (result.metrics.prefill_tokens + result.metrics.decode_tokens) as u64
+    );
+    assert!(
+        result.metrics.decode_tokens_per_second() >= 30.0,
+        "Q4 resident decode regressed to {:.2} tok/s",
+        result.metrics.decode_tokens_per_second()
+    );
 }
 
 #[test]
