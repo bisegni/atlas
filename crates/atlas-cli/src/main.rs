@@ -18,7 +18,7 @@ use atlas_model::{
     AtlasModel,
     executor::{
         AtlasExecutor, ExecutorConfig, ExecutorGeneration, ExecutorMetrics, ExecutorMode,
-        GenerationEvent, LogitsReadback,
+        GenerationEvent, LogitsReadback, ResidentAttentionPath,
     },
     runtime::{AtlasRuntime, RuntimeConfig, RuntimeEvent, RuntimeRequest},
     sampling::SamplingConfig,
@@ -43,6 +43,9 @@ mod providers;
 static CHAT_INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 const MODEL_MANIFEST: &str = "models/manifest.toml";
+const CHAT_PERFORMANCE_LOG: &str = "artifacts/chat-performance.jsonl";
+const Q8_GOLDEN_SUITE: &str = "fixtures/q8-golden-suite.json";
+const DEFAULT_Q8_GOLDEN_MODEL: &str = "small-q8-gpu-20260719124407";
 
 #[derive(Debug)]
 struct ModelManifest {
@@ -108,15 +111,13 @@ fn main() -> Result<()> {
         Some("model") => model_command(&args[1..]),
         Some("generate") => generate(&args[1..]),
         Some("chat") => chat(&args[1..]),
-        Some("benchmark") => benchmark(&args[1..]),
-        Some("diagnose") => diagnose(&args[1..]),
         Some("runtime") => runtime_command(&args[1..]),
         Some("phase_03_model") => phase_03_model(&args[1..]),
         Some("phase_05_quant") => phase_05_quant(&args[1..]),
         Some("phase_08b_decode") => phase_08b_decode(&args[1..]),
         _ => {
             eprintln!(
-                "usage: atlas-cli benchmark|diagnose|generate|chat --model ID ... | atlas-cli provider login|logout|status|default [huggingface] | atlas-cli model search [--provider huggingface] [--json] QUERY | atlas-cli model download PROVIDER_MODEL_ID --id ID | atlas-cli model inspect|verify --model ID"
+                "usage: atlas-cli generate|chat --model ID ... | atlas-cli provider login|logout|status|default [huggingface] | atlas-cli model search [--provider huggingface] [--json] QUERY | atlas-cli model download PROVIDER_MODEL_ID --id ID | atlas-cli model inspect|verify --model ID"
             );
             bail!("invalid command")
         }
@@ -271,7 +272,8 @@ fn chat(args: &[String]) -> Result<()> {
             &selection.id,
             selection.manifest.as_ref().map_or(0, |record| record.bytes),
             &mut turn_metrics,
-        )?;
+        )
+        .and_then(|result| append_chat_performance_record(&selection.id, &model, mode, &result))?;
         return Ok(());
     }
     eprintln!("Atlas chat. Commands: /reset, /help, /quit");
@@ -331,6 +333,7 @@ fn chat(args: &[String]) -> Result<()> {
             }
             Err(error) => return Err(error),
         };
+        append_chat_performance_record(&selection.id, &model, mode, &result)?;
         session_metrics.record(&turn_metrics);
         history.push_str(&model.decode(&result.generation.generated_token_ids)?);
         history.push('\n');
@@ -440,7 +443,7 @@ fn resident_executor<'a>(
     selection: &ModelSelection,
     logits_readback: LogitsReadback,
 ) -> Result<AtlasExecutor<'a>> {
-    resident_executor_with_eos(model, selection, logits_readback, true)
+    resident_executor_with_eos(model, selection, logits_readback, true, false)
 }
 
 fn resident_executor_with_eos<'a>(
@@ -448,6 +451,7 @@ fn resident_executor_with_eos<'a>(
     selection: &ModelSelection,
     logits_readback: LogitsReadback,
     stop_on_eos: bool,
+    _resident_decode_profile: bool,
 ) -> Result<AtlasExecutor<'a>> {
     let executor = AtlasExecutor::new(
         model,
@@ -455,6 +459,9 @@ fn resident_executor_with_eos<'a>(
             mode: ExecutorMode::Resident,
             logits_readback,
             stop_on_eos,
+            // Q8's exact-token gate is presently protected by the legacy
+            // numerical boundaries. Fused remains an explicit test selector.
+            resident_attention_path: ResidentAttentionPath::LegacyThreePass,
             ..Default::default()
         },
     )?;
@@ -494,6 +501,75 @@ fn generation_metrics_json(
         "command_buffers": result.metrics.command_buffer_count,
         "timing": { "ttft_ms": result.metrics.ttft.as_secs_f64() * 1000.0, "host_ms": result.metrics.host_wall_time.as_secs_f64() * 1000.0 },
         "decode_tok_s": result.metrics.decode_tokens_per_second(),
+    })
+}
+
+fn chat_performance_record(
+    model_id: &str,
+    model: &AtlasModel,
+    mode: ExecutorMode,
+    result: &ExecutorGeneration,
+) -> Result<Value> {
+    let timestamp_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock precedes Unix epoch")?
+        .as_millis();
+    Ok(json!({
+        "timestamp_ms": timestamp_ms,
+        "model_id": model_id,
+        "format": model.format_name(),
+        "executor": match mode { ExecutorMode::Reference => "reference", ExecutorMode::Resident => "resident" },
+        "prompt_tokens": result.generation.prompt_token_ids.len(),
+        "generated_tokens": result.generation.generated_token_ids.len(),
+        "finish_reason": format!("{:?}", result.finish_reason).to_lowercase(),
+        "ttft_ms": result.metrics.ttft.as_secs_f64() * 1000.0,
+        "prefill_tok_s": result.metrics.prefill_tokens_per_second(),
+        "decode_tok_s": result.metrics.decode_tokens_per_second(),
+        "host_ms": result.metrics.host_wall_time.as_secs_f64() * 1000.0,
+        "gpu_ms": result.metrics.gpu_execution_time.as_secs_f64() * 1000.0,
+        "command_buffers": result.metrics.command_buffer_count,
+        "prefill_command_buffers": result.metrics.prefill_command_buffer_count,
+        "decode_command_buffers": result.metrics.decode_command_buffer_count,
+        "weight_upload_bytes": result.metrics.weight_upload_bytes,
+        "readback_bytes": result.metrics.readback_bytes,
+        "resident_bytes": result.metrics.resident_bytes,
+    }))
+}
+
+fn append_jsonl_record(path: &Path, record: &Value) -> Result<()> {
+    if let Some(directory) = path.parent() {
+        fs::create_dir_all(directory).with_context(|| format!("create {}", directory.display()))?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    serde_json::to_writer(&mut file, record)?;
+    writeln!(file)?;
+    Ok(())
+}
+
+fn append_chat_performance_record(
+    model_id: &str,
+    model: &AtlasModel,
+    mode: ExecutorMode,
+    result: &ExecutorGeneration,
+) -> Result<()> {
+    let path = Path::new(CHAT_PERFORMANCE_LOG);
+    append_jsonl_record(
+        path,
+        &chat_performance_record(model_id, model, mode, result)?,
+    )?;
+    eprintln!("chat performance log: {}", path.display());
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn resident_profile_json(profile: &atlas_model::executor::ResidentDecodeProfile) -> Value {
+    json!({
+        "tokens": profile.tokens,
+        "profile_command_buffers": profile.command_buffer_count,
     })
 }
 
@@ -654,6 +730,38 @@ mod phase_07_tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn removed_diagnostic_commands_and_profile_flag_are_not_chat_options() {
+        assert!(parse_chat_args(&["benchmark".into()]).is_err());
+        assert!(parse_chat_args(&["diagnose".into()]).is_err());
+        assert!(
+            parse_chat_args(&[
+                "--model".into(),
+                "small".into(),
+                "--profile-resident-decode".into(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn jsonl_append_creates_parent_and_preserves_records() {
+        let directory = std::env::temp_dir().join(format!(
+            "atlas-chat-performance-test-{}",
+            std::process::id()
+        ));
+        let path = directory.join("nested/chat-performance.jsonl");
+        append_jsonl_record(&path, &json!({"record": 1})).unwrap();
+        append_jsonl_record(&path, &json!({"record": 2})).unwrap();
+        let records = fs::read_to_string(&path).unwrap();
+        let values = records
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![json!({"record": 1}), json!({"record": 2})]);
+        fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
@@ -2519,12 +2627,15 @@ fn generate(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn parse_benchmark_args(args: &[String]) -> Result<(Vec<String>, String, usize, usize, bool)> {
+fn parse_benchmark_args(
+    args: &[String],
+) -> Result<(Vec<String>, String, usize, usize, bool, bool)> {
     let mut model_args = Vec::new();
     let mut prompt = None;
     let mut max_new_tokens = 16usize;
     let mut warmup = 1usize;
     let mut ignore_eos = false;
+    let mut resident_decode_profile = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -2558,6 +2669,7 @@ fn parse_benchmark_args(args: &[String]) -> Result<(Vec<String>, String, usize, 
                     .context("parse --warmup")?;
             }
             "--ignore-eos" => ignore_eos = true,
+            "--profile-resident-decode" => resident_decode_profile = true,
             flag => bail!("unknown benchmark/diagnose option: {flag}"),
         }
         index += 1;
@@ -2569,11 +2681,13 @@ fn parse_benchmark_args(args: &[String]) -> Result<(Vec<String>, String, usize, 
         max_new_tokens,
         warmup,
         ignore_eos,
+        resident_decode_profile,
     ))
 }
 
 fn benchmark(args: &[String]) -> Result<()> {
-    let (model_args, prompt, max_new_tokens, warmup, ignore_eos) = parse_benchmark_args(args)?;
+    let (model_args, prompt, max_new_tokens, warmup, ignore_eos, resident_decode_profile) =
+        parse_benchmark_args(args)?;
     let selection = resolve_model(&model_args)?;
     let model = load_verified_model(&selection)?;
     for _ in 0..warmup {
@@ -2582,6 +2696,7 @@ fn benchmark(args: &[String]) -> Result<()> {
             &selection,
             LogitsReadback::SelectedToken,
             !ignore_eos,
+            false,
         )?;
         executor.generate_greedy(&prompt, max_new_tokens)?;
     }
@@ -2590,6 +2705,7 @@ fn benchmark(args: &[String]) -> Result<()> {
         &selection,
         LogitsReadback::SelectedToken,
         !ignore_eos,
+        resident_decode_profile,
     )?;
     let result = executor.generate_greedy(&prompt, max_new_tokens)?;
     let mut report = generation_metrics_json(
@@ -2601,12 +2717,17 @@ fn benchmark(args: &[String]) -> Result<()> {
     report["requested_max_new_tokens"] = json!(max_new_tokens);
     report["generated_tokens"] = json!(result.generation.generated_token_ids.len());
     report["ignore_eos"] = json!(ignore_eos);
+    report["resident_decode_profile_enabled"] = json!(resident_decode_profile);
     println!("{}", report);
     Ok(())
 }
 
 fn diagnose(args: &[String]) -> Result<()> {
-    let (model_args, prompt, max_new_tokens, warmup, ignore_eos) = parse_benchmark_args(args)?;
+    if args.first().map(String::as_str) == Some("--golden-suite") {
+        return diagnose_golden_suite(&args[1..]);
+    }
+    let (model_args, prompt, max_new_tokens, warmup, ignore_eos, resident_decode_profile) =
+        parse_benchmark_args(args)?;
     ensure!(!ignore_eos, "--ignore-eos is supported only by benchmark");
     let selection = resolve_model(&model_args)?;
     let record = selection
@@ -2618,7 +2739,13 @@ fn diagnose(args: &[String]) -> Result<()> {
         let mut executor = resident_executor(&model, &selection, LogitsReadback::FinalLogits)?;
         executor.generate_greedy(&prompt, max_new_tokens)?;
     }
-    let mut executor = resident_executor(&model, &selection, LogitsReadback::FinalLogits)?;
+    let mut executor = resident_executor_with_eos(
+        &model,
+        &selection,
+        LogitsReadback::FinalLogits,
+        true,
+        resident_decode_profile,
+    )?;
     let result = executor.generate_greedy(&prompt, max_new_tokens)?;
     let mut report = generation_metrics_json(&selection.id, &model, &result, record.bytes);
     if let Some(baseline_id) = &record.baseline_model {
@@ -2684,6 +2811,323 @@ fn diagnose(args: &[String]) -> Result<()> {
     }
     println!("{report}");
     Ok(())
+}
+
+fn diagnose_golden_suite(args: &[String]) -> Result<()> {
+    let suite = args.first().context("--golden-suite needs a suite name")?;
+    ensure!(suite == "q8", "unsupported golden suite `{suite}`");
+    let profile_resident_decode = args.iter().any(|arg| arg == "--profile-resident-decode");
+    let model_args = args[1..]
+        .iter()
+        .filter(|arg| arg.as_str() != "--profile-resident-decode")
+        .cloned()
+        .collect::<Vec<_>>();
+    let default_model_args = ["--model".to_owned(), DEFAULT_Q8_GOLDEN_MODEL.to_owned()];
+    let selection = if model_args.is_empty() {
+        resolve_model(&default_model_args)?
+    } else {
+        resolve_model(&model_args)?
+    };
+    let record = selection
+        .manifest
+        .as_ref()
+        .context("Q8 golden suite requires a manifest-backed --model")?;
+    ensure!(
+        record.format == "gguf-q8_0",
+        "Q8 golden suite requires a Q8_0 model"
+    );
+    let baseline_id = record
+        .baseline_model
+        .as_ref()
+        .context("Q8 golden suite requires baseline_model in the manifest")?;
+    let baseline_selection = resolve_model(&["--model".to_owned(), baseline_id.clone()])?;
+    let fixture = load_q8_golden_suite()?;
+    ensure!(
+        fixture.revision == record.revision,
+        "Q8 golden fixture revision {} differs from model revision {}",
+        fixture.revision,
+        record.revision
+    );
+    let q8 = load_verified_model(&selection)?;
+    let baseline = load_verified_model(&baseline_selection)?;
+    let mut cases = Vec::with_capacity(fixture.cases.len());
+    let mut failed = false;
+    for case in fixture.cases {
+        let prompt_ids = match case.prompt {
+            GoldenSuitePrompt::Text(prompt) => {
+                let ids = q8.tokenize(&prompt)?;
+                ensure!(
+                    ids == baseline.tokenize(&prompt)?,
+                    "tokenizer mismatch for {}",
+                    case.name
+                );
+                ids
+            }
+            GoldenSuitePrompt::TokenIds(ids) => ids,
+        };
+        let prompt_text = q8.decode(&prompt_ids)?;
+        let mut q8_executor = resident_executor_with_eos(
+            &q8,
+            &selection,
+            LogitsReadback::FinalLogits,
+            true,
+            profile_resident_decode,
+        )?;
+        let q8_result = q8_executor.generate_token_ids(
+            prompt_ids.clone(),
+            fixture.max_new_tokens,
+            Duration::ZERO,
+        )?;
+        let mut baseline_executor = resident_executor_with_eos(
+            &baseline,
+            &baseline_selection,
+            LogitsReadback::FinalLogits,
+            true,
+            profile_resident_decode,
+        )?;
+        let baseline_result = baseline_executor.generate_token_ids(
+            prompt_ids.clone(),
+            fixture.max_new_tokens,
+            Duration::ZERO,
+        )?;
+        let exact_tokens = q8_result.generation.generated_token_ids
+            == baseline_result.generation.generated_token_ids;
+        let exact_finish = q8_result.finish_reason == baseline_result.finish_reason;
+        failed |= !exact_tokens || !exact_finish;
+        let first_divergence = (!exact_tokens || !exact_finish)
+            .then(|| {
+                q8_first_argmax_divergence(
+                    &q8,
+                    &selection,
+                    &baseline,
+                    &baseline_selection,
+                    &prompt_ids,
+                    &q8_result,
+                    &baseline_result,
+                )
+            })
+            .transpose()?;
+        cases.push(json!({
+            "name": case.name,
+            "prompt_token_ids": prompt_ids,
+            "decoded_prompt": prompt_text,
+            "q8": golden_case_report(&q8_result),
+            "fp32_baseline": golden_case_report(&baseline_result),
+            "q8_profile": q8_result.metrics.resident_decode_profile.as_ref().map(resident_profile_json),
+            "fp32_profile": baseline_result.metrics.resident_decode_profile.as_ref().map(resident_profile_json),
+            "exact_token_parity": exact_tokens,
+            "exact_finish_reason_parity": exact_finish,
+            "first_argmax_divergence": first_divergence,
+        }));
+    }
+    let report = json!({
+        "event": "q8_golden_suite",
+        "suite": "q8",
+        "fixture": Q8_GOLDEN_SUITE,
+        "model_id": selection.id,
+        "model_revision": record.revision,
+        "baseline_model": baseline_id,
+        "executor": "resident",
+        "resident_attention_path": "legacy_three_pass",
+        "resident_decode_profile_enabled": profile_resident_decode,
+        "passed": !failed,
+        "cases": cases,
+    });
+    println!("{report}");
+    if failed {
+        preserve_q8_golden_failure(&report)?;
+        bail!(
+            "Q8 golden suite token or finish-reason parity failed; failure artifact preserved under artifacts/phase-12a/"
+        );
+    }
+    Ok(())
+}
+
+enum GoldenSuitePrompt {
+    Text(String),
+    TokenIds(Vec<u32>),
+}
+
+struct GoldenSuiteCase {
+    name: String,
+    prompt: GoldenSuitePrompt,
+}
+
+struct GoldenSuite {
+    revision: String,
+    max_new_tokens: usize,
+    cases: Vec<GoldenSuiteCase>,
+}
+
+fn load_q8_golden_suite() -> Result<GoldenSuite> {
+    let path = q8_golden_suite_path();
+    let value: Value = serde_json::from_slice(
+        &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+    )?;
+    let revision = value["fixture_revision"]
+        .as_str()
+        .context("Q8 golden fixture_revision is missing")?
+        .to_owned();
+    let max_new_tokens = value["max_new_tokens"]
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .context("Q8 golden max_new_tokens is invalid")?;
+    ensure!(
+        max_new_tokens > 0,
+        "Q8 golden max_new_tokens must be positive"
+    );
+    let cases = value["cases"]
+        .as_array()
+        .context("Q8 golden cases are missing")?
+        .iter()
+        .map(|case| -> Result<_> {
+            let name = case["name"]
+                .as_str()
+                .context("Q8 golden case name is missing")?
+                .to_owned();
+            let prompt = if let Some(text) = case["prompt"].as_str() {
+                GoldenSuitePrompt::Text(text.to_owned())
+            } else {
+                let ids = case["prompt_token_ids"]
+                    .as_array()
+                    .context("Q8 golden case needs prompt or prompt_token_ids")?
+                    .iter()
+                    .map(|id| {
+                        id.as_u64()
+                            .and_then(|id| u32::try_from(id).ok())
+                            .context("Q8 golden prompt token ID is invalid")
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                ensure!(
+                    ids.len() == 64,
+                    "Q8 fixed KV case must contain exactly 64 token IDs"
+                );
+                GoldenSuitePrompt::TokenIds(ids)
+            };
+            Ok(GoldenSuiteCase { name, prompt })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        cases.len() == 3,
+        "Q8 golden suite must contain exactly three cases"
+    );
+    Ok(GoldenSuite {
+        revision,
+        max_new_tokens,
+        cases,
+    })
+}
+
+fn q8_golden_suite_path() -> PathBuf {
+    let working_directory_path = PathBuf::from(Q8_GOLDEN_SUITE);
+    if working_directory_path.exists() {
+        working_directory_path
+    } else {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(Q8_GOLDEN_SUITE)
+    }
+}
+
+fn golden_case_report(result: &ExecutorGeneration) -> Value {
+    let selected_token = result.generation.generated_token_ids.last().copied();
+    let argmax = result
+        .generation
+        .final_logits
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(index, _)| index as u32);
+    let selected_logit = selected_token
+        .and_then(|id| result.generation.final_logits.get(id as usize))
+        .copied();
+    json!({
+        "token_ids": result.generation.generated_token_ids,
+        "finish_reason": format!("{:?}", result.finish_reason).to_lowercase(),
+        "selected_token": selected_token,
+        "selected_token_logit": selected_logit,
+        "final_logits_argmax": argmax,
+        "resident_metrics": {
+            "resident_bytes": result.metrics.resident_bytes,
+            "readback_bytes": result.metrics.readback_bytes,
+            "command_buffers": result.metrics.command_buffer_count,
+        },
+    })
+}
+
+/// Re-run only until the first changed greedy choice. The normal suite retains
+/// its single full generation per model; this slower path is failure-only and
+/// captures the logits which selected the changed token before autoregressive
+/// feedback can obscure the originating decision.
+fn q8_first_argmax_divergence(
+    q8: &AtlasModel,
+    q8_selection: &ModelSelection,
+    baseline: &AtlasModel,
+    baseline_selection: &ModelSelection,
+    prompt_ids: &[u32],
+    q8_full_result: &ExecutorGeneration,
+    baseline_full_result: &ExecutorGeneration,
+) -> Result<Value> {
+    let q8_tokens = &q8_full_result.generation.generated_token_ids;
+    let baseline_tokens = &baseline_full_result.generation.generated_token_ids;
+    let first_index = q8_tokens
+        .iter()
+        .zip(baseline_tokens)
+        .position(|(q8, baseline)| q8 != baseline)
+        .or_else(|| {
+            (q8_tokens.len() != baseline_tokens.len())
+                .then(|| q8_tokens.len().min(baseline_tokens.len()))
+        });
+    let Some(first_index) = first_index else {
+        return Ok(json!({
+            "unavailable": "finish reasons differ without a changed generated token",
+            "q8_finish_reason": format!("{:?}", q8_full_result.finish_reason).to_lowercase(),
+            "fp32_finish_reason": format!("{:?}", baseline_full_result.finish_reason).to_lowercase(),
+        }));
+    };
+    // The full suite already found the changed token. Replay exactly that
+    // prefix once per model to retrieve the logits that selected it.
+    let generated = first_index + 1;
+    let mut q8_executor = resident_executor(q8, q8_selection, LogitsReadback::FinalLogits)?;
+    let q8_result =
+        q8_executor.generate_token_ids(prompt_ids.to_vec(), generated, Duration::ZERO)?;
+    let mut baseline_executor =
+        resident_executor(baseline, baseline_selection, LogitsReadback::FinalLogits)?;
+    let baseline_result =
+        baseline_executor.generate_token_ids(prompt_ids.to_vec(), generated, Duration::ZERO)?;
+    Ok(json!({
+        "generated_token_index": first_index,
+        "q8_token": q8_result.generation.generated_token_ids.last(),
+        "fp32_token": baseline_result.generation.generated_token_ids.last(),
+        "q8_top_candidates": top_logit_candidates(&q8_result.generation.final_logits, 8),
+        "fp32_top_candidates": top_logit_candidates(&baseline_result.generation.final_logits, 8),
+    }))
+}
+
+fn top_logit_candidates(logits: &[f32], count: usize) -> Vec<Value> {
+    let mut candidates = logits
+        .iter()
+        .enumerate()
+        .filter(|(_, logit)| logit.is_finite())
+        .collect::<Vec<_>>();
+    candidates.sort_by(|(_, left), (_, right)| right.total_cmp(left));
+    candidates
+        .into_iter()
+        .take(count)
+        .map(|(token_id, logit)| json!({"token_id": token_id, "logit": logit}))
+        .collect()
+}
+
+fn preserve_q8_golden_failure(report: &Value) -> Result<()> {
+    let directory = Path::new("artifacts/phase-12a");
+    fs::create_dir_all(directory)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock precedes Unix epoch")?
+        .as_millis();
+    let path = directory.join(format!("q8-golden-failure-{stamp}.json"));
+    fs::write(&path, serde_json::to_vec_pretty(report)?)
+        .with_context(|| format!("write {}", path.display()))
 }
 
 fn phase_03_model(args: &[String]) -> Result<()> {

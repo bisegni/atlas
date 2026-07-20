@@ -334,6 +334,64 @@ kernel void attention_decode_f32(
     output[id] = value / denominator;
 }
 
+// One workgroup owns one query head.  It streams keys in order and maintains
+// the stable online-softmax state, avoiding resident score/weight buffers and
+// their three dependent dispatches.  The fixed 128-thread launch is supplied
+// by the resident encoder; each thread may own multiple output dimensions.
+kernel void attention_decode_fused_f32(
+    device const float *query [[buffer(0)]], device const float *cache [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &heads [[buffer(3)]],
+    constant uint &kv_heads [[buffer(4)]], constant uint &head_dim [[buffer(5)]],
+    constant uint &capacity [[buffer(6)]], constant uint &key_count [[buffer(7)]],
+    uint head [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]]) {
+    if (head >= heads) return;
+    uint kv_head = head / (heads / kv_heads);
+    uint value_base = capacity * kv_heads * head_dim;
+    threadgroup float reductions[128];
+    threadgroup float maximum;
+    threadgroup float denominator;
+    threadgroup float rescale;
+    threadgroup float weight;
+    maximum = -INFINITY;
+    denominator = 0.0f;
+    for (uint d = tid; d < head_dim; d += threads) output[head * head_dim + d] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint key = 0; key < key_count; ++key) {
+        float partial = 0.0f;
+        uint key_base = key * kv_heads * head_dim + kv_head * head_dim;
+        for (uint d = tid; d < head_dim; d += threads)
+            partial += query[head * head_dim + d] * cache[key_base + d];
+        reductions[tid] = partial;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) reductions[tid] += reductions[tid + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0) {
+            float score = reductions[0] * rsqrt(float(head_dim));
+            if (score > maximum) {
+                rescale = exp(maximum - score);
+                weight = 1.0f;
+                maximum = score;
+                denominator = denominator * rescale + weight;
+            } else {
+                rescale = 1.0f;
+                weight = exp(score - maximum);
+                denominator += weight;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint value_offset = value_base + key_base;
+        for (uint d = tid; d < head_dim; d += threads)
+            output[head * head_dim + d] = output[head * head_dim + d] * rescale
+                + weight * cache[value_offset + d];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint d = tid; d < head_dim; d += threads)
+        output[head * head_dim + d] /= denominator;
+}
+
 // Resident-layout equivalents of the reference score -> softmax -> value
 // pipeline. Persistent intermediate buffers intentionally preserve the same
 // FP32 rounding boundaries as the reference kernels.

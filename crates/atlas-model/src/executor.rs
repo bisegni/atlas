@@ -153,14 +153,22 @@ pub struct ExecutorConfig {
     /// The requested weight format.  FP16 denotes the existing FP32 model
     /// tensors; packed formats are reserved for the Phase-5 packed kernels.
     pub quant_format: QuantFormat,
-    /// Reference remains the default until resident decode passes its hardware
-    /// parity gate. Resident is explicit for diagnostics and benchmarking.
+    /// Resident is the production default. Reference is restricted to explicit
+    /// parity and diagnostic execution.
     pub mode: ExecutorMode,
     /// Downloading logits defeats token-only decode readback, so it is opt-in.
     pub logits_readback: LogitsReadback,
     /// Normal inference stops on EOS. Benchmark-only callers may disable this
     /// to measure a fixed decode workload without altering product behavior.
     pub stop_on_eos: bool,
+    /// Collect opt-in resident decode stage timings. This must not alter the
+    /// resident command boundary or normal generation behavior.
+    pub resident_decode_profile: bool,
+    /// Hidden resident attention selector. `LegacyThreePass` remains the
+    /// production-safe path while Q8 parity is being restored; `Fused` is an
+    /// explicit diagnostic/acceptance selector only.
+    #[doc(hidden)]
+    pub resident_attention_path: ResidentAttentionPath,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -168,6 +176,17 @@ pub enum ExecutorMode {
     #[default]
     Reference,
     Resident,
+}
+
+/// Resident attention implementation. The fused path is retained for focused
+/// parity and performance acceptance. It must not become the normal Resident
+/// path until the exact-token Q8 golden suite passes.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResidentAttentionPath {
+    #[default]
+    LegacyThreePass,
+    Fused,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -186,6 +205,8 @@ impl Default for ExecutorConfig {
             mode: ExecutorMode::Resident,
             logits_readback: LogitsReadback::SelectedToken,
             stop_on_eos: true,
+            resident_decode_profile: false,
+            resident_attention_path: ResidentAttentionPath::LegacyThreePass,
         }
     }
 }
@@ -226,11 +247,94 @@ pub struct ExecutorMetrics {
     pub decode_command_buffer_count: u64,
     /// Immutable model parameter bytes uploaded while constructing this executor.
     pub weight_upload_bytes: u64,
+    pub weight_upload_elapsed: Duration,
     /// Bytes copied from Metal buffers back to CPU-visible vectors.
     pub readback_bytes: u64,
     /// GPU-visible session arenas and immutable resident model weights.
     pub resident_bytes: u64,
     pub resident_arena_allocations: u64,
+    /// Present only when resident decode profiling was explicitly enabled.
+    pub resident_decode_profile: Option<ResidentDecodeProfile>,
+}
+
+/// Machine-readable, opt-in timing breakdown for post-prefill resident decode.
+/// Metal exposes GPU and scheduling timestamps at the one-command-buffer
+/// boundary, so those totals are attributed to stages by their dispatch count;
+/// CPU encoding is measured directly around each stage's encoding work.
+#[derive(Debug, Clone, Default)]
+pub struct ResidentDecodeProfile {
+    pub tokens: usize,
+    pub attention_implementation: &'static str,
+    pub fused_attention_dispatches: u64,
+    pub embedding: ResidentDecodeStageMetrics,
+    pub attention: ResidentDecodeStageMetrics,
+    pub packed_projections: ResidentDecodeStageMetrics,
+    pub mlp: ResidentDecodeStageMetrics,
+    pub lm_head: ResidentDecodeStageMetrics,
+    pub token_readback: ResidentDecodeStageMetrics,
+    pub command_buffer_schedule: Duration,
+    pub gpu_execution: Duration,
+    /// Ordered exact per-dispatch records. These are populated only when the
+    /// profiler isolated each kernel in its own Metal command buffer.
+    pub trace: Vec<ResidentKernelTrace>,
+    pub command_buffer_count: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResidentKernelTrace {
+    pub token_index: usize,
+    pub phase: &'static str,
+    pub layer: Option<usize>,
+    pub stage: &'static str,
+    pub kernel: &'static str,
+    pub cpu_encode: Duration,
+    pub gpu_execution: Option<Duration>,
+    pub command_buffer_schedule: Duration,
+    pub threads: usize,
+    pub threadgroups: usize,
+    pub threads_per_threadgroup: usize,
+    pub readback_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ResidentDecodeStageMetrics {
+    pub cpu_encode: Duration,
+    pub dispatches: u64,
+    pub command_buffer_schedule: Duration,
+    pub gpu_execution: Duration,
+}
+
+impl ResidentDecodeProfile {
+    fn record(stage: &mut ResidentDecodeStageMetrics, elapsed: Duration, dispatches: u64) {
+        stage.cpu_encode += elapsed;
+        stage.dispatches += dispatches;
+    }
+
+    fn attribute_command_buffer(&mut self, timing: atlas_metal::DispatchTiming) {
+        self.tokens += 1;
+        let total_dispatches = self.embedding.dispatches
+            + self.attention.dispatches
+            + self.packed_projections.dispatches
+            + self.mlp.dispatches
+            + self.lm_head.dispatches;
+        if total_dispatches == 0 {
+            return;
+        }
+        self.command_buffer_schedule += timing.command_buffer_schedule;
+        let gpu_time = timing.gpu_time.unwrap_or_default();
+        self.gpu_execution += gpu_time;
+        for stage in [
+            &mut self.embedding,
+            &mut self.attention,
+            &mut self.packed_projections,
+            &mut self.mlp,
+            &mut self.lm_head,
+        ] {
+            let ratio = stage.dispatches as f64 / total_dispatches as f64;
+            stage.command_buffer_schedule += timing.command_buffer_schedule.mul_f64(ratio);
+            stage.gpu_execution += gpu_time.mul_f64(ratio);
+        }
+    }
 }
 
 impl ExecutorMetrics {
@@ -295,7 +399,9 @@ pub struct AtlasExecutor<'a> {
     mode: ExecutorMode,
     logits_readback: LogitsReadback,
     stop_on_eos: bool,
+    resident_decode_profile: bool,
     weight_upload_bytes: u64,
+    weight_upload_elapsed: Duration,
 }
 
 struct ResidentExecutor {
@@ -316,8 +422,8 @@ struct ResidentExecutor {
     k_rot: GpuBuffer,
     v: GpuBuffer,
     attention: GpuBuffer,
-    attention_scores: GpuBuffer,
-    attention_weights: GpuBuffer,
+    attention_scores: Option<GpuBuffer>,
+    attention_weights: Option<GpuBuffer>,
     attention_key_count: GpuBuffer,
     gate: GpuBuffer,
     up: GpuBuffer,
@@ -341,10 +447,16 @@ struct ResidentExecutor {
     max_context: usize,
     position_index: usize,
     logits_readback: LogitsReadback,
+    attention_path: ResidentAttentionPath,
 }
 
 impl ResidentExecutor {
-    fn new(model: &AtlasModel, capacity: usize, logits_readback: LogitsReadback) -> Result<Self> {
+    fn new(
+        model: &AtlasModel,
+        capacity: usize,
+        logits_readback: LogitsReadback,
+        attention_path: ResidentAttentionPath,
+    ) -> Result<Self> {
         let runtime = model.ops.runtime();
         let c = &model.config;
         let h = c.hidden_size;
@@ -379,8 +491,12 @@ impl ResidentExecutor {
             k_rot: allocate_f32(kv_width)?,
             v: allocate_f32(kv_width)?,
             attention: allocate_f32(h)?,
-            attention_scores: allocate_f32(c.num_attention_heads * capacity)?,
-            attention_weights: allocate_f32(c.num_attention_heads * capacity)?,
+            attention_scores: (attention_path == ResidentAttentionPath::LegacyThreePass)
+                .then(|| allocate_f32(c.num_attention_heads * capacity))
+                .transpose()?,
+            attention_weights: (attention_path == ResidentAttentionPath::LegacyThreePass)
+                .then(|| allocate_f32(c.num_attention_heads * capacity))
+                .transpose()?,
             attention_key_count: runtime.allocate(4)?,
             gate: allocate_f32(c.intermediate_size)?,
             up: allocate_f32(c.intermediate_size)?,
@@ -404,6 +520,7 @@ impl ResidentExecutor {
             max_context: capacity,
             position_index: 0,
             logits_readback,
+            attention_path,
         })
     }
 
@@ -430,8 +547,6 @@ impl ResidentExecutor {
             &self.k_rot,
             &self.v,
             &self.attention,
-            &self.attention_scores,
-            &self.attention_weights,
             &self.attention_key_count,
             &self.gate,
             &self.up,
@@ -464,6 +579,14 @@ impl ResidentExecutor {
                 .iter()
                 .map(|buffer| buffer.bytes() as u64)
                 .sum::<u64>()
+            + self
+                .attention_scores
+                .as_ref()
+                .map_or(0, |buffer| buffer.bytes() as u64)
+            + self
+                .attention_weights
+                .as_ref()
+                .map_or(0, |buffer| buffer.bytes() as u64)
     }
     fn weight(&self, name: &str) -> Result<&GpuBuffer> {
         self.weights
@@ -555,13 +678,37 @@ impl ResidentExecutor {
         hidden: usize,
     ) -> Result<()> {
         let keys = self.position_index + 1;
+        if self.attention_path == ResidentAttentionPath::Fused {
+            let mut command = runtime.begin_resident_command()?;
+            command.dispatch_threadgroups_1d(
+                "attention_decode_fused_f32",
+                &[
+                    &self.q_rot,
+                    cache,
+                    &self.attention,
+                    &self.heads,
+                    &self.kv_heads,
+                    &self.head_dim,
+                    &self.capacity,
+                    &self.attention_key_count,
+                ],
+                heads,
+                128,
+            )?;
+            return command.finish().map(|_| ()).map_err(Into::into);
+        }
+        let scores = self.attention_scores.as_ref().expect("legacy score buffer");
+        let weights = self
+            .attention_weights
+            .as_ref()
+            .expect("legacy weight buffer");
         self.trace_dispatch(
             runtime,
             "attention_scores_resident_f32",
             &[
                 &self.q_rot,
                 cache,
-                &self.attention_scores,
+                scores,
                 &self.heads,
                 &self.kv_heads,
                 &self.head_dim,
@@ -574,8 +721,8 @@ impl ResidentExecutor {
             runtime,
             "masked_softmax_resident_f32",
             &[
-                &self.attention_scores,
-                &self.attention_weights,
+                scores,
+                weights,
                 &self.heads,
                 &self.capacity,
                 &self.attention_key_count,
@@ -586,7 +733,7 @@ impl ResidentExecutor {
             runtime,
             "attention_values_resident_f32",
             &[
-                &self.attention_weights,
+                weights,
                 cache,
                 &self.attention,
                 &self.heads,
@@ -874,7 +1021,12 @@ impl ResidentExecutor {
         Ok(snapshots)
     }
 
-    fn forward_token(&mut self, model: &AtlasModel, token: u32) -> Result<TokenStep> {
+    fn forward_token(
+        &mut self,
+        model: &AtlasModel,
+        token: u32,
+        mut profile: Option<&mut ResidentDecodeProfile>,
+    ) -> Result<TokenStep> {
         ensure!(
             self.position_index < self.max_context,
             "executor context exhausted"
@@ -886,8 +1038,10 @@ impl ResidentExecutor {
         runtime.write_u32(&self.position, &[u32::try_from(self.position_index)?])?;
         self.write_rope_tables(model)?;
         self.write_attention_key_count(runtime)?;
-        let mut command = runtime.begin_resident_command()?;
+        let token_index = self.position_index;
+        let mut command = runtime.begin_resident_command_with_exact_timing(profile.is_some())?;
         let embed = self.weight("model.embed_tokens.weight")?;
+        let stage_started = Instant::now();
         command.dispatch_1d(
             resident_embedding_kernel(model, "model.embed_tokens.weight")?,
             &[
@@ -900,6 +1054,9 @@ impl ResidentExecutor {
             ],
             model.config.hidden_size,
         )?;
+        if let Some(profile) = profile.as_deref_mut() {
+            ResidentDecodeProfile::record(&mut profile.embedding, stage_started.elapsed(), 1);
+        }
         for layer in 0..model.config.num_hidden_layers {
             let p = format!("model.layers.{layer}");
             command.dispatch_1d(
@@ -913,6 +1070,7 @@ impl ResidentExecutor {
                 ],
                 1,
             )?;
+            let stage_started = Instant::now();
             for (name, output, width_buffer, output_width) in [
                 ("q_proj", &self.q, &self.hidden, hidden_size),
                 ("k_proj", &self.k, &self.kv_width, kv_width),
@@ -931,6 +1089,14 @@ impl ResidentExecutor {
                     output_width,
                 )?;
             }
+            if let Some(profile) = profile.as_deref_mut() {
+                ResidentDecodeProfile::record(
+                    &mut profile.packed_projections,
+                    stage_started.elapsed(),
+                    3,
+                );
+            }
+            let stage_started = Instant::now();
             command.dispatch_1d(
                 "rope_half_to_interleaved_f32",
                 &[&self.q, &self.rope_input, &self.heads, &self.head_dim],
@@ -991,45 +1157,69 @@ impl ResidentExecutor {
                 kv_width,
             )?;
             let attention_keys = self.position_index + 1;
-            command.dispatch_1d(
-                "attention_scores_resident_f32",
-                &[
-                    &self.q_rot,
-                    &self.kv[layer],
-                    &self.attention_scores,
-                    &self.heads,
-                    &self.kv_heads,
-                    &self.head_dim,
-                    &self.capacity,
-                    &self.attention_key_count,
-                ],
-                model.config.num_attention_heads * attention_keys,
-            )?;
-            command.dispatch_1d(
-                "masked_softmax_resident_f32",
-                &[
-                    &self.attention_scores,
-                    &self.attention_weights,
-                    &self.heads,
-                    &self.capacity,
-                    &self.attention_key_count,
-                ],
-                model.config.num_attention_heads,
-            )?;
-            command.dispatch_1d(
-                "attention_values_resident_f32",
-                &[
-                    &self.attention_weights,
-                    &self.kv[layer],
-                    &self.attention,
-                    &self.heads,
-                    &self.kv_heads,
-                    &self.head_dim,
-                    &self.capacity,
-                    &self.attention_key_count,
-                ],
-                model.config.hidden_size,
-            )?;
+            match self.attention_path {
+                ResidentAttentionPath::Fused => command.dispatch_threadgroups_1d(
+                    "attention_decode_fused_f32",
+                    &[
+                        &self.q_rot,
+                        &self.kv[layer],
+                        &self.attention,
+                        &self.heads,
+                        &self.kv_heads,
+                        &self.head_dim,
+                        &self.capacity,
+                        &self.attention_key_count,
+                    ],
+                    model.config.num_attention_heads,
+                    128,
+                )?,
+                ResidentAttentionPath::LegacyThreePass => {
+                    let scores = self.attention_scores.as_ref().expect("legacy score buffer");
+                    let weights = self
+                        .attention_weights
+                        .as_ref()
+                        .expect("legacy weight buffer");
+                    command.dispatch_1d(
+                        "attention_scores_resident_f32",
+                        &[
+                            &self.q_rot,
+                            &self.kv[layer],
+                            scores,
+                            &self.heads,
+                            &self.kv_heads,
+                            &self.head_dim,
+                            &self.capacity,
+                            &self.attention_key_count,
+                        ],
+                        model.config.num_attention_heads * attention_keys,
+                    )?;
+                    command.dispatch_1d(
+                        "masked_softmax_resident_f32",
+                        &[
+                            scores,
+                            weights,
+                            &self.heads,
+                            &self.capacity,
+                            &self.attention_key_count,
+                        ],
+                        model.config.num_attention_heads,
+                    )?;
+                    command.dispatch_1d(
+                        "attention_values_resident_f32",
+                        &[
+                            weights,
+                            &self.kv[layer],
+                            &self.attention,
+                            &self.heads,
+                            &self.kv_heads,
+                            &self.head_dim,
+                            &self.capacity,
+                            &self.attention_key_count,
+                        ],
+                        model.config.hidden_size,
+                    )?;
+                }
+            }
             let attention_output_name = format!("{p}.self_attn.o_proj.weight");
             command.dispatch_1d(
                 resident_matvec_kernel(model, &attention_output_name)?,
@@ -1047,6 +1237,20 @@ impl ResidentExecutor {
                 &[&self.state, &self.work, &self.residual, &self.hidden],
                 model.config.hidden_size,
             )?;
+            if let Some(profile) = profile.as_deref_mut() {
+                let dispatches = match self.attention_path {
+                    ResidentAttentionPath::Fused => {
+                        profile.fused_attention_dispatches += 1;
+                        10
+                    }
+                    ResidentAttentionPath::LegacyThreePass => 12,
+                };
+                ResidentDecodeProfile::record(
+                    &mut profile.attention,
+                    stage_started.elapsed(),
+                    dispatches,
+                );
+            }
             command.dispatch_1d(
                 "rms_norm_f32",
                 &[
@@ -1059,6 +1263,7 @@ impl ResidentExecutor {
                 1,
             )?;
             let gate_name = format!("{p}.mlp.gate_proj.weight");
+            let stage_started = Instant::now();
             command.dispatch_1d(
                 resident_matvec_kernel(model, &gate_name)?,
                 &[
@@ -1109,7 +1314,11 @@ impl ResidentExecutor {
                 &[&self.residual, &self.work, &self.state, &self.hidden],
                 model.config.hidden_size,
             )?;
+            if let Some(profile) = profile.as_deref_mut() {
+                ResidentDecodeProfile::record(&mut profile.mlp, stage_started.elapsed(), 6);
+            }
         }
+        let stage_started = Instant::now();
         command.dispatch_1d(
             "rms_norm_f32",
             &[
@@ -1141,17 +1350,109 @@ impl ResidentExecutor {
             &[&self.logits, &self.selected, &self.vocab],
             1,
         )?;
-        command.finish()?;
-        self.position_index += 1;
-        Ok(TokenStep {
-            selected: runtime.read_u32(&self.selected)?,
-            logits: if self.logits_readback == LogitsReadback::FinalLogits {
-                runtime.read_f32(&self.logits, model.config.vocab_size)?
+        if let Some(profile) = profile.as_deref_mut() {
+            ResidentDecodeProfile::record(&mut profile.lm_head, stage_started.elapsed(), 3);
+        }
+        let kernel_timings = command.take_kernel_timings();
+        let timing = command.finish()?;
+        if let Some(profile) = profile.as_deref_mut() {
+            if kernel_timings.is_empty() {
+                profile.attribute_command_buffer(timing);
             } else {
-                Vec::new()
-            },
-        })
+                record_exact_kernel_trace(profile, token_index, &kernel_timings);
+            }
+        }
+        self.position_index += 1;
+        let readback_started = Instant::now();
+        let selected = runtime.read_u32(&self.selected)?;
+        let logits = if self.logits_readback == LogitsReadback::FinalLogits {
+            runtime.read_f32(&self.logits, model.config.vocab_size)?
+        } else {
+            Vec::new()
+        };
+        if let Some(profile) = profile.as_deref_mut() {
+            ResidentDecodeProfile::record(
+                &mut profile.token_readback,
+                readback_started.elapsed(),
+                0,
+            );
+            profile.trace.push(ResidentKernelTrace {
+                token_index,
+                phase: "token_readback",
+                layer: None,
+                stage: "token_readback",
+                kernel: "selected_token_readback",
+                cpu_encode: readback_started.elapsed(),
+                gpu_execution: None,
+                command_buffer_schedule: Duration::ZERO,
+                threads: 0,
+                threadgroups: 0,
+                threads_per_threadgroup: 0,
+                readback_bytes: if self.logits_readback == LogitsReadback::FinalLogits {
+                    (model.config.vocab_size * std::mem::size_of::<f32>()
+                        + std::mem::size_of::<u32>()) as u64
+                } else {
+                    std::mem::size_of::<u32>() as u64
+                },
+            });
+        }
+        Ok(TokenStep { selected, logits })
     }
+}
+
+fn record_exact_kernel_trace(
+    profile: &mut ResidentDecodeProfile,
+    token_index: usize,
+    timings: &[atlas_metal::ResidentKernelTiming],
+) {
+    let mut layer = 0usize;
+    for dispatch in timings {
+        let (stage, phase) = match dispatch.kernel {
+            "embedding_lookup_f32" | "embedding_lookup_q4_0" | "embedding_lookup_q8_0" => {
+                ("embedding", "prefill_or_decode")
+            }
+            "attention_scores_resident_f32"
+            | "masked_softmax_resident_f32"
+            | "attention_values_resident_f32"
+            | "attention_decode_fused_f32"
+            | "kv_append_decode_f32"
+            | "rope_f32"
+            | "rope_half_to_interleaved_f32"
+            | "rope_interleaved_to_half_f32" => ("attention", "prefill_or_decode"),
+            "matvec_f32" | "matvec_q4_0" | "matvec_q8_0" => ("projection", "prefill_or_decode"),
+            "silu_f32" | "vector_multiply_f32" => ("mlp", "prefill_or_decode"),
+            "argmax_f32" => ("lm_head", "prefill_or_decode"),
+            "rms_norm_f32" | "vector_add_f32" => ("normalization_or_residual", "prefill_or_decode"),
+            _ => ("other", "prefill_or_decode"),
+        };
+        let layer_for_dispatch = if stage == "embedding" || stage == "lm_head" {
+            None
+        } else {
+            Some(layer)
+        };
+        let timing = dispatch.timing;
+        profile.command_buffer_count += 1;
+        profile.command_buffer_schedule += timing.command_buffer_schedule;
+        profile.gpu_execution += timing.gpu_time.unwrap_or_default();
+        profile.trace.push(ResidentKernelTrace {
+            token_index,
+            phase,
+            layer: layer_for_dispatch,
+            stage,
+            kernel: dispatch.kernel,
+            cpu_encode: dispatch.cpu_encode,
+            gpu_execution: timing.gpu_time,
+            command_buffer_schedule: timing.command_buffer_schedule,
+            threads: dispatch.threads,
+            threadgroups: dispatch.threadgroups,
+            threads_per_threadgroup: dispatch.threads_per_threadgroup,
+            readback_bytes: 0,
+        });
+        if dispatch.kernel == "kv_append_decode_f32" {
+            layer += 1;
+        }
+    }
+    profile.tokens += 1;
 }
 
 struct TokenStep {
@@ -1285,13 +1586,22 @@ impl<'a> AtlasExecutor<'a> {
         };
         // Do this after compatibility validation: unsupported packed plans
         // must not cause an expensive, surprising upload.
+        let upload_started = Instant::now();
         let weight_upload_bytes = if config.mode == ExecutorMode::Resident {
             model.ensure_resident_weights()?
         } else {
             0
         };
+        let weight_upload_elapsed = upload_started.elapsed();
         let resident = (config.mode == ExecutorMode::Resident)
-            .then(|| ResidentExecutor::new(model, config.max_context, config.logits_readback))
+            .then(|| {
+                ResidentExecutor::new(
+                    model,
+                    config.max_context,
+                    config.logits_readback,
+                    config.resident_attention_path,
+                )
+            })
             .transpose()?;
         let pipelines = model.ops.runtime().pipeline_count();
         Ok(Self {
@@ -1311,7 +1621,9 @@ impl<'a> AtlasExecutor<'a> {
             mode: config.mode,
             logits_readback: config.logits_readback,
             stop_on_eos: config.stop_on_eos,
+            resident_decode_profile: config.resident_decode_profile,
             weight_upload_bytes,
+            weight_upload_elapsed,
         })
     }
 
@@ -1464,16 +1776,84 @@ impl<'a> AtlasExecutor<'a> {
         let command_buffers_before = runtime.command_buffer_count();
         let gpu_before = runtime.gpu_execution_time();
         let readback_before = runtime.readback_bytes();
+        let mut resident_decode_profile =
+            self.resident_decode_profile.then(|| ResidentDecodeProfile {
+                attention_implementation: match self
+                    .resident
+                    .as_ref()
+                    .map(|resident| resident.attention_path)
+                {
+                    Some(ResidentAttentionPath::Fused) => "fused_online_softmax",
+                    Some(ResidentAttentionPath::LegacyThreePass) => "legacy_three_pass",
+                    None => "not_applicable",
+                },
+                ..Default::default()
+            });
+        if let Some(profile) = resident_decode_profile.as_mut() {
+            profile.trace.push(ResidentKernelTrace {
+                token_index: 0,
+                phase: "request_tokenization",
+                layer: None,
+                stage: "request",
+                kernel: "request_tokenization",
+                cpu_encode,
+                gpu_execution: None,
+                command_buffer_schedule: Duration::ZERO,
+                threads: 0,
+                threadgroups: 0,
+                threads_per_threadgroup: 0,
+                readback_bytes: 0,
+            });
+            profile.trace.push(ResidentKernelTrace {
+                token_index: 0,
+                phase: "resident_upload",
+                layer: None,
+                stage: "resident_upload",
+                kernel: "resident_weight_upload",
+                cpu_encode: self.weight_upload_elapsed,
+                gpu_execution: None,
+                command_buffer_schedule: Duration::ZERO,
+                threads: 0,
+                threadgroups: 0,
+                threads_per_threadgroup: 0,
+                readback_bytes: self.weight_upload_bytes,
+            });
+        }
         let prefill_start = Instant::now();
+        let prefill_gpu_before = runtime.gpu_execution_time();
+        let prefill_readback_before = runtime.readback_bytes();
         let mut step = TokenStep {
             selected: 0,
             logits: Vec::new(),
         };
         for &token in &prompt_token_ids {
-            step = self.forward_token(token)?;
+            // Exact profiling is decode-only. Keeping normal one-command-
+            // buffer prefill avoids multiplying the golden suite's 64-token
+            // prefix into thousands of serial diagnostic submissions.
+            step = self.forward_token(token, None)?;
         }
         let prefill = prefill_start.elapsed();
         let prefill_command_buffer_count = runtime.command_buffer_count() - command_buffers_before;
+        if let Some(profile) = resident_decode_profile.as_mut() {
+            profile.trace.push(ResidentKernelTrace {
+                token_index: 0,
+                phase: "prefill",
+                layer: None,
+                stage: "prefill",
+                kernel: "resident_prefill",
+                cpu_encode: prefill,
+                gpu_execution: Some(
+                    runtime
+                        .gpu_execution_time()
+                        .saturating_sub(prefill_gpu_before),
+                ),
+                command_buffer_schedule: Duration::ZERO,
+                threads: 0,
+                threadgroups: prefill_command_buffer_count as usize,
+                threads_per_threadgroup: 0,
+                readback_bytes: runtime.readback_bytes() - prefill_readback_before,
+            });
+        }
         let mut ids = prompt_token_ids.clone();
         let mut latencies = Vec::new();
         let decode_start = Instant::now();
@@ -1514,7 +1894,17 @@ impl<'a> AtlasExecutor<'a> {
                     "executor context exhausted"
                 );
                 let started = Instant::now();
-                step = self.forward_token(token)?;
+                let trace_start = resident_decode_profile
+                    .as_ref()
+                    .map_or(0, |profile| profile.trace.len());
+                step = self.forward_token(token, resident_decode_profile.as_mut())?;
+                if let Some(profile) = resident_decode_profile.as_mut() {
+                    for entry in &mut profile.trace[trace_start..] {
+                        if entry.phase == "prefill_or_decode" {
+                            entry.phase = "decode";
+                        }
+                    }
+                }
                 latencies.push(started.elapsed());
             }
         }
@@ -1548,6 +1938,7 @@ impl<'a> AtlasExecutor<'a> {
                     - command_buffers_before
                     - prefill_command_buffer_count,
                 weight_upload_bytes: self.weight_upload_bytes,
+                weight_upload_elapsed: self.weight_upload_elapsed,
                 readback_bytes: runtime.readback_bytes() - readback_before,
                 resident_bytes: self
                     .resident
@@ -1557,6 +1948,7 @@ impl<'a> AtlasExecutor<'a> {
                     .resident
                     .as_ref()
                     .map_or(0, ResidentExecutor::allocations),
+                resident_decode_profile,
             },
             finish_reason,
         };
@@ -1567,13 +1959,17 @@ impl<'a> AtlasExecutor<'a> {
         Ok(generation)
     }
 
-    fn forward_token(&mut self, token: u32) -> Result<TokenStep> {
+    fn forward_token(
+        &mut self,
+        token: u32,
+        profile: Option<&mut ResidentDecodeProfile>,
+    ) -> Result<TokenStep> {
         if self.mode == ExecutorMode::Resident {
             return self
                 .resident
                 .as_mut()
                 .expect("resident executor exists")
-                .forward_token(self.model, token);
+                .forward_token(self.model, token, profile);
         }
         self.forward_token_reference(token)
     }

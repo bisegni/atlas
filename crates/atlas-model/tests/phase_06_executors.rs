@@ -5,8 +5,8 @@ use atlas_model::{
     AtlasModel,
     executor::{
         AtlasExecutor, ExecutorConfig, ExecutorMetrics, ExecutorMode, GenerationEvent,
-        GenerationFinishReason, LogitsReadback, ResidentStage, compare_stage,
-        resident_stage_tolerance,
+        GenerationFinishReason, LogitsReadback, ResidentAttentionPath, ResidentStage,
+        compare_stage, resident_stage_tolerance,
     },
 };
 
@@ -117,9 +117,14 @@ fn phase_08a_metrics_expose_gpu_residency_observability() {
 fn phase_11a_defaults_to_resident_for_production_inference() {
     assert_eq!(ExecutorConfig::default().mode, ExecutorMode::Resident);
     assert_eq!(
+        ExecutorConfig::default().resident_attention_path,
+        ResidentAttentionPath::LegacyThreePass
+    );
+    assert_eq!(
         ExecutorConfig::default().logits_readback,
         LogitsReadback::SelectedToken
     );
+    assert!(!ExecutorConfig::default().resident_decode_profile);
 }
 
 #[test]
@@ -350,6 +355,201 @@ fn phase_08c_resident_matches_reference_for_32_tokens_and_keeps_the_token_bounda
         assert_eq!(actual.metrics.post_warmup_allocations, 0);
         assert!(actual.metrics.resident_arena_allocations > 0);
     }
+}
+
+#[test]
+#[ignore = "requires local Metal and the downloaded small fixture"]
+fn phase_12a_resident_decode_profile_is_observational() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fixture = root.join("models/hf/SmolLM2-135M-Instruct");
+    let model = match AtlasModel::load(&fixture) {
+        Ok(model) => model,
+        Err(error) if format!("{error:#}").contains("no Metal device is available") => return,
+        Err(error) => panic!("load small fixture: {error:#}"),
+    };
+    let config = ExecutorConfig {
+        mode: ExecutorMode::Resident,
+        max_context: 64,
+        ..Default::default()
+    };
+    let mut unprofiled = AtlasExecutor::new(&model, config).unwrap();
+    let unprofiled = unprofiled.generate_greedy("Atlas", 2).unwrap();
+    let mut profiled = AtlasExecutor::new(
+        &model,
+        ExecutorConfig {
+            resident_decode_profile: true,
+            ..config
+        },
+    )
+    .unwrap();
+    let profiled = profiled.generate_greedy("Atlas", 2).unwrap();
+
+    assert_eq!(
+        profiled.generation.generated_token_ids,
+        unprofiled.generation.generated_token_ids
+    );
+    assert_eq!(profiled.finish_reason, unprofiled.finish_reason);
+    assert_eq!(
+        profiled.metrics.resident_bytes,
+        unprofiled.metrics.resident_bytes
+    );
+    assert!(
+        profiled.metrics.command_buffer_count > unprofiled.metrics.command_buffer_count,
+        "exact profiling intentionally isolates every dispatched kernel"
+    );
+    assert_eq!(
+        profiled.metrics.readback_bytes,
+        unprofiled.metrics.readback_bytes
+    );
+    assert!(unprofiled.metrics.resident_decode_profile.is_none());
+    let profile = profiled.metrics.resident_decode_profile.as_ref().unwrap();
+    assert_eq!(profile.tokens, profiled.metrics.decode_tokens);
+    assert!(profile.token_readback.cpu_encode > Duration::ZERO);
+    assert!(profile.embedding.dispatches > 0);
+    assert_eq!(profile.token_readback.dispatches, 0);
+    assert_eq!(profile.attention_implementation, "legacy_three_pass");
+    assert_eq!(profile.fused_attention_dispatches, 0);
+    assert_eq!(
+        profile.command_buffer_count as usize,
+        profile.trace.len() - profile.tokens - 3,
+        "request/tokenization, resident upload, and prefill are trace-only stages"
+    );
+    assert!(profile.trace.iter().all(|entry| {
+        matches!(
+            entry.kernel,
+            "selected_token_readback" | "request_tokenization" | "resident_weight_upload"
+        ) || entry.gpu_execution.is_some()
+    }));
+}
+
+#[test]
+#[ignore = "requires local Metal and the downloaded small fixture"]
+fn phase_12a_fused_attention_matches_legacy_at_multi_position_and_capacity() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fixture = root.join("models/hf/SmolLM2-135M-Instruct");
+    let model = match AtlasModel::load(&fixture) {
+        Ok(model) => model,
+        Err(error) if format!("{error:#}").contains("no Metal device is available") => return,
+        Err(error) => panic!("load small fixture: {error:#}"),
+    };
+    // SmolLM2 is grouped-query attention.  Four generated tokens exercise
+    // position zero, multi-position KV reads, and the final capacity slot.
+    let prompt = "Atlas";
+    let capacity = model.tokenize(prompt).unwrap().len() + 4;
+    let common = ExecutorConfig {
+        mode: ExecutorMode::Resident,
+        max_context: capacity,
+        logits_readback: LogitsReadback::FinalLogits,
+        ..Default::default()
+    };
+    let mut legacy = AtlasExecutor::new(
+        &model,
+        ExecutorConfig {
+            resident_attention_path: ResidentAttentionPath::LegacyThreePass,
+            ..common
+        },
+    )
+    .unwrap();
+    let legacy = legacy.generate_greedy(prompt, 4).unwrap();
+    let mut fused = AtlasExecutor::new(
+        &model,
+        ExecutorConfig {
+            resident_attention_path: ResidentAttentionPath::Fused,
+            ..common
+        },
+    )
+    .unwrap();
+    let fused = fused.generate_greedy(prompt, 4).unwrap();
+    assert_eq!(
+        fused.generation.generated_token_ids,
+        legacy.generation.generated_token_ids
+    );
+    assert_eq!(fused.finish_reason, legacy.finish_reason);
+    assert_eq!(
+        fused.metrics.command_buffer_count,
+        legacy.metrics.command_buffer_count
+    );
+    assert_eq!(fused.metrics.readback_bytes, legacy.metrics.readback_bytes);
+    assert!(fused.metrics.resident_bytes < legacy.metrics.resident_bytes);
+    let max_delta = fused
+        .generation
+        .final_logits
+        .iter()
+        .zip(&legacy.generation.final_logits)
+        .map(|(left, right)| (left - right).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_delta <= 1e-4,
+        "fused/legacy final-logit delta: {max_delta}"
+    );
+}
+
+#[test]
+#[ignore = "requires local Metal plus the downloaded small FP32 and Q8 fixtures"]
+fn phase_12a_q8_golden_failure_distinguishes_fused_from_legacy_attention() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fp32 = root.join("models/hf/SmolLM2-135M-Instruct");
+    let q8 = root.join("models/gguf/small-q8-gpu-20260719124407");
+    let baseline = match AtlasModel::load(&fp32) {
+        Ok(model) => model,
+        Err(error) if format!("{error:#}").contains("no Metal device is available") => return,
+        Err(error) => panic!("load FP32 fixture: {error:#}"),
+    };
+    let q8 = AtlasModel::load(&q8).expect("load Q8 fixture");
+    let prompt = "The capital of France is";
+    let mut baseline_legacy_executor = AtlasExecutor::new(
+        &baseline,
+        ExecutorConfig {
+            resident_attention_path: ResidentAttentionPath::LegacyThreePass,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let baseline_legacy = baseline_legacy_executor
+        .generate_greedy(prompt, 32)
+        .unwrap();
+    let mut baseline_fused_executor = AtlasExecutor::new(
+        &baseline,
+        ExecutorConfig {
+            resident_attention_path: ResidentAttentionPath::Fused,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let baseline_fused = baseline_fused_executor.generate_greedy(prompt, 32).unwrap();
+    let mut legacy_executor = AtlasExecutor::new(
+        &q8,
+        ExecutorConfig {
+            resident_attention_path: ResidentAttentionPath::LegacyThreePass,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let legacy_result = legacy_executor.generate_greedy(prompt, 32).unwrap();
+    let mut fused_executor = AtlasExecutor::new(
+        &q8,
+        ExecutorConfig {
+            resident_attention_path: ResidentAttentionPath::Fused,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let fused_result = fused_executor.generate_greedy(prompt, 32).unwrap();
+
+    assert_eq!(
+        fused_result.generation.generated_token_ids, legacy_result.generation.generated_token_ids,
+        "fused attention changes Q8 greedy token IDs relative to legacy"
+    );
+    assert_eq!(
+        legacy_result.generation.generated_token_ids,
+        baseline_legacy.generation.generated_token_ids,
+        "legacy Q8 no longer meets the previously pinned exact-token gate"
+    );
+    assert_eq!(
+        baseline_fused.generation.generated_token_ids,
+        baseline_legacy.generation.generated_token_ids,
+        "fused FP32 attention changes the baseline greedy token IDs used by the Q8 gate"
+    );
 }
 
 #[test]

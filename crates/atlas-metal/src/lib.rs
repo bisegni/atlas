@@ -60,7 +60,22 @@ mod macos {
     #[derive(Debug, Clone, Copy)]
     pub struct DispatchTiming {
         pub wall_time: Duration,
+        /// CPU time spent submitting the completed command buffer to Metal.
+        pub command_buffer_schedule: Duration,
         pub gpu_time: Option<Duration>,
+    }
+
+    /// Exact timing for one resident kernel dispatch. Present only for the
+    /// opt-in diagnostic path, where each dispatch is isolated in its own
+    /// command buffer.
+    #[derive(Debug, Clone)]
+    pub struct ResidentKernelTiming {
+        pub kernel: &'static str,
+        pub threads: usize,
+        pub threadgroups: usize,
+        pub threads_per_threadgroup: usize,
+        pub cpu_encode: Duration,
+        pub timing: DispatchTiming,
     }
 
     /// An owned, GPU-visible buffer used by the resident decode path.
@@ -93,15 +108,68 @@ mod macos {
         // its own compute encoder so producer writes are an explicit pass
         // boundary before the next kernel consumes them.
         encoder: Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
+        exact_per_dispatch: bool,
+        kernel_timings: Vec<ResidentKernelTiming>,
     }
 
     impl<'a> ResidentCommand<'a> {
+        /// Dispatch a fixed number of workgroups.  Resident fused kernels use
+        /// this when their synchronization scope is one logical output unit
+        /// (for example, one attention head) rather than a flat element range.
+        pub fn dispatch_threadgroups_1d(
+            &mut self,
+            kernel: &'static str,
+            buffers: &[&GpuBuffer],
+            threadgroups: usize,
+            threads_per_threadgroup: usize,
+        ) -> Result<(), MetalError> {
+            let encode_started = Instant::now();
+            if self.encoder.is_none() {
+                self.encoder = Some(
+                    self.command_buffer
+                        .computeCommandEncoder()
+                        .ok_or(MetalError::CommandCreation)?,
+                );
+            }
+            let encoder = self.encoder.as_ref().expect("compute encoder exists");
+            let pipeline = self
+                .runtime
+                .pipelines
+                .get(kernel)
+                .ok_or_else(|| MetalError::MissingKernel(kernel.into()))?;
+            encoder.setComputePipelineState(&**pipeline);
+            for (index, buffer) in buffers.iter().enumerate() {
+                unsafe { encoder.setBuffer_offset_atIndex(Some(buffer.native()), 0, index) };
+            }
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: threadgroups.max(1),
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: threads_per_threadgroup,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.complete_profiled_dispatch(
+                kernel,
+                0,
+                threadgroups,
+                threads_per_threadgroup,
+                encode_started.elapsed(),
+            )?;
+            Ok(())
+        }
+
         pub fn dispatch_1d(
             &mut self,
             kernel: &'static str,
             buffers: &[&GpuBuffer],
             count: usize,
         ) -> Result<(), MetalError> {
+            let encode_started = Instant::now();
             if self.encoder.is_none() {
                 self.encoder = Some(
                     self.command_buffer
@@ -133,6 +201,13 @@ mod macos {
                     depth: 1,
                 },
             );
+            self.complete_profiled_dispatch(
+                kernel,
+                count,
+                0,
+                self.runtime.pipeline_thread_width(kernel),
+                encode_started.elapsed(),
+            )?;
             Ok(())
         }
 
@@ -145,6 +220,7 @@ mod macos {
             buffers: &[(&GpuBuffer, usize)],
             count: usize,
         ) -> Result<(), MetalError> {
+            let encode_started = Instant::now();
             if self.encoder.is_none() {
                 self.encoder = Some(
                     self.command_buffer
@@ -181,10 +257,45 @@ mod macos {
                     depth: 1,
                 },
             );
+            self.complete_profiled_dispatch(
+                kernel,
+                count,
+                0,
+                self.runtime.pipeline_thread_width(kernel),
+                encode_started.elapsed(),
+            )?;
             Ok(())
         }
 
-        pub fn finish(mut self) -> Result<DispatchTiming, MetalError> {
+        fn complete_profiled_dispatch(
+            &mut self,
+            kernel: &'static str,
+            threads: usize,
+            threadgroups: usize,
+            threads_per_threadgroup: usize,
+            cpu_encode: Duration,
+        ) -> Result<(), MetalError> {
+            if !self.exact_per_dispatch {
+                return Ok(());
+            }
+            let timing = self.submit_current()?;
+            self.kernel_timings.push(ResidentKernelTiming {
+                kernel,
+                threads,
+                threadgroups,
+                threads_per_threadgroup,
+                cpu_encode,
+                timing,
+            });
+            self.command_buffer = self
+                .runtime
+                .queue
+                .commandBuffer()
+                .ok_or(MetalError::CommandCreation)?;
+            Ok(())
+        }
+
+        fn submit_current(&mut self) -> Result<DispatchTiming, MetalError> {
             if let Some(encoder) = self.encoder.take() {
                 encoder.endEncoding();
             }
@@ -192,7 +303,9 @@ mod macos {
             self.runtime
                 .command_buffer_count
                 .fetch_add(1, Ordering::Relaxed);
+            let schedule_started = Instant::now();
             self.command_buffer.commit();
+            let command_buffer_schedule = schedule_started.elapsed();
             self.command_buffer.waitUntilCompleted();
             let wall_time = started.elapsed();
             if self.command_buffer.status() == objc2_metal::MTLCommandBufferStatus::Error {
@@ -215,8 +328,26 @@ mod macos {
             }
             Ok(DispatchTiming {
                 wall_time,
+                command_buffer_schedule,
                 gpu_time,
             })
+        }
+
+        pub fn take_kernel_timings(&mut self) -> Vec<ResidentKernelTiming> {
+            std::mem::take(&mut self.kernel_timings)
+        }
+
+        pub fn finish(mut self) -> Result<DispatchTiming, MetalError> {
+            // The profiled path submits after every dispatch. Do not add an
+            // empty command buffer at the end of the token.
+            if self.exact_per_dispatch {
+                return Ok(DispatchTiming {
+                    wall_time: Duration::ZERO,
+                    command_buffer_schedule: Duration::ZERO,
+                    gpu_time: Some(Duration::ZERO),
+                });
+            }
+            self.submit_current()
         }
     }
 
@@ -397,6 +528,7 @@ mod macos {
                 "rope_interleaved_to_half_f32",
                 "kv_append_decode_f32",
                 "attention_decode_f32",
+                "attention_decode_fused_f32",
                 "attention_scores_resident_f32",
                 "masked_softmax_resident_f32",
                 "attention_values_resident_f32",
@@ -546,6 +678,13 @@ mod macos {
         }
 
         pub fn begin_resident_command(&self) -> Result<ResidentCommand<'_>, MetalError> {
+            self.begin_resident_command_with_exact_timing(false)
+        }
+
+        pub fn begin_resident_command_with_exact_timing(
+            &self,
+            exact_per_dispatch: bool,
+        ) -> Result<ResidentCommand<'_>, MetalError> {
             let command_buffer = self
                 .queue
                 .commandBuffer()
@@ -554,6 +693,8 @@ mod macos {
                 runtime: self,
                 command_buffer,
                 encoder: None,
+                exact_per_dispatch,
+                kernel_timings: Vec::new(),
             })
         }
 
@@ -751,6 +892,63 @@ mod macos {
             let output_width_buffer = self.buffer_from_slice(&[count_u32(output_width)?])?;
             let timing = self.dispatch_1d(
                 "matvec_f32",
+                &[
+                    &input_buffer,
+                    &weights_buffer,
+                    &output_buffer,
+                    &input_width_buffer,
+                    &output_width_buffer,
+                ],
+                output_width,
+            )?;
+            self.copy_buffer_to_slice(&output_buffer, &mut output)?;
+            Ok((output, timing))
+        }
+
+        /// Execute a GGUF block-32 projection without materializing an FP32
+        /// weight matrix. This is deliberately exposed for packed-kernel
+        /// parity diagnostics; normal resident execution binds the same
+        /// buffers directly inside its one-token command buffer.
+        pub fn matvec_gguf_packed(
+            &self,
+            input: &[f32],
+            weights: &[u8],
+            format: GgufTensorType,
+            input_width: usize,
+            output_width: usize,
+        ) -> Result<(Vec<f32>, DispatchTiming), MetalError> {
+            if !matches!(format, GgufTensorType::Q4_0 | GgufTensorType::Q8_0)
+                || input_width == 0
+                || output_width == 0
+                || !input_width.is_multiple_of(32)
+            {
+                return Err(MetalError::InvalidInput(
+                    "packed matvec requires Q4_0/Q8_0 and a non-zero block-32 width".into(),
+                ));
+            }
+            require_len(input, Some(input_width), "packed matvec input")?;
+            require_len(
+                weights,
+                Some(checked_product(
+                    output_width,
+                    input_width / 32 * format.block_bytes(),
+                    "packed matvec weights",
+                )?),
+                "packed matvec weights",
+            )?;
+            let mut output = vec![0.0; output_width];
+            let input_buffer = self.buffer_from_slice(input)?;
+            let weights_buffer = self.buffer_from_slice(weights)?;
+            let output_buffer = self.buffer_from_slice(&output)?;
+            let input_width_buffer = self.buffer_from_slice(&[count_u32(input_width)?])?;
+            let output_width_buffer = self.buffer_from_slice(&[count_u32(output_width)?])?;
+            let kernel = if format == GgufTensorType::Q4_0 {
+                "matvec_q4_0"
+            } else {
+                "matvec_q8_0"
+            };
+            let timing = self.dispatch_1d(
+                kernel,
                 &[
                     &input_buffer,
                     &weights_buffer,
@@ -1226,7 +1424,9 @@ mod macos {
 
             let start = Instant::now();
             self.command_buffer_count.fetch_add(1, Ordering::Relaxed);
+            let schedule_started = Instant::now();
             command_buffer.commit();
+            let command_buffer_schedule = schedule_started.elapsed();
             command_buffer.waitUntilCompleted();
             let wall_time = start.elapsed();
             if command_buffer.status() == objc2_metal::MTLCommandBufferStatus::Error {
@@ -1249,6 +1449,7 @@ mod macos {
             }
             Ok(DispatchTiming {
                 wall_time,
+                command_buffer_schedule,
                 gpu_time,
             })
         }

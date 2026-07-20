@@ -536,20 +536,16 @@ impl AtlasModel {
         &self.root
     }
 
+    pub fn resident_tensor_count(&self) -> usize {
+        self.weights.len()
+    }
+
     /// Materialize every immutable parameter in a GPU-visible buffer once.
     /// Repeated calls are idempotent and return only bytes uploaded by this
     /// invocation, which makes executor warm-up telemetry unambiguous.
     pub(crate) fn ensure_resident_weights(&self) -> Result<u64> {
         let mut resident = self.resident_weights.lock().expect("resident weight lock");
         let mut uploaded = 0u64;
-        let missing = self
-            .weights
-            .keys()
-            .filter(|name| !resident.buffers.contains_key(*name))
-            .count();
-        if missing > 0 {
-            eprintln!("atlas: uploading {missing} model tensors to Metal");
-        }
         for (name, source) in &self.weights {
             if resident.buffers.contains_key(name) {
                 continue;

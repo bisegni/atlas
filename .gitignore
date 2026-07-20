@@ -4,3 +4,4 @@
 /artifacts/
 /.memory/
 .DS_Store
+/fixtures/
