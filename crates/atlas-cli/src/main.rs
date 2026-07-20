@@ -59,6 +59,10 @@ struct ModelRecord {
     tokenizer: PathBuf,
     format: String,
     bytes: u64,
+    baseline_model: Option<String>,
+    max_logit_abs_delta: Option<f32>,
+    min_token_agreement: Option<f32>,
+    max_resident_bytes: Option<u64>,
     files: Vec<ModelFile>,
 }
 
@@ -104,13 +108,15 @@ fn main() -> Result<()> {
         Some("model") => model_command(&args[1..]),
         Some("generate") => generate(&args[1..]),
         Some("chat") => chat(&args[1..]),
+        Some("benchmark") => benchmark(&args[1..]),
+        Some("diagnose") => diagnose(&args[1..]),
         Some("runtime") => runtime_command(&args[1..]),
         Some("phase_03_model") => phase_03_model(&args[1..]),
         Some("phase_05_quant") => phase_05_quant(&args[1..]),
         Some("phase_08b_decode") => phase_08b_decode(&args[1..]),
         _ => {
             eprintln!(
-                "usage: atlas-cli provider login|logout|status|default [huggingface] | atlas-cli model search [--provider huggingface] [--json] QUERY | atlas-cli model download PROVIDER_MODEL_ID --id ID | atlas-cli model inspect|verify --model ID"
+                "usage: atlas-cli benchmark|diagnose|generate|chat --model ID ... | atlas-cli provider login|logout|status|default [huggingface] | atlas-cli model search [--provider huggingface] [--json] QUERY | atlas-cli model download PROVIDER_MODEL_ID --id ID | atlas-cli model inspect|verify --model ID"
             );
             bail!("invalid command")
         }
@@ -251,8 +257,10 @@ fn chat(args: &[String]) -> Result<()> {
     install_chat_sigint_handler();
     let (model_args, prompt, max_tokens, mode) = parse_chat_args(args)?;
     let selection = resolve_model(&model_args)?;
-    let directory = &selection.directory;
-    let model = AtlasModel::load(directory)?;
+    let model = load_verified_model(&selection)?;
+    if mode == ExecutorMode::Resident {
+        let _ = resident_executor(&model, &selection, LogitsReadback::SelectedToken)?;
+    }
     if let Some(prompt) = prompt {
         let mut turn_metrics = ChatTurnMetrics::new();
         print_completion(
@@ -261,6 +269,7 @@ fn chat(args: &[String]) -> Result<()> {
             max_tokens,
             mode,
             &selection.id,
+            selection.manifest.as_ref().map_or(0, |record| record.bytes),
             &mut turn_metrics,
         )?;
         return Ok(());
@@ -311,6 +320,7 @@ fn chat(args: &[String]) -> Result<()> {
             max_tokens,
             mode,
             &selection.id,
+            selection.manifest.as_ref().map_or(0, |record| record.bytes),
             &mut turn_metrics,
         ) {
             Ok(result) => result,
@@ -379,6 +389,7 @@ fn print_completion(
     max_tokens: usize,
     mode: ExecutorMode,
     model_id: &str,
+    model_bytes: u64,
     turn_metrics: &mut ChatTurnMetrics,
 ) -> Result<ExecutorGeneration> {
     let mut executor = AtlasExecutor::new(
@@ -403,6 +414,7 @@ fn print_completion(
             "model_id": model_id,
             "executor": match mode { ExecutorMode::Reference => "reference", ExecutorMode::Resident => "resident" },
             "format": model.format_name(),
+            "model_bytes": model_bytes,
             "token_ids": result.generation.generated_token_ids,
             "finish_reason": format!("{:?}", result.finish_reason).to_lowercase(),
             "resident_bytes": result.metrics.resident_bytes,
@@ -414,6 +426,75 @@ fn print_completion(
         })
     );
     Ok(result)
+}
+
+fn load_verified_model(selection: &ModelSelection) -> Result<AtlasModel> {
+    if let Some(record) = &selection.manifest {
+        verify_manifest_model(record)?;
+    }
+    AtlasModel::load(&selection.directory)
+}
+
+fn resident_executor<'a>(
+    model: &'a AtlasModel,
+    selection: &ModelSelection,
+    logits_readback: LogitsReadback,
+) -> Result<AtlasExecutor<'a>> {
+    resident_executor_with_eos(model, selection, logits_readback, true)
+}
+
+fn resident_executor_with_eos<'a>(
+    model: &'a AtlasModel,
+    selection: &ModelSelection,
+    logits_readback: LogitsReadback,
+    stop_on_eos: bool,
+) -> Result<AtlasExecutor<'a>> {
+    let executor = AtlasExecutor::new(
+        model,
+        ExecutorConfig {
+            mode: ExecutorMode::Resident,
+            logits_readback,
+            stop_on_eos,
+            ..Default::default()
+        },
+    )?;
+    if let Some(limit) = selection
+        .manifest
+        .as_ref()
+        .and_then(|record| record.max_resident_bytes)
+    {
+        ensure!(
+            executor.resident_bytes() <= limit,
+            "resident memory budget exceeded for `{}`: {} > {} bytes",
+            selection.id,
+            executor.resident_bytes(),
+            limit
+        );
+    }
+    Ok(executor)
+}
+
+fn generation_metrics_json(
+    model_id: &str,
+    model: &AtlasModel,
+    result: &ExecutorGeneration,
+    model_bytes: u64,
+) -> Value {
+    json!({
+        "event": "generation_metrics",
+        "model_id": model_id,
+        "executor": "resident",
+        "format": model.format_name(),
+        "model_bytes": model_bytes,
+        "token_ids": result.generation.generated_token_ids,
+        "finish_reason": format!("{:?}", result.finish_reason).to_lowercase(),
+        "resident_bytes": result.metrics.resident_bytes,
+        "weight_upload_bytes": result.metrics.weight_upload_bytes,
+        "readback_bytes": result.metrics.readback_bytes,
+        "command_buffers": result.metrics.command_buffer_count,
+        "timing": { "ttft_ms": result.metrics.ttft.as_secs_f64() * 1000.0, "host_ms": result.metrics.host_wall_time.as_secs_f64() * 1000.0 },
+        "decode_tok_s": result.metrics.decode_tokens_per_second(),
+    })
 }
 
 fn write_stream_event(writer: &mut impl Write, event: &GenerationEvent) -> Result<()> {
@@ -765,9 +846,15 @@ fn phase_08b_decode(args: &[String]) -> Result<()> {
     } else {
         LogitsReadback::SelectedToken
     };
-    let (model_name, directory) = model_dir(&model_args)?;
-    let model = AtlasModel::load(directory)?;
+    let selection = resolve_model(&model_args)?;
+    let model_name = selection.id.clone();
+    let model_bytes = selection.manifest.as_ref().map_or(0, |record| record.bytes);
+    let model = load_verified_model(&selection)?;
     if trace_stages {
+        ensure!(
+            model.format_name() != "gguf-packed",
+            "stage tracing requires an FP32 reference model; use `atlas-cli diagnose --model {model_name}` for GGUF quality diagnostics"
+        );
         match AtlasExecutor::trace_resident_prompt(&model, &prompt, trace_tolerance)? {
             Some(result) => {
                 println!(
@@ -790,6 +877,25 @@ fn phase_08b_decode(args: &[String]) -> Result<()> {
                 return Ok(());
             }
         }
+    }
+
+    if model.format_name() == "gguf-packed" {
+        for _ in 0..warmup {
+            let mut executor = resident_executor(&model, &selection, logits_readback)?;
+            executor.generate_greedy(&prompt, max_new_tokens)?;
+        }
+        let mut executor = resident_executor(&model, &selection, logits_readback)?;
+        let resident = executor.generate_greedy(&prompt, max_new_tokens)?;
+        println!("model: {model_name}");
+        println!("format: {}", model.format_name());
+        println!("model_bytes: {model_bytes}");
+        println!("reference_decode_tok_s: unavailable (GGUF is resident-only)");
+        println!(
+            "resident_decode_tok_s: {:.2}",
+            resident.metrics.decode_tokens_per_second()
+        );
+        println!("{}", metrics_line(&resident.metrics));
+        return Ok(());
     }
 
     // Warm each implementation separately.  The measured runs begin only
@@ -861,6 +967,8 @@ fn phase_08b_decode(args: &[String]) -> Result<()> {
     };
     let resident_rate = resident.metrics.decode_tokens_per_second();
     println!("model: {model_name}");
+    println!("format: {}", model.format_name());
+    println!("model_bytes: {model_bytes}");
     println!("token_agreement: true");
     println!("reference_decode_tok_s: {reference_rate:.2}");
     println!("resident_decode_tok_s: {resident_rate:.2}");
@@ -1011,6 +1119,10 @@ fn load_manifest() -> Result<ModelManifest> {
                 tokenizer: PathBuf::new(),
                 format: String::new(),
                 bytes: 0,
+                baseline_model: None,
+                max_logit_abs_delta: None,
+                min_token_agreement: None,
+                max_resident_bytes: None,
                 files: Vec::new(),
             });
             continue;
@@ -1070,6 +1182,24 @@ fn load_manifest() -> Result<ModelManifest> {
                 }
                 "format" => model.format = text.context("model format must be quoted")?.to_owned(),
                 "bytes" => model.bytes = value.parse().context("parse model bytes")?,
+                "baseline_model" => {
+                    model.baseline_model = Some(
+                        text.context("model baseline_model must be quoted")?
+                            .to_owned(),
+                    )
+                }
+                "max_logit_abs_delta" => {
+                    model.max_logit_abs_delta =
+                        Some(value.parse().context("parse max_logit_abs_delta")?)
+                }
+                "min_token_agreement" => {
+                    model.min_token_agreement =
+                        Some(value.parse().context("parse min_token_agreement")?)
+                }
+                "max_resident_bytes" => {
+                    model.max_resident_bytes =
+                        Some(value.parse().context("parse max_resident_bytes")?)
+                }
                 _ => bail!("unknown model manifest key `{key}`"),
             }
         }
@@ -1096,6 +1226,36 @@ fn load_manifest() -> Result<ModelManifest> {
                 && !model.files.is_empty(),
             "manifest contains an incomplete model record"
         );
+        if matches!(model.format.as_str(), "gguf-q4_0" | "gguf-q8_0") {
+            ensure!(
+                model.baseline_model.is_some() == model.max_logit_abs_delta.is_some()
+                    && model.baseline_model.is_some() == model.min_token_agreement.is_some()
+                    && model.baseline_model.is_some() == model.max_resident_bytes.is_some(),
+                "quantized manifest model `{}` must set all acceptance policy fields together",
+                model.id
+            );
+            if model.baseline_model.is_some() {
+                ensure!(
+                    model
+                        .max_logit_abs_delta
+                        .is_some_and(|value| value.is_finite() && value >= 0.0),
+                    "quantized manifest model `{}` has invalid max_logit_abs_delta",
+                    model.id
+                );
+                ensure!(
+                    model
+                        .min_token_agreement
+                        .is_some_and(|value| (0.0..=1.0).contains(&value)),
+                    "quantized manifest model `{}` has invalid min_token_agreement",
+                    model.id
+                );
+                ensure!(
+                    model.max_resident_bytes.is_some_and(|value| value > 0),
+                    "quantized manifest model `{}` has invalid max_resident_bytes",
+                    model.id
+                );
+            }
+        }
     }
     let mut ids = BTreeSet::new();
     for model in &models {
@@ -1104,6 +1264,27 @@ fn load_manifest() -> Result<ModelManifest> {
             "duplicate model ID `{}`",
             model.id
         );
+    }
+    for model in &models {
+        if let Some(baseline) = &model.baseline_model {
+            let baseline = models
+                .iter()
+                .find(|candidate| candidate.id == *baseline)
+                .with_context(|| {
+                    format!("baseline model `{baseline}` is not in {MODEL_MANIFEST}")
+                })?;
+            ensure!(
+                baseline.format == "safetensors-fp32",
+                "baseline model `{}` must use safetensors-fp32",
+                baseline.id
+            );
+            ensure!(
+                baseline.architecture == model.architecture,
+                "baseline model `{}` architecture differs from `{}`",
+                baseline.id,
+                model.id
+            );
+        }
     }
     let manifest = ModelManifest { models };
     ensure!(!manifest.models.is_empty(), "model manifest has no models");
@@ -1302,14 +1483,17 @@ fn model_command(args: &[String]) -> Result<()> {
             json!({
                 "model_id": record.id, "source": record.source, "revision": record.revision,
                 "path": record.path, "architecture": record.architecture, "format": record.format,
-                "bytes": record.bytes,
+                "bytes": record.bytes, "baseline_model": record.baseline_model,
+                "max_logit_abs_delta": record.max_logit_abs_delta,
+                "min_token_agreement": record.min_token_agreement,
+                "max_resident_bytes": record.max_resident_bytes,
             })
         ),
         "verify" => {
             verify_manifest_model(&record)?;
             println!(
                 "{}",
-                json!({"model_id": record.id, "verified": true, "bytes": record.bytes})
+                json!({"model_id": record.id, "verified": true, "format": record.format, "bytes": record.bytes})
             );
         }
         _ => bail!(
@@ -2295,24 +2479,210 @@ fn generate(args: &[String]) -> Result<()> {
     if !greedy {
         bail!("Phase 3 supports only --greedy");
     }
-    let (_, directory) = model_dir(&model_args)?;
-    eprintln!("atlas: loading model fixture from {}", directory.display());
-    let generation = AtlasModel::load(&directory)?.generate_greedy(
-        &prompt.context("--prompt is required")?,
-        max_new_tokens.context("--max-new-tokens is required")?,
-    )?;
+    let selection = resolve_model(&model_args)?;
+    eprintln!(
+        "atlas: loading model fixture from {}",
+        selection.directory.display()
+    );
+    let model = load_verified_model(&selection)?;
+    let prompt = prompt.context("--prompt is required")?;
+    let max_new_tokens = max_new_tokens.context("--max-new-tokens is required")?;
+    let mut executor = resident_executor(&model, &selection, LogitsReadback::SelectedToken)?;
+    let generation = executor.generate_greedy(&prompt, max_new_tokens)?;
     if let Some(golden) = golden {
-        validate_generation_golden(golden, &generation)?;
+        validate_generation_golden(golden, &generation.generation)?;
     }
-    println!("prompt_token_ids: {:?}", generation.prompt_token_ids);
-    println!("generated_token_ids: {:?}", generation.generated_token_ids);
-    println!("text: {}", generation.text);
-    for entry in generation.trace.entries {
+    println!(
+        "prompt_token_ids: {:?}",
+        generation.generation.prompt_token_ids
+    );
+    println!(
+        "generated_token_ids: {:?}",
+        generation.generation.generated_token_ids
+    );
+    println!("text: {}", generation.generation.text);
+    println!(
+        "{}",
+        generation_metrics_json(
+            &selection.id,
+            &model,
+            &generation,
+            selection.manifest.as_ref().map_or(0, |record| record.bytes)
+        )
+    );
+    for entry in generation.generation.trace.entries {
         println!(
             "trace {} len={} max_abs={:.7}",
             entry.name, entry.len, entry.max_abs
         );
     }
+    Ok(())
+}
+
+fn parse_benchmark_args(args: &[String]) -> Result<(Vec<String>, String, usize, usize, bool)> {
+    let mut model_args = Vec::new();
+    let mut prompt = None;
+    let mut max_new_tokens = 16usize;
+    let mut warmup = 1usize;
+    let mut ignore_eos = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--model" | "--model-dir" => {
+                model_args.push(args[index].clone());
+                index += 1;
+                model_args.push(
+                    args.get(index)
+                        .context("model option needs a value")?
+                        .clone(),
+                );
+            }
+            "--prompt" => {
+                index += 1;
+                prompt = Some(args.get(index).context("--prompt needs a value")?.clone());
+            }
+            "--max-new-tokens" => {
+                index += 1;
+                max_new_tokens = args
+                    .get(index)
+                    .context("--max-new-tokens needs a value")?
+                    .parse()
+                    .context("parse --max-new-tokens")?;
+            }
+            "--warmup" => {
+                index += 1;
+                warmup = args
+                    .get(index)
+                    .context("--warmup needs a value")?
+                    .parse()
+                    .context("parse --warmup")?;
+            }
+            "--ignore-eos" => ignore_eos = true,
+            flag => bail!("unknown benchmark/diagnose option: {flag}"),
+        }
+        index += 1;
+    }
+    ensure!(max_new_tokens > 0, "--max-new-tokens must be positive");
+    Ok((
+        model_args,
+        prompt.context("--prompt is required")?,
+        max_new_tokens,
+        warmup,
+        ignore_eos,
+    ))
+}
+
+fn benchmark(args: &[String]) -> Result<()> {
+    let (model_args, prompt, max_new_tokens, warmup, ignore_eos) = parse_benchmark_args(args)?;
+    let selection = resolve_model(&model_args)?;
+    let model = load_verified_model(&selection)?;
+    for _ in 0..warmup {
+        let mut executor = resident_executor_with_eos(
+            &model,
+            &selection,
+            LogitsReadback::SelectedToken,
+            !ignore_eos,
+        )?;
+        executor.generate_greedy(&prompt, max_new_tokens)?;
+    }
+    let mut executor = resident_executor_with_eos(
+        &model,
+        &selection,
+        LogitsReadback::SelectedToken,
+        !ignore_eos,
+    )?;
+    let result = executor.generate_greedy(&prompt, max_new_tokens)?;
+    let mut report = generation_metrics_json(
+        &selection.id,
+        &model,
+        &result,
+        selection.manifest.as_ref().map_or(0, |record| record.bytes),
+    );
+    report["requested_max_new_tokens"] = json!(max_new_tokens);
+    report["generated_tokens"] = json!(result.generation.generated_token_ids.len());
+    report["ignore_eos"] = json!(ignore_eos);
+    println!("{}", report);
+    Ok(())
+}
+
+fn diagnose(args: &[String]) -> Result<()> {
+    let (model_args, prompt, max_new_tokens, warmup, ignore_eos) = parse_benchmark_args(args)?;
+    ensure!(!ignore_eos, "--ignore-eos is supported only by benchmark");
+    let selection = resolve_model(&model_args)?;
+    let record = selection
+        .manifest
+        .as_ref()
+        .context("diagnose requires a manifest-backed model ID")?;
+    let model = load_verified_model(&selection)?;
+    for _ in 0..warmup {
+        let mut executor = resident_executor(&model, &selection, LogitsReadback::FinalLogits)?;
+        executor.generate_greedy(&prompt, max_new_tokens)?;
+    }
+    let mut executor = resident_executor(&model, &selection, LogitsReadback::FinalLogits)?;
+    let result = executor.generate_greedy(&prompt, max_new_tokens)?;
+    let mut report = generation_metrics_json(&selection.id, &model, &result, record.bytes);
+    if let Some(baseline_id) = &record.baseline_model {
+        let baseline_args = vec!["--model".to_owned(), baseline_id.clone()];
+        let baseline_selection = resolve_model(&baseline_args)?;
+        let baseline_model = load_verified_model(&baseline_selection)?;
+        ensure!(
+            model.tokenize(&prompt)? == baseline_model.tokenize(&prompt)?,
+            "tokenizer mismatch between `{}` and baseline `{baseline_id}`",
+            selection.id
+        );
+        let mut baseline = resident_executor(
+            &baseline_model,
+            &baseline_selection,
+            LogitsReadback::FinalLogits,
+        )?;
+        let baseline_result = baseline.generate_greedy(&prompt, max_new_tokens)?;
+        let compared = result
+            .generation
+            .generated_token_ids
+            .len()
+            .max(baseline_result.generation.generated_token_ids.len());
+        let matching = result
+            .generation
+            .generated_token_ids
+            .iter()
+            .zip(&baseline_result.generation.generated_token_ids)
+            .filter(|(left, right)| left == right)
+            .count();
+        let token_agreement = if compared == 0 {
+            1.0
+        } else {
+            matching as f32 / compared as f32
+        };
+        let max_logit_abs_delta = result
+            .generation
+            .final_logits
+            .iter()
+            .zip(&baseline_result.generation.final_logits)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max);
+        let max_logit_limit = record
+            .max_logit_abs_delta
+            .expect("validated quantized policy");
+        let min_token_agreement = record
+            .min_token_agreement
+            .expect("validated quantized policy");
+        report["quality"] = json!({"baseline_model": baseline_id, "max_logit_abs_delta": max_logit_abs_delta, "max_logit_abs_delta_limit": max_logit_limit, "token_agreement": token_agreement, "min_token_agreement": min_token_agreement, "exact_token_parity": token_agreement == 1.0});
+        println!("{report}");
+        ensure!(
+            max_logit_abs_delta <= max_logit_limit,
+            "quantized logit drift {:.6} exceeds pinned limit {:.6}",
+            max_logit_abs_delta,
+            max_logit_limit
+        );
+        ensure!(
+            token_agreement >= min_token_agreement,
+            "quantized token agreement {:.3} is below pinned limit {:.3}",
+            token_agreement,
+            min_token_agreement
+        );
+        return Ok(());
+    }
+    println!("{report}");
     Ok(())
 }
 

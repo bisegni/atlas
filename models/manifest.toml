@@ -25,6 +25,31 @@ bytes = 269060552
 sha256 = "5af571cbf074e6d21a03528d2330792e532ca608f24ac70a143f6b369968ab8c"
 
 [[models]]
+id = "larger"
+source = "HuggingFaceTB/SmolLM2-1.7B-Instruct"
+revision = "31b70e2e869a7173562077fd711b654946d38674"
+path = "models/hf/SmolLM2-1.7B-Instruct"
+architecture = "LlamaForCausalLM"
+tokenizer = "tokenizer.json"
+format = "safetensors-fp32"
+bytes = 3424883416
+
+[[models.files]]
+path = "config.json"
+bytes = 908
+sha256 = "994f50b16abb4ae00880baefe03c10260b5bd608d2bf586f7056ca05a534feea"
+
+[[models.files]]
+path = "tokenizer.json"
+bytes = 2104556
+sha256 = "9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c"
+
+[[models.files]]
+path = "model.safetensors"
+bytes = 3422777952
+sha256 = "f55217be716b6a997b97b9d8d7eb6fad02e00858f5010ec24f64603c3a98a0e8"
+
+[[models]]
 id = "small-q4-gpu-20260719123633"
 source = "HuggingFaceTB/SmolLM2-135M-Instruct"
 revision = "12fd25f77366fa6b3b4b768ec3050bf629380bac"
@@ -33,6 +58,10 @@ architecture = "LlamaForCausalLM"
 tokenizer = "tokenizer.json"
 format = "gguf-q4_0"
 bytes = 77907497
+baseline_model = "small"
+max_logit_abs_delta = 34.0
+min_token_agreement = 0.0
+max_resident_bytes = 268435456
 
 [[models.files]]
 path = "config.json"
@@ -58,6 +87,10 @@ architecture = "LlamaForCausalLM"
 tokenizer = "tokenizer.json"
 format = "gguf-q8_0"
 bytes = 145147433
+baseline_model = "small"
+max_logit_abs_delta = 0.6
+min_token_agreement = 1.0
+max_resident_bytes = 268435456
 
 [[models.files]]
 path = "config.json"
@@ -98,3 +131,53 @@ sha256 = "8eb740e8bbe4cff95ea7b4588d17a2432deb16e8075bc5828ff7ba9be94d982a"
 path = "tokenizer.json"
 bytes = 2104556
 sha256 = "9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c"
+
+[[models]]
+id = "larger-q4"
+source = "HuggingFaceTB/SmolLM2-1.7B-Instruct"
+revision = "31b70e2e869a7173562077fd711b654946d38674"
+path = "models/gguf/larger-q4"
+architecture = "LlamaForCausalLM"
+tokenizer = "tokenizer.json"
+format = "gguf-q4_0"
+bytes = 965113016
+
+[[models.files]]
+path = "config.json"
+bytes = 908
+sha256 = "994f50b16abb4ae00880baefe03c10260b5bd608d2bf586f7056ca05a534feea"
+
+[[models.files]]
+path = "tokenizer.json"
+bytes = 2104556
+sha256 = "9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c"
+
+[[models.files]]
+path = "model.gguf"
+bytes = 963007552
+sha256 = "298d82d8ebbf7ebded1cc8ca80417c0edbcf8059e8c808d93b5db0c034fba57c"
+
+[[models]]
+id = "larger-q8"
+source = "HuggingFaceTB/SmolLM2-1.7B-Instruct"
+revision = "31b70e2e869a7173562077fd711b654946d38674"
+path = "models/gguf/larger-q8"
+architecture = "LlamaForCausalLM"
+tokenizer = "tokenizer.json"
+format = "gguf-q8_0"
+bytes = 1820751032
+
+[[models.files]]
+path = "config.json"
+bytes = 908
+sha256 = "994f50b16abb4ae00880baefe03c10260b5bd608d2bf586f7056ca05a534feea"
+
+[[models.files]]
+path = "tokenizer.json"
+bytes = 2104556
+sha256 = "9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c"
+
+[[models.files]]
+path = "model.gguf"
+bytes = 1818645568
+sha256 = "93d9e0daff5d47459777eadb0a06dc5e070e3d4f191ce0846ce52834911a3387"

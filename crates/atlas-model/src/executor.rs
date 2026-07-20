@@ -158,6 +158,9 @@ pub struct ExecutorConfig {
     pub mode: ExecutorMode,
     /// Downloading logits defeats token-only decode readback, so it is opt-in.
     pub logits_readback: LogitsReadback,
+    /// Normal inference stops on EOS. Benchmark-only callers may disable this
+    /// to measure a fixed decode workload without altering product behavior.
+    pub stop_on_eos: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -182,6 +185,7 @@ impl Default for ExecutorConfig {
             quant_format: QuantFormat::Fp16,
             mode: ExecutorMode::Resident,
             logits_readback: LogitsReadback::SelectedToken,
+            stop_on_eos: true,
         }
     }
 }
@@ -290,6 +294,7 @@ pub struct AtlasExecutor<'a> {
     resident: Option<ResidentExecutor>,
     mode: ExecutorMode,
     logits_readback: LogitsReadback,
+    stop_on_eos: bool,
     weight_upload_bytes: u64,
 }
 
@@ -1305,6 +1310,7 @@ impl<'a> AtlasExecutor<'a> {
             resident,
             mode: config.mode,
             logits_readback: config.logits_readback,
+            stop_on_eos: config.stop_on_eos,
             weight_upload_bytes,
         })
     }
@@ -1319,6 +1325,15 @@ impl<'a> AtlasExecutor<'a> {
     /// initialized. A second executor for the same loaded model reports zero.
     pub fn weight_upload_bytes(&self) -> u64 {
         self.weight_upload_bytes
+    }
+
+    /// GPU-visible bytes reserved by this executor before decoding begins.
+    /// This includes the immutable resident weights and the session arena, so
+    /// callers can enforce a model memory budget before submitting a prompt.
+    pub fn resident_bytes(&self) -> u64 {
+        self.resident
+            .as_ref()
+            .map_or(0, ResidentExecutor::resident_bytes)
     }
     pub fn reset(&mut self) {
         for cache in &mut self.caches {
@@ -1485,7 +1500,7 @@ impl<'a> AtlasExecutor<'a> {
             if token_index == 0 {
                 ttft = request_start.elapsed();
             }
-            if Some(token) == self.model.config.eos_token_id {
+            if self.stop_on_eos && Some(token) == self.model.config.eos_token_id {
                 finish_reason = GenerationFinishReason::Eos;
                 break;
             }
