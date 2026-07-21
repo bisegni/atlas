@@ -35,6 +35,10 @@ fn gemma4_rope_angle(
     position as f32 / theta.powf((pair * 2) as f32 / rotary as f32) / frequency_factor
 }
 
+fn gemma4_should_finish(token: u32, eos_token: u32, decoded: &str, chat: bool) -> bool {
+    token == eos_token || (chat && decoded.contains("<turn|>"))
+}
+
 #[derive(Debug, Clone)]
 pub struct Gemma4Metrics {
     pub resident_bytes: u64,
@@ -437,6 +441,27 @@ impl<'a> Gemma4E2bExecutor<'a> {
         prompt: &str,
         max_new_tokens: usize,
         cancelled: &AtomicBool,
+        emit: impl FnMut(Gemma4TokenEvent) -> Result<()>,
+    ) -> Result<Gemma4Generation> {
+        self.generate_greedy_stream_inner(prompt, max_new_tokens, cancelled, false, emit)
+    }
+
+    pub fn generate_greedy_chat_stream(
+        &mut self,
+        prompt: &str,
+        max_new_tokens: usize,
+        cancelled: &AtomicBool,
+        emit: impl FnMut(Gemma4TokenEvent) -> Result<()>,
+    ) -> Result<Gemma4Generation> {
+        self.generate_greedy_stream_inner(prompt, max_new_tokens, cancelled, true, emit)
+    }
+
+    fn generate_greedy_stream_inner(
+        &mut self,
+        prompt: &str,
+        max_new_tokens: usize,
+        cancelled: &AtomicBool,
+        stop_on_end_turn: bool,
         mut emit: impl FnMut(Gemma4TokenEvent) -> Result<()>,
     ) -> Result<Gemma4Generation> {
         ensure!(max_new_tokens > 0, "max_new_tokens must be positive");
@@ -480,7 +505,12 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 text: fragment,
                 latency: token_latency,
             })?;
-            if selected == self.model.config.eos_token_id {
+            if gemma4_should_finish(
+                selected,
+                self.model.config.eos_token_id,
+                &decoded,
+                stop_on_end_turn,
+            ) {
                 finish_reason = Gemma4FinishReason::Eos;
                 break;
             }
@@ -1418,7 +1448,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::gemma4_rope_angle;
+    use super::{gemma4_rope_angle, gemma4_should_finish};
 
     #[test]
     fn gemma4_rope_honors_proportional_factors_and_partial_rotary_width() {
@@ -1428,5 +1458,12 @@ mod tests {
         assert_eq!(normal, 8.0);
         assert!(suppressed.abs() < 1.0e-30);
         assert_eq!(outside_partial_width, 0.0);
+    }
+
+    #[test]
+    fn chat_stops_on_end_turn_while_raw_generation_does_not() {
+        assert!(gemma4_should_finish(106, 1, "answer<turn|>", true));
+        assert!(!gemma4_should_finish(106, 1, "answer<turn|>", false));
+        assert!(gemma4_should_finish(1, 1, "answer", false));
     }
 }

@@ -482,7 +482,6 @@ fn print_completion(
             "executor": match mode { ExecutorMode::Reference => "reference", ExecutorMode::Resident => "resident" },
             "format": model.format_name(),
             "model_bytes": model_bytes,
-            "token_ids": result.generation.generated_token_ids,
             "finish_reason": format!("{:?}", result.finish_reason).to_lowercase(),
             "resident_bytes": result.metrics.resident_bytes,
             "weight_upload_bytes": result.metrics.weight_upload_bytes,
@@ -532,7 +531,6 @@ fn print_gemma4_generation(
         json!({
             "event":"generation_metrics", "model_id":selection.id, "executor":"resident",
             "format":"gguf-gemma4-q4_0", "model_bytes":selection.manifest.as_ref().map_or(0, |record| record.bytes),
-            "token_ids":generation.generation.generated_token_ids,
             "finish_reason":gemma4_finish_reason(generation.finish_reason),
             "resident_bytes":generation.metrics.resident_bytes,
             "weight_upload_bytes":generation.metrics.weight_upload_bytes,
@@ -540,6 +538,8 @@ fn print_gemma4_generation(
             "command_buffers":generation.metrics.command_buffers,
             "prefill_command_buffers":generation.metrics.prefill_command_buffers,
             "decode_command_buffers":generation.metrics.decode_command_buffers,
+            "prefill_tok_s":gemma4_prefill_tokens_per_second(&generation),
+            "decode_tok_s":gemma4_decode_tokens_per_second(&generation),
             "timing":{"prefill_ms":generation.metrics.prefill.as_secs_f64()*1000.0,"decode_ms":generation.metrics.decode.as_secs_f64()*1000.0,"host_ms":generation.metrics.host_wall_time.as_secs_f64()*1000.0}
         })
     );
@@ -660,11 +660,15 @@ fn compact_gemma4_history(
             "conversation history cannot be summarized within the Gemma context limit"
         );
         let mut filter = ThoughtFilter::default();
-        let generation =
-            executor.generate_greedy_stream(&summary_prompt, 256, &CHAT_INTERRUPTED, |event| {
+        let generation = executor.generate_greedy_chat_stream(
+            &summary_prompt,
+            256,
+            &CHAT_INTERRUPTED,
+            |event| {
                 filter.push(&event.text);
                 Ok(())
-            })?;
+            },
+        )?;
         ensure!(
             generation.finish_reason != Gemma4FinishReason::Cancelled,
             "conversation summarization cancelled"
@@ -721,6 +725,28 @@ fn gemma4_finish_reason(reason: Gemma4FinishReason) -> &'static str {
         Gemma4FinishReason::MaxTokens => "max_tokens",
         Gemma4FinishReason::Cancelled => "cancelled",
     }
+}
+
+fn tokens_per_second(tokens: usize, elapsed: Duration) -> f64 {
+    if elapsed.is_zero() {
+        0.0
+    } else {
+        tokens as f64 / elapsed.as_secs_f64()
+    }
+}
+
+fn gemma4_prefill_tokens_per_second(generation: &Gemma4Generation) -> f64 {
+    tokens_per_second(
+        generation.generation.prompt_token_ids.len(),
+        generation.metrics.prefill,
+    )
+}
+
+fn gemma4_decode_tokens_per_second(generation: &Gemma4Generation) -> f64 {
+    tokens_per_second(
+        usize::try_from(generation.metrics.decode_command_buffers).unwrap_or(usize::MAX),
+        generation.metrics.decode,
+    )
 }
 
 #[derive(Default)]
@@ -821,14 +847,18 @@ fn run_gemma4_turn(
     io::stdout().flush()?;
     let mut filter = ThoughtFilter::default();
     let mut count = 0usize;
-    let generation =
-        executor.generate_greedy_stream(&rendered, max_tokens, &CHAT_INTERRUPTED, |event| {
+    let generation = executor.generate_greedy_chat_stream(
+        &rendered,
+        max_tokens,
+        &CHAT_INTERRUPTED,
+        |event| {
             count += 1;
             let text = filter.push(&event.text);
             print!("{text}");
             io::stdout().flush()?;
             Ok(())
-        })?;
+        },
+    )?;
     let (visible, thoughts, tail) = filter.finish();
     print!("{tail}\n");
     io::stdout().flush()?;
@@ -846,7 +876,7 @@ fn run_gemma4_turn(
 fn emit_gemma4_metrics(selection: &ModelSelection, generation: &Gemma4Generation) -> Result<()> {
     eprintln!(
         "{}",
-        json!({"event":"generation_metrics","model_id":selection.id,"executor":"resident","format":"gguf-gemma4-q4_0","token_ids":generation.generation.generated_token_ids,"finish_reason":gemma4_finish_reason(generation.finish_reason),"resident_bytes":generation.metrics.resident_bytes,"weight_upload_bytes":generation.metrics.weight_upload_bytes,"readback_bytes":generation.metrics.readback_bytes,"command_buffers":generation.metrics.command_buffers,"prefill_command_buffers":generation.metrics.prefill_command_buffers,"decode_command_buffers":generation.metrics.decode_command_buffers,"timing":{"prefill_ms":generation.metrics.prefill.as_secs_f64()*1000.0,"decode_ms":generation.metrics.decode.as_secs_f64()*1000.0,"host_ms":generation.metrics.host_wall_time.as_secs_f64()*1000.0}})
+        json!({"event":"generation_metrics","model_id":selection.id,"executor":"resident","format":"gguf-gemma4-q4_0","finish_reason":gemma4_finish_reason(generation.finish_reason),"resident_bytes":generation.metrics.resident_bytes,"weight_upload_bytes":generation.metrics.weight_upload_bytes,"readback_bytes":generation.metrics.readback_bytes,"command_buffers":generation.metrics.command_buffers,"prefill_command_buffers":generation.metrics.prefill_command_buffers,"decode_command_buffers":generation.metrics.decode_command_buffers,"prefill_tok_s":gemma4_prefill_tokens_per_second(generation),"decode_tok_s":gemma4_decode_tokens_per_second(generation),"timing":{"prefill_ms":generation.metrics.prefill.as_secs_f64()*1000.0,"decode_ms":generation.metrics.decode.as_secs_f64()*1000.0,"host_ms":generation.metrics.host_wall_time.as_secs_f64()*1000.0}})
     );
     Ok(())
 }
@@ -858,7 +888,7 @@ fn append_gemma4_performance_record(
 ) -> Result<()> {
     append_jsonl_record(
         Path::new(CHAT_PERFORMANCE_LOG),
-        &json!({"model_id":selection.id,"executor":"resident","format":"gguf-gemma4-q4_0","generated_tokens":generation.generation.generated_token_ids.len(),"finish_reason":gemma4_finish_reason(generation.finish_reason),"visible_chars":visible.chars().count(),"resident_bytes":generation.metrics.resident_bytes,"weight_upload_bytes":generation.metrics.weight_upload_bytes,"readback_bytes":generation.metrics.readback_bytes,"command_buffers":generation.metrics.command_buffers}),
+        &json!({"model_id":selection.id,"executor":"resident","format":"gguf-gemma4-q4_0","prompt_tokens":generation.generation.prompt_token_ids.len(),"generated_tokens":generation.generation.generated_token_ids.len(),"finish_reason":gemma4_finish_reason(generation.finish_reason),"visible_chars":visible.chars().count(),"prefill_tok_s":gemma4_prefill_tokens_per_second(generation),"decode_tok_s":gemma4_decode_tokens_per_second(generation),"resident_bytes":generation.metrics.resident_bytes,"weight_upload_bytes":generation.metrics.weight_upload_bytes,"readback_bytes":generation.metrics.readback_bytes,"command_buffers":generation.metrics.command_buffers}),
     )?;
     eprintln!("chat performance log: {CHAT_PERFORMANCE_LOG}");
     Ok(())
@@ -943,7 +973,6 @@ fn generation_metrics_json(
         "executor": "resident",
         "format": model.format_name(),
         "model_bytes": model_bytes,
-        "token_ids": result.generation.generated_token_ids,
         "finish_reason": format!("{:?}", result.finish_reason).to_lowercase(),
         "resident_bytes": result.metrics.resident_bytes,
         "weight_upload_bytes": result.metrics.weight_upload_bytes,
@@ -1390,6 +1419,33 @@ mod phase_07_tests {
         assert!(line.contains("ttft_ms=12.00"));
         assert!(line.contains("prefill_tok_s=500.00"));
         assert!(line.contains("decode_tok_s=200.00"));
+    }
+
+    #[test]
+    fn gemma_metrics_report_prefill_and_post_prefill_decode_rates() {
+        let generation = Gemma4Generation {
+            generation: atlas_model::Generation {
+                prompt_token_ids: vec![1, 2, 3, 4],
+                generated_token_ids: vec![5, 6, 7],
+                text: String::new(),
+                trace: atlas_model::LayerTrace::default(),
+                final_logits: Vec::new(),
+            },
+            metrics: atlas_model::gemma4_executor::Gemma4Metrics {
+                resident_bytes: 0,
+                weight_upload_bytes: 0,
+                readback_bytes: 0,
+                command_buffers: 0,
+                prefill_command_buffers: 4,
+                decode_command_buffers: 2,
+                prefill: Duration::from_millis(20),
+                decode: Duration::from_millis(10),
+                host_wall_time: Duration::from_millis(30),
+            },
+            finish_reason: Gemma4FinishReason::Eos,
+        };
+        assert_eq!(gemma4_prefill_tokens_per_second(&generation), 200.0);
+        assert_eq!(gemma4_decode_tokens_per_second(&generation), 200.0);
     }
 
     #[test]
