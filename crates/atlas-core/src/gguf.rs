@@ -85,10 +85,26 @@ pub struct GgufTensor {
     pub bytes: usize,
 }
 
+/// Array-valued GGUF metadata retained for tokenizer and architecture-specific
+/// configuration. Scalar metadata remains in [`GgufModel::metadata`] for the
+/// existing Llama callers.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GgufMetadataArray {
+    Strings(Vec<String>),
+    F32(Vec<f32>),
+    I32(Vec<i32>),
+    U32(Vec<u32>),
+    U64(Vec<u64>),
+    I64(Vec<i64>),
+    Bool(Vec<bool>),
+}
+
 #[derive(Debug, Clone)]
 pub struct GgufModel {
     pub metadata: BTreeMap<String, String>,
+    pub metadata_arrays: BTreeMap<String, GgufMetadataArray>,
     pub tensors: Vec<GgufTensor>,
+    data_start: usize,
     data: Vec<u8>,
 }
 
@@ -112,11 +128,15 @@ impl GgufModel {
             return Err(CoreError::InvalidInput("GGUF count is unreasonable".into()));
         }
         let mut metadata = BTreeMap::new();
+        let mut metadata_arrays = BTreeMap::new();
         for _ in 0..metadata_count {
             let key = r.string()?;
             let value_type = r.u32()?;
-            let value = r.metadata_value(value_type)?;
-            if let Some(value) = value {
+            if value_type == 9 {
+                if let Some(value) = r.metadata_array()? {
+                    metadata_arrays.insert(key, value);
+                }
+            } else if let Some(value) = r.metadata_value(value_type)? {
                 metadata.insert(key, value);
             }
         }
@@ -197,21 +217,20 @@ impl GgufModel {
         }
         Ok(Self {
             metadata,
+            metadata_arrays,
             tensors,
+            data_start,
             data,
         })
     }
     pub fn tensor_data(&self, tensor: &GgufTensor) -> Result<&[u8], CoreError> {
-        let data_start = align(self.header_end()?, GGUF_ALIGNMENT)?;
-        let start = data_start
+        let start = self
+            .data_start
             .checked_add(tensor.offset)
             .ok_or_else(|| CoreError::InvalidInput("GGUF offset overflows".into()))?;
         self.data
             .get(start..start + tensor.bytes)
             .ok_or_else(|| CoreError::InvalidInput("GGUF tensor data is outside file".into()))
-    }
-    fn header_end(&self) -> Result<usize, CoreError> {
-        header_end(&self.data)
     }
 }
 
@@ -309,29 +328,38 @@ fn quantize(values: &[f32], kind: GgufTensorType) -> Result<Vec<u8>, CoreError> 
     }
     let mut out = Vec::with_capacity(kind.encoded_bytes(values.len())?);
     for block in values.chunks_exact(GGML_QK) {
-        let max = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let (max, _) = block
+            .iter()
+            .copied()
+            .fold((0.0f32, 0.0f32), |(max, amax), v| {
+                if v.abs() > amax {
+                    (v, v.abs())
+                } else {
+                    (max, amax)
+                }
+            });
         let scale = if max == 0.0 {
             0.0
         } else {
             max / if kind == GgufTensorType::Q4_0 {
-                7.0
+                -8.0
             } else {
-                127.0
+                max.signum() * 127.0
             }
         };
         out.extend_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
         match kind {
             GgufTensorType::Q4_0 => {
-                for pair in block.chunks_exact(2) {
+                for i in 0..GGML_QK / 2 {
                     let a = if scale == 0.0 {
                         0
                     } else {
-                        (pair[0] / scale).round().clamp(-8.0, 7.0) as i8 + 8
+                        (block[i] / scale).round().clamp(-8.0, 7.0) as i8 + 8
                     } as u8;
                     let b = if scale == 0.0 {
                         0
                     } else {
-                        (pair[1] / scale).round().clamp(-8.0, 7.0) as i8 + 8
+                        (block[i + GGML_QK / 2] / scale).round().clamp(-8.0, 7.0) as i8 + 8
                     } as u8;
                     out.push(a | (b << 4));
                 }
@@ -357,19 +385,30 @@ pub fn dequantize_block(
         if output.len() != 256 || block.len() != kind.block_bytes() {
             return Err(CoreError::InvalidInput("invalid Q6_K block".into()));
         }
-        let delta = f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
-        let ql = &block[2..130];
-        let qh = &block[130..194];
-        let scales = &block[194..210];
+        // llama.cpp block_q6_K is ql[128], qh[64], scales[16], then the
+        // f16 super-block scale. The scale is at the end of the block.
+        let delta = f16_bits_to_f32(u16::from_le_bytes([block[208], block[209]]));
+        let ql = &block[..128];
+        let qh = &block[128..192];
+        let scales = &block[192..208];
         for index in 0usize..256 {
-            let low = if index.is_multiple_of(2) {
-                ql[index / 2] & 0x0f
+            // GGML Q6_K encodes each 128-value half as four interleaved
+            // 32-element streams. The two high-bit planes select both the
+            // low/high ql nibble and the per-16-value scale; they are not a
+            // sequential two-bit value for every four elements.
+            let half = index / 128;
+            let within = index % 128;
+            let stream = within / 32;
+            let lane = within % 32;
+            let packed = ql[half * 64 + lane + if stream % 2 == 1 { 32 } else { 0 }];
+            let low = if stream >= 2 {
+                packed >> 4
             } else {
-                ql[index / 2] >> 4
+                packed & 0x0f
             };
-            let high = (qh[index / 4] >> ((index % 4) * 2)) & 0x03;
-            output[index] =
-                (((high << 4) | low) as i8 - 32) as f32 * scales[index / 16] as i8 as f32 * delta;
+            let high = (qh[half * 32 + lane] >> (stream * 2)) & 0x03;
+            let scale = scales[half * 8 + lane / 16 + stream * 2] as i8 as f32;
+            output[index] = (((high << 4) | low) as i8 - 32) as f32 * scale * delta;
         }
         return Ok(());
     }
@@ -380,10 +419,10 @@ pub fn dequantize_block(
     match kind {
         GgufTensorType::Q4_0 => {
             for i in 0..GGML_QK {
-                let nibble = if i.is_multiple_of(2) {
-                    block[2 + i / 2] & 15
+                let nibble = if i < GGML_QK / 2 {
+                    block[2 + i] & 15
                 } else {
-                    block[2 + i / 2] >> 4
+                    block[2 + i - GGML_QK / 2] >> 4
                 };
                 output[i] = (nibble as i8 - 8) as f32 * scale;
             }
@@ -452,14 +491,9 @@ impl<'a> Reader<'a> {
             )),
             7 => Ok(Some((self.take(1)?[0] != 0).to_string())),
             8 => Ok(Some(self.string()?)),
-            9 => {
-                let element_type = self.u32()?;
-                let count = self.usize_u64("metadata array length")?;
-                for _ in 0..count {
-                    let _ = self.metadata_value(element_type)?;
-                }
-                Ok(None)
-            }
+            9 => Err(CoreError::InvalidInput(
+                "GGUF array must be read through metadata_array".into(),
+            )),
             10 => Ok(Some(self.u64()?.to_string())),
             11 => Ok(Some(
                 i64::from_le_bytes(self.take(8)?.try_into().unwrap()).to_string(),
@@ -470,6 +504,65 @@ impl<'a> Reader<'a> {
             _ => Err(CoreError::InvalidInput(format!(
                 "unsupported GGUF metadata type {value_type}"
             ))),
+        }
+    }
+    fn metadata_array(&mut self) -> Result<Option<GgufMetadataArray>, CoreError> {
+        let element_type = self.u32()?;
+        let count = self.usize_u64("metadata array length")?;
+        match element_type {
+            8 => Ok(Some(GgufMetadataArray::Strings(
+                (0..count)
+                    .map(|_| self.string())
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))),
+            6 => Ok(Some(GgufMetadataArray::F32(
+                (0..count)
+                    .map(|_| {
+                        Ok(f32::from_le_bytes(
+                            self.take(4)?.try_into().expect("f32 bytes"),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, CoreError>>()?,
+            ))),
+            5 => Ok(Some(GgufMetadataArray::I32(
+                (0..count)
+                    .map(|_| {
+                        Ok(i32::from_le_bytes(
+                            self.take(4)?.try_into().expect("i32 bytes"),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, CoreError>>()?,
+            ))),
+            4 => Ok(Some(GgufMetadataArray::U32(
+                (0..count)
+                    .map(|_| self.u32())
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))),
+            10 => Ok(Some(GgufMetadataArray::U64(
+                (0..count)
+                    .map(|_| self.u64())
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))),
+            11 => Ok(Some(GgufMetadataArray::I64(
+                (0..count)
+                    .map(|_| {
+                        Ok(i64::from_le_bytes(
+                            self.take(8)?.try_into().expect("i64 bytes"),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, CoreError>>()?,
+            ))),
+            7 => Ok(Some(GgufMetadataArray::Bool(
+                (0..count)
+                    .map(|_| Ok(self.take(1)?[0] != 0))
+                    .collect::<Result<Vec<_>, CoreError>>()?,
+            ))),
+            other => {
+                for _ in 0..count {
+                    let _ = self.metadata_value(other)?;
+                }
+                Ok(None)
+            }
         }
     }
 }
@@ -488,28 +581,4 @@ fn align(value: usize, alignment: usize) -> Result<usize, CoreError> {
         .checked_add(alignment - 1)
         .map(|v| v / alignment * alignment)
         .ok_or_else(|| CoreError::InvalidInput("GGUF alignment overflows".into()))
-}
-fn header_end(data: &[u8]) -> Result<usize, CoreError> {
-    let mut r = Reader { data, at: 0 };
-    if r.take(4)? != GGUF_MAGIC {
-        return Err(CoreError::InvalidInput("GGUF magic is missing".into()));
-    }
-    let _ = r.u32()?;
-    let tensors = r.usize_u64("tensor count")?;
-    let metadata = r.usize_u64("metadata count")?;
-    for _ in 0..metadata {
-        let _ = r.string()?;
-        let value_type = r.u32()?;
-        let _ = r.metadata_value(value_type)?;
-    }
-    for _ in 0..tensors {
-        let _ = r.string()?;
-        let rank = r.u32()?;
-        for _ in 0..rank {
-            let _ = r.u64()?;
-        }
-        let _ = r.u32()?;
-        let _ = r.u64()?;
-    }
-    Ok(r.at)
 }

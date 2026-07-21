@@ -6,8 +6,8 @@ mod safetensors;
 mod tensor;
 
 pub use gguf::{
-    GGML_QK, GGUF_ALIGNMENT, GGUF_VERSION, GgufModel, GgufTensor, GgufTensorType, GgufWriter,
-    dequantize_block, quantize_q4_0, quantize_q8_0,
+    GGML_QK, GGUF_ALIGNMENT, GGUF_VERSION, GgufMetadataArray, GgufModel, GgufTensor,
+    GgufTensorType, GgufWriter, dequantize_block, quantize_q4_0, quantize_q8_0,
 };
 pub use quant::{QuantFormat, QuantizedMatrix};
 pub use safetensors::{

@@ -69,8 +69,19 @@ gemma4_e2b_fixture_header_is_read_when_available -- --exact
 
 cargo run -p atlas-cli -- metal-info
 cargo run -p atlas-cli -- generate --model gemma4-e2b-q4_0 \
-  --prompt 'The capital of France is' --max-tokens 8 --executor resident
+  --prompt 'The capital of France is' --max-new-tokens 8 --greedy
+
+cargo run -p atlas-cli -- chat --model gemma4-e2b-q4_0 \
+  --prompt 'Explain the history and importance of Paris.' \
+  --max-tokens 128
 ```
+
+`generate` currently selects `ExecutorMode::Resident` unconditionally; it
+does not accept an executor switch. It sends the supplied text as a raw
+completion prompt, so the instruction-tuned fixture can repeat prompt text.
+Use `chat` for normal Gemma 4 instruction inference; it renders the embedded
+GGUF chat template and also executes through `ExecutorMode::Resident`. Gemma 4
+chat currently requires `--prompt` and does not provide an interactive REPL.
 
 The phase passes only when the resident command reports the expected
 Gemma-derived token IDs/text, non-zero resident bytes, one-time weight upload,

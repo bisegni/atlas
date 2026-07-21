@@ -206,3 +206,20 @@ sha256 = "79e3e522635f3171300913bb421464a87de6222182a0570b9b2ccba2a964b2b4"
 path = "model.gguf"
 bytes = 703209312
 sha256 = "d5ae64fa20798099b37cedd1ebd54d3d66a003928d6c72db5d66900a4ac0c75a"
+
+[[models]]
+id = "gemma4-e2b-q4_0"
+source = "google/gemma-4-E2B-it-qat-q4_0-gguf"
+revision = "main"
+path = "models/gguf/gemma-4-e2b-it-q4_0"
+architecture = "gemma4"
+tokenizer = "embedded"
+embedded_tokenizer = true
+model_file = "gemma-4-E2B_q4_0-it.gguf"
+format = "gguf-gemma4-q4_0"
+bytes = 3349516256
+
+[[models.files]]
+path = "gemma-4-E2B_q4_0-it.gguf"
+bytes = 3349516256
+sha256 = "fa401b55b07ee70a54c6dae3903c783a6e65064312529ea57175cb5f8dec6634"

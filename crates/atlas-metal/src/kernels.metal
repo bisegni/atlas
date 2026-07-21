@@ -67,6 +67,13 @@ kernel void vector_multiply_f32(
     if (id < count) { output[id] = lhs[id] * rhs[id]; }
 }
 
+kernel void vector_multiply_offset_f32(
+    device const float *lhs [[buffer(0)]], device const float *rhs [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &rhs_offset [[buffer(3)]],
+    constant uint &count [[buffer(4)]], uint id [[thread_position_in_grid]]) {
+    if (id < count) output[id] = lhs[id] * rhs[rhs_offset + id];
+}
+
 kernel void embedding_lookup_f32(
     device const float *table [[buffer(0)]], device const uint *token_ids [[buffer(1)]],
     device float *output [[buffer(2)]], constant uint &vocabulary [[buffer(3)]],
@@ -125,13 +132,17 @@ kernel void quantize_q4_0(
     constant uint &blocks [[buffer(2)]], uint block_id [[thread_position_in_grid]]) {
     if (block_id >= blocks) return;
     float maximum = 0.0f;
-    for (uint i = 0; i < 32; ++i) maximum = max(maximum, abs(input[block_id * 32 + i]));
-    float scale = maximum == 0.0f ? 0.0f : maximum / 7.0f;
+    float signed_maximum = 0.0f;
+    for (uint i = 0; i < 32; ++i) {
+        float value = input[block_id * 32 + i];
+        if (abs(value) > maximum) { maximum = abs(value); signed_maximum = value; }
+    }
+    float scale = maximum == 0.0f ? 0.0f : signed_maximum / -8.0f;
     device half *scale_out = (device half *)(output + block_id * 18);
     *scale_out = half(scale);
     for (uint i = 0; i < 16; ++i) {
-        int a = scale == 0.0f ? 0 : int(round(clamp(input[block_id * 32 + i * 2] / scale, -8.0f, 7.0f)));
-        int b = scale == 0.0f ? 0 : int(round(clamp(input[block_id * 32 + i * 2 + 1] / scale, -8.0f, 7.0f)));
+        int a = scale == 0.0f ? 0 : int(round(clamp(input[block_id * 32 + i] / scale, -8.0f, 7.0f)));
+        int b = scale == 0.0f ? 0 : int(round(clamp(input[block_id * 32 + i + 16] / scale, -8.0f, 7.0f)));
         output[block_id * 18 + 2 + i] = uchar((a + 8) | ((b + 8) << 4));
     }
 }
@@ -158,7 +169,7 @@ kernel void matvec_q4_0(
     for (uint block = 0; block < blocks; ++block) {
         device const uchar *base = weights + (row * blocks + block) * 18;
         float scale = float(*(device const half *)base);
-        for (uint i = 0; i < 32; ++i) { uchar nibble = (i & 1) ? base[2 + i / 2] >> 4 : base[2 + i / 2] & 15; sum += input[block * 32 + i] * float(int(nibble) - 8) * scale; }
+        for (uint i = 0; i < 32; ++i) { uchar packed = base[2 + (i & 15)]; uchar nibble = i < 16 ? packed & 15 : packed >> 4; sum += input[block * 32 + i] * float(int(nibble) - 8) * scale; }
     }
     output[row] = sum;
 }
@@ -176,8 +187,8 @@ kernel void matvec_q4_0_blocked(
     uint blocks = input_width / 32;
     for (uint block = 0; block < blocks; ++block) {
         device const uchar *base = weights + (row * blocks + block) * 18;
-        uchar packed = base[2 + lane / 2];
-        uchar nibble = (lane & 1) ? packed >> 4 : packed & 15;
+        uchar packed = base[2 + (lane & 15)];
+        uchar nibble = lane < 16 ? packed & 15 : packed >> 4;
         sum += input[block * 32 + lane] * float(int(nibble) - 8) * float(*(device const half *)base);
     }
     float total = simd_sum(sum);
@@ -197,7 +208,7 @@ kernel void matvec_q8_0(
 
 kernel void embedding_lookup_q4_0(
     device const uchar *weights [[buffer(0)]], device const uint *token_ids [[buffer(1)]], device float *output [[buffer(2)]], constant uint &vocabulary [[buffer(3)]], constant uint &hidden [[buffer(4)]], constant uint &tokens [[buffer(5)]], uint id [[thread_position_in_grid]]) {
-    if (id >= tokens * hidden) return; uint token = token_ids[id / hidden]; if (token >= vocabulary) return; uint column = id % hidden; uint block = column / 32; device const uchar *base = weights + (token * (hidden / 32) + block) * 18; float scale = float(*(device const half *)base); uchar nibble = (column & 1) ? base[2 + (column % 32) / 2] >> 4 : base[2 + (column % 32) / 2] & 15; output[id] = float(int(nibble) - 8) * scale;
+    if (id >= tokens * hidden) return; uint token = token_ids[id / hidden]; if (token >= vocabulary) return; uint column = id % hidden; uint block = column / 32; uint within = column % 32; device const uchar *base = weights + (token * (hidden / 32) + block) * 18; float scale = float(*(device const half *)base); uchar packed = base[2 + (within & 15)]; uchar nibble = within < 16 ? packed & 15 : packed >> 4; output[id] = float(int(nibble) - 8) * scale;
 }
 
 kernel void embedding_lookup_q8_0(
@@ -205,9 +216,22 @@ kernel void embedding_lookup_q8_0(
     if (id >= tokens * hidden) return; uint token = token_ids[id / hidden]; if (token >= vocabulary) return; uint column = id % hidden; uint block = column / 32; device const uchar *base = weights + (token * (hidden / 32) + block) * 34; float scale = float(*(device const half *)base); output[id] = float((char)base[2 + (column % 32)]) * scale;
 }
 
-// GGML block_q6_K: f16 block scale, 128 low nibbles, 64 packed high-bit
-// pairs, then sixteen signed per-group scales.  Gemma 4 E2B's two embedding
+// GGML block_q6_K: 128 low nibbles, 64 packed high-bit pairs, sixteen signed
+// per-group scales, then the f16 block scale. Gemma 4 E2B's two embedding
 // tables use this format while its projections remain Q4_0.
+inline float q6_k_value(device const uchar *base, uint index) {
+    uint chunk = index / 128;
+    uint within = index % 128;
+    uint stream = within / 32;
+    uint lane = within % 32;
+    uchar packed = base[chunk * 64 + lane + ((stream & 1) ? 32 : 0)];
+    uchar low = stream >= 2 ? packed >> 4 : packed & 15;
+    uchar high = (base[128 + chunk * 32 + lane] >> (stream * 2)) & 3;
+    int group_scale = int((char) base[192 + chunk * 8 + lane / 16 + stream * 2]);
+    int quantized = int((high << 4) | low) - 32;
+    return float(quantized * group_scale) * float(*(device const half *)(base + 208));
+}
+
 kernel void embedding_lookup_q6_k(
     device const uchar *weights [[buffer(0)]], device const uint *token_ids [[buffer(1)]],
     device float *output [[buffer(2)]], constant uint &vocabulary [[buffer(3)]],
@@ -220,11 +244,194 @@ kernel void embedding_lookup_q6_k(
     uint block = column / 256;
     uint index = column % 256;
     device const uchar *base = weights + (token * (hidden / 256) + block) * 210;
-    uchar low = (index & 1) ? base[2 + index / 2] >> 4 : base[2 + index / 2] & 15;
-    uchar high = (base[130 + index / 4] >> ((index % 4) * 2)) & 3;
-    int quantized = int((high << 4) | low) - 32;
-    int group_scale = int((char) base[194 + index / 16]);
-    output[id] = float(quantized * group_scale) * float(*(device const half *)base);
+    output[id] = q6_k_value(base, index);
+}
+
+// Q6_K matrix-vector multiplication shares the exact block layout used by the
+// Gemma E2B embedding tables.  Keeping it packed avoids a hidden FP32 output
+// projection cache for Gemma's tied vocabulary matrix.
+kernel void matvec_q6_k(
+    device const float *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
+    constant uint &output_width [[buffer(4)]], uint row [[thread_position_in_grid]]) {
+    if (row >= output_width) return;
+    float sum = 0.0f;
+    for (uint block = 0; block < input_width / 256; ++block) {
+        device const uchar *base = weights + (row * (input_width / 256) + block) * 210;
+        for (uint index = 0; index < 256; ++index) {
+            sum += input[block * 256 + index] * q6_k_value(base, index);
+        }
+    }
+    output[row] = sum;
+}
+
+kernel void matvec_f16(
+    device const float *input [[buffer(0)]], device const half *weights [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
+    constant uint &output_width [[buffer(4)]], uint row [[thread_position_in_grid]]) {
+    if (row >= output_width) return;
+    float sum = 0.0f;
+    for (uint column = 0; column < input_width; ++column)
+        sum += input[column] * float(weights[row * input_width + column]);
+    output[row] = sum;
+}
+
+inline float atlas_tanh_f32(float value) {
+    // Metal's generic tanh path produced NaN for ordinary finite scalar input
+    // on the resident device.  Saturate outside the range where tanh differs
+    // from +/-1 at FP32 precision, then use its stable exponential identity.
+    if (value >= 10.0f) return 1.0f;
+    if (value <= -10.0f) return -1.0f;
+    float exponent = exp(2.0f * value);
+    return (exponent - 1.0f) / (exponent + 1.0f);
+}
+
+kernel void gelu_f32(
+    device const float *input [[buffer(0)]], device float *output [[buffer(1)]],
+    constant uint &count [[buffer(2)]], uint id [[thread_position_in_grid]]) {
+    if (id < count) {
+        float x = input[id];
+        // The tanh GELU polynomial has the correct limits x and 0.  Preserve
+        // those limits explicitly when the cubic intermediate overflows so a
+        // finite large negative activation cannot become (-finite * 0) NaN.
+        float argument = 0.7978845608f * (x + 0.044715f * x * x * x);
+        if (isinf(argument)) {
+            output[id] = argument > 0.0f ? x : 0.0f;
+        } else {
+            output[id] = 0.5f * x * (1.0f + atlas_tanh_f32(argument));
+        }
+    }
+}
+
+// Trace-only GELU variant. Its intermediate buffers make a finite-input NaN
+// attributable to a specific arithmetic operation rather than a later reuse
+// of the activation arena.
+kernel void gelu_trace_f32(
+    device const float *input [[buffer(0)]], device float *output [[buffer(1)]],
+    device float *cubic_output [[buffer(2)]], device float *argument_output [[buffer(3)]],
+    device float *tanh_output [[buffer(4)]], constant uint &count [[buffer(5)]],
+    uint id [[thread_position_in_grid]]) {
+    if (id < count) {
+        float x = input[id];
+        float cubic = 0.044715f * x * x * x;
+        float argument = 0.7978845608f * (x + cubic);
+        float tanh_value = atlas_tanh_f32(argument);
+        cubic_output[id] = cubic;
+        argument_output[id] = argument;
+        tanh_output[id] = tanh_value;
+        output[id] = isinf(argument) ? (argument > 0.0f ? x : 0.0f)
+                                   : 0.5f * x * (1.0f + tanh_value);
+    }
+}
+
+kernel void copy_f32(
+    device const float *input [[buffer(0)]], device float *output [[buffer(1)]],
+    constant uint &count [[buffer(2)]], uint id [[thread_position_in_grid]]) {
+    if (id < count) output[id] = input[id];
+}
+
+kernel void rms_norm_groups_f32(
+    device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &width [[buffer(3)]],
+    constant uint &groups [[buffer(4)]], constant float &epsilon [[buffer(5)]],
+    uint id [[thread_position_in_grid]]) {
+    uint group = id / width, column = id % width;
+    if (group >= groups) return;
+    uint base = group * width;
+    float squared_sum = 0.0f;
+    for (uint index = 0; index < width; ++index) squared_sum += input[base + index] * input[base + index];
+    output[base + column] = input[base + column] * rsqrt(squared_sum / float(width) + epsilon) * weight[column];
+}
+
+kernel void rms_norm_groups_unweighted_f32(
+    device const float *input [[buffer(0)]], device float *output [[buffer(1)]],
+    constant uint &width [[buffer(2)]], constant uint &groups [[buffer(3)]], constant float &epsilon [[buffer(4)]],
+    uint id [[thread_position_in_grid]]) {
+    uint group = id / width, column = id % width;
+    if (group >= groups) return;
+    uint base = group * width;
+    float squared_sum = 0.0f;
+    for (uint index = 0; index < width; ++index) squared_sum += input[base + index] * input[base + index];
+    output[base + column] = input[base + column] * rsqrt(squared_sum / float(width) + epsilon);
+}
+
+// Gemma's resident buffers intentionally reuse storage between stages.  A
+// parallel elementwise RMS implementation races when input and output alias,
+// so this decode-oriented variant owns an entire group in one thread.
+kernel void rms_norm_groups_in_place_f32(
+    device float *values [[buffer(0)]], device const float *weight [[buffer(1)]],
+    constant uint &width [[buffer(2)]], constant uint &groups [[buffer(3)]],
+    constant float &epsilon [[buffer(4)]], uint group [[thread_position_in_grid]]) {
+    if (group >= groups) return;
+    uint base = group * width;
+    float squared_sum = 0.0f;
+    for (uint index = 0; index < width; ++index) squared_sum += values[base + index] * values[base + index];
+    float inv_rms = rsqrt(squared_sum / float(width) + epsilon);
+    for (uint index = 0; index < width; ++index) values[base + index] = values[base + index] * inv_rms * weight[index];
+}
+
+// PLE projection can inherit the QAT embedding's very large dynamic range.
+// Scale the reduction by each group's finite maximum to avoid x*x overflow
+// while preserving RMSNorm's mathematical result.
+kernel void rms_norm_groups_in_place_stable_f32(
+    device float *values [[buffer(0)]], device const float *weight [[buffer(1)]],
+    constant uint &width [[buffer(2)]], constant uint &groups [[buffer(3)]],
+    constant float &epsilon [[buffer(4)]], uint group [[thread_position_in_grid]]) {
+    if (group >= groups) return;
+    uint base = group * width;
+    float maximum = 0.0f;
+    for (uint index = 0; index < width; ++index) maximum = max(maximum, abs(values[base + index]));
+    if (maximum == 0.0f) {
+        for (uint index = 0; index < width; ++index) values[base + index] = 0.0f;
+        return;
+    }
+    float squared_sum = 0.0f;
+    for (uint index = 0; index < width; ++index) {
+        float scaled = values[base + index] / maximum;
+        squared_sum += scaled * scaled;
+    }
+    float inverse_rms = rsqrt(squared_sum / float(width) + epsilon / (maximum * maximum)) / maximum;
+    for (uint index = 0; index < width; ++index)
+        values[base + index] = values[base + index] * inverse_rms * weight[index];
+}
+
+kernel void rms_norm_groups_in_place_unweighted_f32(
+    device float *values [[buffer(0)]], constant uint &width [[buffer(1)]],
+    constant uint &groups [[buffer(2)]], constant float &epsilon [[buffer(3)]],
+    uint group [[thread_position_in_grid]]) {
+    if (group >= groups) return;
+    uint base = group * width;
+    float squared_sum = 0.0f;
+    for (uint index = 0; index < width; ++index) squared_sum += values[base + index] * values[base + index];
+    float inv_rms = rsqrt(squared_sum / float(width) + epsilon);
+    for (uint index = 0; index < width; ++index) values[base + index] *= inv_rms;
+}
+
+kernel void softcap_f32(
+    device float *values [[buffer(0)]], constant float &cap [[buffer(1)]], constant uint &count [[buffer(2)]], uint id [[thread_position_in_grid]]) {
+    if (id < count) values[id] = cap * tanh(values[id] / cap);
+}
+
+kernel void first_nonfinite_f32(
+    device const float *values [[buffer(0)]], device atomic_uint *result [[buffer(1)]],
+    constant uint &count [[buffer(2)]], constant uint &slot [[buffer(3)]],
+    uint id [[thread_position_in_grid]]) {
+    if (id != 0) return;
+    uint first = count;
+    for (uint index = 0; index < count; ++index) {
+        if (!isfinite(values[index])) { first = index; break; }
+    }
+    if (first < count) atomic_fetch_min_explicit(&result[0], (slot << 16) | first, memory_order_relaxed);
+}
+
+kernel void max_abs_f32(
+    device const float *values [[buffer(0)]], device float *result [[buffer(1)]],
+    constant uint &count [[buffer(2)]], constant uint &slot [[buffer(3)]],
+    uint id [[thread_position_in_grid]]) {
+    if (id != 0) return;
+    float maximum = 0.0f;
+    for (uint index = 0; index < count; ++index) maximum = max(maximum, abs(values[index]));
+    result[slot] = maximum;
 }
 
 // One-token decode projection.  The resident command path keeps input,
@@ -431,6 +638,63 @@ kernel void attention_decode_fused_f32(
         }
         if (tid == 0) {
             float score = reductions[0] * rsqrt(float(head_dim));
+            if (score > maximum) {
+                rescale = exp(maximum - score);
+                weight = 1.0f;
+                maximum = score;
+                denominator = denominator * rescale + weight;
+            } else {
+                rescale = 1.0f;
+                weight = exp(score - maximum);
+                denominator += weight;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint value_offset = value_base + key_base;
+        for (uint d = tid; d < head_dim; d += threads)
+            output[head * head_dim + d] = output[head * head_dim + d] * rescale
+                + weight * cache[value_offset + d];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint d = tid; d < head_dim; d += threads)
+        output[head * head_dim + d] /= denominator;
+}
+
+// Gemma 4 normalizes Q and K per head and explicitly uses attention scale
+// 1.0. Keep this separate from the Llama fused kernel, whose contract is
+// 1/sqrt(head_dim), so changing Gemma cannot regress existing executors.
+kernel void attention_decode_fused_gemma4_f32(
+    device const float *query [[buffer(0)]], device const float *cache [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &heads [[buffer(3)]],
+    constant uint &kv_heads [[buffer(4)]], constant uint &head_dim [[buffer(5)]],
+    constant uint &capacity [[buffer(6)]], constant uint &key_count [[buffer(7)]],
+    uint head [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]]) {
+    if (head >= heads) return;
+    uint kv_head = head / (heads / kv_heads);
+    uint value_base = capacity * kv_heads * head_dim;
+    threadgroup float reductions[128];
+    threadgroup float maximum;
+    threadgroup float denominator;
+    threadgroup float rescale;
+    threadgroup float weight;
+    maximum = -INFINITY;
+    denominator = 0.0f;
+    for (uint d = tid; d < head_dim; d += threads) output[head * head_dim + d] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint key = 0; key < key_count; ++key) {
+        float partial = 0.0f;
+        uint key_base = key * kv_heads * head_dim + kv_head * head_dim;
+        for (uint d = tid; d < head_dim; d += threads)
+            partial += query[head * head_dim + d] * cache[key_base + d];
+        reductions[tid] = partial;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) reductions[tid] += reductions[tid + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0) {
+            float score = reductions[0];
             if (score > maximum) {
                 rescale = exp(maximum - score);
                 weight = 1.0f;

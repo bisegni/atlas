@@ -15,11 +15,12 @@ use atlas_core::{
 };
 use atlas_metal::MetalRuntime;
 use atlas_model::{
-    AtlasModel,
+    AtlasModel, Gemma4E2bModel,
     executor::{
         AtlasExecutor, ExecutorConfig, ExecutorGeneration, ExecutorMetrics, ExecutorMode,
         GenerationEvent, LogitsReadback, ResidentAttentionPath,
     },
+    gemma4_executor::Gemma4E2bExecutor,
     runtime::{AtlasRuntime, RuntimeConfig, RuntimeEvent, RuntimeRequest},
     sampling::SamplingConfig,
     validate_generation_golden,
@@ -58,6 +59,8 @@ struct ModelRecord {
     path: PathBuf,
     architecture: String,
     tokenizer: PathBuf,
+    model_file: Option<PathBuf>,
+    embedded_tokenizer: bool,
     format: String,
     bytes: u64,
     baseline_model: Option<String>,
@@ -65,6 +68,38 @@ struct ModelRecord {
     min_token_agreement: Option<f32>,
     max_resident_bytes: Option<u64>,
     files: Vec<ModelFile>,
+}
+
+impl ModelRecord {
+    fn manifest_kind(&self) -> Result<ManifestModelKind> {
+        match (
+            self.architecture.as_str(),
+            self.embedded_tokenizer,
+            self.model_file.as_ref(),
+            self.tokenizer.as_path(),
+        ) {
+            ("LlamaForCausalLM", false, None, _) => Ok(ManifestModelKind::Llama),
+            ("gemma4", true, Some(_), tokenizer) if tokenizer == Path::new("embedded") => {
+                Ok(ManifestModelKind::Gemma4E2b)
+            }
+            _ => bail!(
+                "unsupported manifest/model combination for `{}`: architecture=`{}`, embedded_tokenizer={}, model_file={}, tokenizer={}; Atlas supports LlamaForCausalLM with an external tokenizer or gemma4 E2B with tokenizer = \"embedded\"",
+                self.id,
+                self.architecture,
+                self.embedded_tokenizer,
+                self.model_file
+                    .as_ref()
+                    .map_or("<none>", |path| path.to_str().unwrap_or("<non-UTF-8>")),
+                self.tokenizer.display(),
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManifestModelKind {
+    Llama,
+    Gemma4E2b,
 }
 
 #[derive(Debug)]
@@ -79,6 +114,23 @@ struct ModelSelection {
     id: String,
     directory: PathBuf,
     manifest: Option<ModelRecord>,
+}
+
+/// Generation-family selection stays explicit at the CLI boundary. Gemma is
+/// intentionally never coerced through AtlasModel's Llama-only loader.
+enum LoadedModel {
+    Llama(AtlasModel),
+    Gemma4E2b(Gemma4E2bModel),
+}
+
+fn gemma4_resident_executor_unavailable(_: &Gemma4E2bModel) -> anyhow::Error {
+    gemma4_resident_executor_unavailable_error()
+}
+
+fn gemma4_resident_executor_unavailable_error() -> anyhow::Error {
+    anyhow::anyhow!(
+        "Gemma 4 resident executor is not implemented; Atlas will not fall back to Llama or Reference"
+    )
 }
 
 extern "C" fn chat_sigint_handler(_: i32) {
@@ -256,7 +308,12 @@ fn chat(args: &[String]) -> Result<()> {
     install_chat_sigint_handler();
     let (model_args, prompt, max_tokens, mode) = parse_chat_args(args)?;
     let selection = resolve_model(&model_args)?;
-    let model = load_verified_model(&selection)?;
+    let model = match load_verified_model(&selection)? {
+        LoadedModel::Llama(model) => model,
+        LoadedModel::Gemma4E2b(model) => {
+            return gemma4_chat(&model, prompt, max_tokens, &selection);
+        }
+    };
     if mode == ExecutorMode::Resident {
         let _ = resident_executor(&model, &selection, LogitsReadback::SelectedToken)?;
     }
@@ -429,11 +486,90 @@ fn print_completion(
     Ok(result)
 }
 
-fn load_verified_model(selection: &ModelSelection) -> Result<AtlasModel> {
+fn print_gemma4_generation(
+    model: &Gemma4E2bModel,
+    prompt: &str,
+    max_tokens: usize,
+    selection: &ModelSelection,
+) -> Result<()> {
+    let mut executor = Gemma4E2bExecutor::new(model, 4096)?;
+    let generation = executor.generate_greedy(prompt, max_tokens)?;
+    println!(
+        "prompt_token_ids: {:?}",
+        generation.generation.prompt_token_ids
+    );
+    println!(
+        "generated_token_ids: {:?}",
+        generation.generation.generated_token_ids
+    );
+    println!("text: {}", generation.generation.text);
+    if !generation.generation.final_logits.is_empty() {
+        let mut top = generation
+            .generation
+            .final_logits
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, value)| value.is_finite())
+            .collect::<Vec<_>>();
+        top.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));
+        println!(
+            "gemma4_top_logits: {:?}",
+            top.into_iter().take(8).collect::<Vec<_>>()
+        );
+    }
+    println!(
+        "{}",
+        json!({
+            "event":"generation_metrics", "model_id":selection.id, "executor":"resident",
+            "format":"gguf-gemma4-q4_0", "model_bytes":selection.manifest.as_ref().map_or(0, |record| record.bytes),
+            "token_ids":generation.generation.generated_token_ids,
+            "finish_reason":if generation.stopped_on_eos { "eos" } else { "max_tokens" },
+            "resident_bytes":generation.metrics.resident_bytes,
+            "weight_upload_bytes":generation.metrics.weight_upload_bytes,
+            "readback_bytes":generation.metrics.readback_bytes,
+            "command_buffers":generation.metrics.command_buffers,
+            "prefill_command_buffers":generation.metrics.prefill_command_buffers,
+            "decode_command_buffers":generation.metrics.decode_command_buffers,
+            "timing":{"prefill_ms":generation.metrics.prefill.as_secs_f64()*1000.0,"decode_ms":generation.metrics.decode.as_secs_f64()*1000.0,"host_ms":generation.metrics.host_wall_time.as_secs_f64()*1000.0}
+        })
+    );
+    Ok(())
+}
+
+fn gemma4_chat(
+    model: &Gemma4E2bModel,
+    prompt: Option<String>,
+    max_tokens: usize,
+    selection: &ModelSelection,
+) -> Result<()> {
+    let prompt = prompt.context("Gemma 4 interactive chat is not available yet; pass --prompt")?;
+    let rendered = model.render_text_chat_prompt(&prompt)?;
+    print_gemma4_generation(model, &rendered, max_tokens, selection)
+}
+
+fn load_verified_model(selection: &ModelSelection) -> Result<LoadedModel> {
     if let Some(record) = &selection.manifest {
         verify_manifest_model(record)?;
+        return match record.manifest_kind()? {
+            ManifestModelKind::Llama => {
+                Ok(LoadedModel::Llama(AtlasModel::load(&selection.directory)?))
+            }
+            ManifestModelKind::Gemma4E2b => {
+                let path = safe_model_file(
+                    &selection.directory,
+                    record
+                        .model_file
+                        .as_ref()
+                        .expect("Gemma manifest has model_file"),
+                )?;
+                Ok(LoadedModel::Gemma4E2b(Gemma4E2bModel::load_gguf(path)?))
+            }
+        };
     }
-    AtlasModel::load(&selection.directory)
+    // An explicit --model-dir remains the existing Llama developer-fixture
+    // contract; manifest-backed selection never guesses an architecture.
+    Ok(LoadedModel::Llama(AtlasModel::load(&selection.directory)?))
 }
 
 fn resident_executor<'a>(
@@ -776,6 +912,55 @@ mod phase_07_tests {
     }
 
     #[test]
+    fn gemma4_manifest_selects_the_embedded_gguf_dispatch_branch() {
+        let manifest_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/manifest.toml");
+        let manifest = load_manifest_from(&manifest_path).unwrap();
+        let gemma = manifest
+            .models
+            .iter()
+            .find(|record| record.id == "gemma4-e2b-q4_0")
+            .expect("Gemma 4 E2B manifest entry");
+
+        assert_eq!(gemma.manifest_kind().unwrap(), ManifestModelKind::Gemma4E2b);
+        assert_eq!(gemma.architecture, "gemma4");
+        assert_eq!(gemma.tokenizer, PathBuf::from("embedded"));
+        assert_eq!(
+            gemma.model_file.as_deref(),
+            Some(Path::new("gemma-4-E2B_q4_0-it.gguf"))
+        );
+        assert_eq!(gemma.files.len(), 1);
+        assert_eq!(gemma.files[0].bytes, gemma.bytes);
+        assert_eq!(
+            gemma.files[0].sha256,
+            "fa401b55b07ee70a54c6dae3903c783a6e65064312529ea57175cb5f8dec6634"
+        );
+    }
+
+    #[test]
+    fn gemma4_without_resident_executor_has_no_fallback() {
+        let error = gemma4_resident_executor_unavailable_error();
+        assert_eq!(
+            error.to_string(),
+            "Gemma 4 resident executor is not implemented; Atlas will not fall back to Llama or Reference"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the ignored 3.3 GiB Gemma 4 E2B GGUF fixture"]
+    fn gemma4_manifest_fixture_verifies_architecture_and_checksum() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = load_manifest_from(&repository.join("models/manifest.toml")).unwrap();
+        let mut gemma = manifest
+            .models
+            .into_iter()
+            .find(|record| record.id == "gemma4-e2b-q4_0")
+            .expect("Gemma 4 E2B manifest entry");
+        gemma.path = repository.join(gemma.path);
+        verify_manifest_model(&gemma).unwrap();
+    }
+
+    #[test]
     fn model_search_sizes_are_human_readable() {
         assert_eq!(human_bytes(0), "0 B");
         assert_eq!(human_bytes(1024), "1.0 KiB");
@@ -947,7 +1132,10 @@ fn phase_08b_decode(args: &[String]) -> Result<()> {
     let selection = resolve_model(&model_args)?;
     let model_name = selection.id.clone();
     let model_bytes = selection.manifest.as_ref().map_or(0, |record| record.bytes);
-    let model = load_verified_model(&selection)?;
+    let model = match load_verified_model(&selection)? {
+        LoadedModel::Llama(model) => model,
+        LoadedModel::Gemma4E2b(model) => return Err(gemma4_resident_executor_unavailable(&model)),
+    };
     if trace_stages {
         ensure!(
             model.format_name() != "gguf-packed",
@@ -1187,7 +1375,10 @@ fn phase_05_quant(args: &[String]) -> Result<()> {
 }
 
 fn load_manifest() -> Result<ModelManifest> {
-    let path = Path::new(MODEL_MANIFEST);
+    load_manifest_from(Path::new(MODEL_MANIFEST))
+}
+
+fn load_manifest_from(path: &Path) -> Result<ModelManifest> {
     let contents = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut models: Vec<ModelRecord> = Vec::new();
     let mut model: Option<ModelRecord> = None;
@@ -1215,6 +1406,8 @@ fn load_manifest() -> Result<ModelManifest> {
                 path: PathBuf::new(),
                 architecture: String::new(),
                 tokenizer: PathBuf::new(),
+                model_file: None,
+                embedded_tokenizer: false,
                 format: String::new(),
                 bytes: 0,
                 baseline_model: None,
@@ -1277,6 +1470,14 @@ fn load_manifest() -> Result<ModelManifest> {
                 }
                 "tokenizer" => {
                     model.tokenizer = PathBuf::from(text.context("model tokenizer must be quoted")?)
+                }
+                "model_file" => {
+                    model.model_file =
+                        Some(PathBuf::from(text.context("model_file must be quoted")?))
+                }
+                "embedded_tokenizer" => {
+                    model.embedded_tokenizer =
+                        value.parse::<bool>().context("parse embedded_tokenizer")?
                 }
                 "format" => model.format = text.context("model format must be quoted")?.to_owned(),
                 "bytes" => model.bytes = value.parse().context("parse model bytes")?,
@@ -1428,11 +1629,28 @@ fn resolve_model(args: &[String]) -> Result<ModelSelection> {
         .find(|record| record.id == model)
         .with_context(|| format!("model ID `{model}` is not in {MODEL_MANIFEST}"))?;
     record.path = safe_project_path(&record.path)?;
-    if !record.path.join("config.json").exists() {
-        bail!(
-            "manifest model `{model}` is missing at {}; download its pinned revision or pass --model-dir for a developer fixture",
-            record.path.display()
-        );
+    match record.manifest_kind()? {
+        ManifestModelKind::Gemma4E2b => {
+            let model_file = safe_model_file(
+                &record.path,
+                record
+                    .model_file
+                    .as_ref()
+                    .expect("Gemma manifest has model_file"),
+            )?;
+            ensure!(
+                model_file.is_file(),
+                "manifest model `{model}` is missing embedded GGUF at {}; download its pinned revision",
+                model_file.display()
+            );
+        }
+        ManifestModelKind::Llama if !record.path.join("config.json").exists() => {
+            bail!(
+                "manifest model `{model}` is missing at {}; download its pinned revision or pass --model-dir for a developer fixture",
+                record.path.display()
+            );
+        }
+        ManifestModelKind::Llama => {}
     }
     Ok(ModelSelection {
         id: model,
@@ -1517,6 +1735,27 @@ fn verify_manifest_model(record: &ModelRecord) -> Result<()> {
         "manifest byte total mismatch for `{}`",
         record.id
     );
+    if record.manifest_kind()? == ManifestModelKind::Gemma4E2b {
+        let model_file = record
+            .model_file
+            .as_ref()
+            .expect("Gemma manifest has model_file");
+        ensure!(
+            record.files.iter().any(|file| file.path == *model_file),
+            "embedded GGUF model file is not recorded in manifest files for `{}`",
+            record.id
+        );
+        let gguf = GgufModel::open(safe_model_file(&record.path, model_file)?)?;
+        ensure!(
+            gguf.metadata
+                .get("general.architecture")
+                .map(String::as_str)
+                == Some(record.architecture.as_str()),
+            "embedded GGUF architecture mismatch for `{}`",
+            record.id
+        );
+        return Ok(());
+    }
     let tokenizer = safe_model_file(&record.path, &record.tokenizer)?;
     ensure!(
         tokenizer.is_file(),
@@ -2582,39 +2821,45 @@ fn generate(args: &[String]) -> Result<()> {
         "atlas: loading model fixture from {}",
         selection.directory.display()
     );
-    let model = load_verified_model(&selection)?;
     let prompt = prompt.context("--prompt is required")?;
     let max_new_tokens = max_new_tokens.context("--max-new-tokens is required")?;
-    let mut executor = resident_executor(&model, &selection, LogitsReadback::SelectedToken)?;
-    let generation = executor.generate_greedy(&prompt, max_new_tokens)?;
-    if let Some(golden) = golden {
-        validate_generation_golden(golden, &generation.generation)?;
+    match load_verified_model(&selection)? {
+        LoadedModel::Llama(model) => {
+            let mut executor =
+                resident_executor(&model, &selection, LogitsReadback::SelectedToken)?;
+            let generation = executor.generate_greedy(&prompt, max_new_tokens)?;
+            if let Some(golden) = golden {
+                validate_generation_golden(golden, &generation.generation)?;
+            }
+            println!(
+                "prompt_token_ids: {:?}",
+                generation.generation.prompt_token_ids
+            );
+            println!(
+                "generated_token_ids: {:?}",
+                generation.generation.generated_token_ids
+            );
+            println!("text: {}", generation.generation.text);
+            println!(
+                "{}",
+                generation_metrics_json(
+                    &selection.id,
+                    &model,
+                    &generation,
+                    selection.manifest.as_ref().map_or(0, |record| record.bytes)
+                )
+            );
+            return Ok(());
+        }
+        LoadedModel::Gemma4E2b(model) => {
+            if golden.is_some() {
+                bail!(
+                    "--golden is currently a Llama-only JSON contract; Gemma uses artifacts/phase-12a-pre/oracle.json"
+                );
+            }
+            return print_gemma4_generation(&model, &prompt, max_new_tokens, &selection);
+        }
     }
-    println!(
-        "prompt_token_ids: {:?}",
-        generation.generation.prompt_token_ids
-    );
-    println!(
-        "generated_token_ids: {:?}",
-        generation.generation.generated_token_ids
-    );
-    println!("text: {}", generation.generation.text);
-    println!(
-        "{}",
-        generation_metrics_json(
-            &selection.id,
-            &model,
-            &generation,
-            selection.manifest.as_ref().map_or(0, |record| record.bytes)
-        )
-    );
-    for entry in generation.generation.trace.entries {
-        println!(
-            "trace {} len={} max_abs={:.7}",
-            entry.name, entry.len, entry.max_abs
-        );
-    }
-    Ok(())
 }
 
 fn phase_03_model(args: &[String]) -> Result<()> {

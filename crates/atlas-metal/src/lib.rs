@@ -507,6 +507,7 @@ mod macos {
                 "reduction_sum_f32",
                 "transpose_f32",
                 "vector_multiply_f32",
+                "vector_multiply_offset_f32",
                 "embedding_lookup_f32",
                 "rms_norm_f32",
                 "rms_norm_decode_f32",
@@ -517,6 +518,19 @@ mod macos {
                 "embedding_lookup_q4_0",
                 "embedding_lookup_q8_0",
                 "embedding_lookup_q6_k",
+                "matvec_q6_k",
+                "matvec_f16",
+                "gelu_f32",
+                "gelu_trace_f32",
+                "copy_f32",
+                "rms_norm_groups_f32",
+                "rms_norm_groups_unweighted_f32",
+                "rms_norm_groups_in_place_f32",
+                "rms_norm_groups_in_place_stable_f32",
+                "rms_norm_groups_in_place_unweighted_f32",
+                "softcap_f32",
+                "first_nonfinite_f32",
+                "max_abs_f32",
                 "quantize_q4_0",
                 "quantize_q8_0",
                 "matvec_tiled_f32",
@@ -532,6 +546,7 @@ mod macos {
                 "kv_append_decode_f32",
                 "attention_decode_f32",
                 "attention_decode_fused_f32",
+                "attention_decode_fused_gemma4_f32",
                 "attention_scores_resident_f32",
                 "masked_softmax_resident_f32",
                 "attention_values_resident_f32",
@@ -816,6 +831,56 @@ mod macos {
                 "embedding_lookup_f32",
                 &[
                     &table_buffer,
+                    &ids_buffer,
+                    &output_buffer,
+                    &vocabulary_buffer,
+                    &hidden_buffer,
+                    &tokens_buffer,
+                ],
+                total,
+            )?;
+            self.copy_buffer_to_slice(&output_buffer, &mut output)?;
+            Ok((output, timing))
+        }
+
+        /// Decode selected rows from a GGUF Q6_K embedding table without a
+        /// host-side dequantized cache.
+        pub fn embedding_lookup_q6_k(
+            &self,
+            weights: &[u8],
+            vocabulary: usize,
+            hidden: usize,
+            token_ids: &[u32],
+        ) -> Result<(Vec<f32>, DispatchTiming), MetalError> {
+            if hidden == 0
+                || !hidden.is_multiple_of(256)
+                || token_ids.is_empty()
+                || token_ids.iter().any(|&token| token as usize >= vocabulary)
+            {
+                return Err(MetalError::InvalidInput(
+                    "Q6_K embedding dimensions or token IDs are invalid".into(),
+                ));
+            }
+            let expected_bytes = vocabulary
+                .checked_mul(hidden)
+                .and_then(|elements| elements.checked_div(256))
+                .and_then(|blocks| blocks.checked_mul(GgufTensorType::Q6K.block_bytes()))
+                .ok_or_else(|| MetalError::InvalidInput("Q6_K embedding size overflows".into()))?;
+            require_len(weights, Some(expected_bytes), "Q6_K embedding table")?;
+            let total = token_ids.len().checked_mul(hidden).ok_or_else(|| {
+                MetalError::InvalidInput("Q6_K embedding output length overflow".into())
+            })?;
+            let mut output = vec![0.0; total];
+            let weights_buffer = self.buffer_from_slice(weights)?;
+            let ids_buffer = self.buffer_from_slice(token_ids)?;
+            let output_buffer = self.buffer_from_slice(&output)?;
+            let vocabulary_buffer = self.buffer_from_slice(&[count_u32(vocabulary)?])?;
+            let hidden_buffer = self.buffer_from_slice(&[count_u32(hidden)?])?;
+            let tokens_buffer = self.buffer_from_slice(&[count_u32(token_ids.len())?])?;
+            let timing = self.dispatch_1d(
+                "embedding_lookup_q6_k",
+                &[
+                    &weights_buffer,
                     &ids_buffer,
                     &output_buffer,
                     &vocabulary_buffer,
@@ -1248,6 +1313,22 @@ mod macos {
             let count_buffer = self.buffer_from_slice(&[count])?;
             let timing = self.dispatch_1d(
                 "silu_f32",
+                &[&input_buffer, &output_buffer, &count_buffer],
+                input.len(),
+            )?;
+            self.copy_buffer_to_slice(&output_buffer, &mut output)?;
+            Ok((output, timing))
+        }
+
+        /// Apply the resident GELU kernel for numerical regression tests.
+        pub fn gelu(&self, input: &[f32]) -> Result<(Vec<f32>, DispatchTiming), MetalError> {
+            let count = count_u32(input.len())?;
+            let mut output = vec![0.0; input.len()];
+            let input_buffer = self.buffer_from_slice(input)?;
+            let output_buffer = self.buffer_from_slice(&output)?;
+            let count_buffer = self.buffer_from_slice(&[count])?;
+            let timing = self.dispatch_1d(
+                "gelu_f32",
                 &[&input_buffer, &output_buffer, &count_buffer],
                 input.len(),
             )?;

@@ -114,9 +114,33 @@ Talk to the model directly (omit `--prompt` for the REPL):
 cargo run -p atlas-cli -- chat --model small --prompt 'The capital of France is' --max-tokens 32
 ```
 
+For the instruction-tuned Gemma 4 E2B fixture, use `chat` so Atlas applies the
+chat template embedded in the GGUF:
+
+```zsh
+cargo run -p atlas-cli -- chat --model gemma4-e2b-q4_0 \
+  --prompt 'Explain the history and importance of Paris.' \
+  --max-tokens 128
+```
+
+Gemma 4 chat currently requires `--prompt`; interactive REPL input is not yet
+available for this model family. The command always uses the GPU-resident
+executor. Use `generate --max-new-tokens N --greedy` only for raw completion
+and parity diagnostics because it does not apply the instruction template.
+
 The supported product interface is currently the local CLI. HTTP serving is
 intentionally deferred until the final API phase, after sampling, quantized
 model loading, scheduling, and the memory runtime have stable CLI contracts.
+
+## External Software
+
+- [Rust](https://www.rust-lang.org/tools/install) provides Cargo and the Rust
+  compiler used to build and test the workspace.
+- Apple Xcode Command Line Tools provide the macOS SDK and Metal compiler used
+  to build and run the native GPU kernels.
+- [Hugging Face Hub](https://huggingface.co/docs/huggingface_hub/guides/cli)
+  provides the optional `hf` CLI used by `scripts/download-models.sh` to fetch
+  local model fixtures.
 
 ## Implementation order
 
