@@ -58,6 +58,12 @@ upload/readback bytes, and resident bytes.
   diagnostic evidence only. If it fails, retain the output artifact and run
   the opt-in resident stage-parity diagnostic to identify the first divergent
   FP32 stage rather than relaxing the gate.
+- Before promoting a Gemma 4 kernel optimization, add a pinned external
+  runtime revision and require exact greedy prompt/generated token parity for
+  a fixed canonical short chat. Phase 12a-pre intentionally accepted the
+  text-chat foundation without this external-runtime comparison; optimization
+  work must restore it as a promotion gate rather than relying on semantic
+  similarity.
 
 ## Exit gate
 

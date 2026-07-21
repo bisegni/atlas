@@ -15,12 +15,13 @@ use atlas_core::{
 };
 use atlas_metal::MetalRuntime;
 use atlas_model::{
-    AtlasModel, Gemma4E2bModel,
+    AtlasModel, Gemma4ChatMessage, Gemma4ChatRole, Gemma4E2bModel,
     executor::{
         AtlasExecutor, ExecutorConfig, ExecutorGeneration, ExecutorMetrics, ExecutorMode,
         GenerationEvent, LogitsReadback, ResidentAttentionPath,
     },
-    gemma4_executor::Gemma4E2bExecutor,
+    gemma4_executor::{Gemma4E2bExecutor, Gemma4FinishReason, Gemma4Generation},
+    render_gemma4_chat,
     runtime::{AtlasRuntime, RuntimeConfig, RuntimeEvent, RuntimeRequest},
     sampling::SamplingConfig,
     validate_generation_golden,
@@ -244,7 +245,11 @@ fn provider_command(args: &[String]) -> Result<()> {
 fn runtime_command(args: &[String]) -> Result<()> {
     CHAT_INTERRUPTED.store(false, Ordering::Release);
     install_chat_sigint_handler();
-    let (model_args, prompt, max_tokens, mode) = parse_chat_args(args)?;
+    let (model_args, prompt, max_tokens, mode, show_thoughts) = parse_chat_args(args)?;
+    ensure!(
+        !show_thoughts,
+        "--show-thoughts is only valid for Gemma 4 chat"
+    );
     ensure!(
         mode == ExecutorMode::Resident,
         "atlas runtime requires --executor resident"
@@ -306,14 +311,18 @@ fn runtime_command(args: &[String]) -> Result<()> {
 fn chat(args: &[String]) -> Result<()> {
     CHAT_INTERRUPTED.store(false, Ordering::Release);
     install_chat_sigint_handler();
-    let (model_args, prompt, max_tokens, mode) = parse_chat_args(args)?;
+    let (model_args, prompt, max_tokens, mode, show_thoughts) = parse_chat_args(args)?;
     let selection = resolve_model(&model_args)?;
     let model = match load_verified_model(&selection)? {
         LoadedModel::Llama(model) => model,
         LoadedModel::Gemma4E2b(model) => {
-            return gemma4_chat(&model, prompt, max_tokens, &selection);
+            return gemma4_chat(&model, prompt, max_tokens, show_thoughts, &selection);
         }
     };
+    ensure!(
+        !show_thoughts,
+        "--show-thoughts is only valid for Gemma 4 chat"
+    );
     if mode == ExecutorMode::Resident {
         let _ = resident_executor(&model, &selection, LogitsReadback::SelectedToken)?;
     }
@@ -524,7 +533,7 @@ fn print_gemma4_generation(
             "event":"generation_metrics", "model_id":selection.id, "executor":"resident",
             "format":"gguf-gemma4-q4_0", "model_bytes":selection.manifest.as_ref().map_or(0, |record| record.bytes),
             "token_ids":generation.generation.generated_token_ids,
-            "finish_reason":if generation.stopped_on_eos { "eos" } else { "max_tokens" },
+            "finish_reason":gemma4_finish_reason(generation.finish_reason),
             "resident_bytes":generation.metrics.resident_bytes,
             "weight_upload_bytes":generation.metrics.weight_upload_bytes,
             "readback_bytes":generation.metrics.readback_bytes,
@@ -541,11 +550,318 @@ fn gemma4_chat(
     model: &Gemma4E2bModel,
     prompt: Option<String>,
     max_tokens: usize,
+    show_thoughts: bool,
     selection: &ModelSelection,
 ) -> Result<()> {
-    let prompt = prompt.context("Gemma 4 interactive chat is not available yet; pass --prompt")?;
-    let rendered = model.render_text_chat_prompt(&prompt)?;
-    print_gemma4_generation(model, &rendered, max_tokens, selection)
+    let mut executor = Gemma4E2bExecutor::new(model, 4096)?;
+    let mut messages = Vec::new();
+    let mut session = ChatSessionMetrics::default();
+    if let Some(prompt) = prompt {
+        messages.push(Gemma4ChatMessage::new(Gemma4ChatRole::User, prompt));
+        let _ = run_gemma4_turn(
+            model,
+            &mut executor,
+            &messages,
+            max_tokens,
+            show_thoughts,
+            selection,
+            &mut session,
+        )?;
+        return Ok(());
+    }
+    eprintln!("Atlas Gemma 4 chat. Commands: /reset, /help, /quit");
+    let stdin = io::stdin();
+    loop {
+        if CHAT_INTERRUPTED.load(Ordering::Acquire) {
+            break;
+        }
+        print!("you> ");
+        io::stdout().flush()?;
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line)? == 0 {
+            break;
+        }
+        match repl_command(line.trim()) {
+            ReplCommand::Quit => break,
+            ReplCommand::Help => {
+                println!("/reset clears the conversation; /quit exits");
+                continue;
+            }
+            ReplCommand::Reset => {
+                messages.clear();
+                executor.reset();
+                println!("conversation reset");
+                continue;
+            }
+            ReplCommand::Ignore => continue,
+            ReplCommand::Prompt(text) => {
+                messages.push(Gemma4ChatMessage::new(Gemma4ChatRole::User, text))
+            }
+        }
+        compact_gemma4_history(model, &mut executor, &mut messages, max_tokens, selection)?;
+        match run_gemma4_turn(
+            model,
+            &mut executor,
+            &messages,
+            max_tokens,
+            show_thoughts,
+            selection,
+            &mut session,
+        ) {
+            Ok(visible) => messages.push(Gemma4ChatMessage::new(Gemma4ChatRole::Model, visible)),
+            Err(error) => {
+                messages.pop();
+                return Err(error);
+            }
+        }
+    }
+    eprintln!("{}", session_metrics_line(&session));
+    Ok(())
+}
+
+fn compact_gemma4_history(
+    model: &Gemma4E2bModel,
+    executor: &mut Gemma4E2bExecutor<'_>,
+    messages: &mut Vec<Gemma4ChatMessage>,
+    response_budget: usize,
+    selection: &ModelSelection,
+) -> Result<()> {
+    while model.tokenize(&render_gemma4_chat(messages)?)?.len() + response_budget > 4096 {
+        let offset = usize::from(
+            messages
+                .first()
+                .is_some_and(|m| m.role == Gemma4ChatRole::System),
+        );
+        let complete_pairs_before_newest = messages.len().saturating_sub(offset + 1) / 2;
+        ensure!(
+            complete_pairs_before_newest > 0,
+            "Gemma chat turn exceeds the 4096-token context limit and no older complete pair can be summarized"
+        );
+        let prior_summary = if offset == 1 {
+            Some(messages[0].content.as_str())
+        } else {
+            None
+        };
+        let user = &messages[offset].content;
+        let answer = &messages[offset + 1].content;
+        let summary_request = format!(
+            "Summarize the following earlier conversation faithfully and compactly for future turns. Preserve names, facts, decisions, and unresolved requests. Return only the summary.\n\nPrior summary:\n{}\n\nUser:\n{}\n\nModel:\n{}",
+            prior_summary.unwrap_or("(none)"),
+            user,
+            answer
+        );
+        let summary_prompt = render_gemma4_chat(&[Gemma4ChatMessage::new(
+            Gemma4ChatRole::User,
+            summary_request,
+        )])?;
+        let summarized_input_tokens = model.tokenize(&summary_prompt)?.len();
+        ensure!(
+            summarized_input_tokens + 256 <= 4096,
+            "conversation history cannot be summarized within the Gemma context limit"
+        );
+        let mut filter = ThoughtFilter::default();
+        let generation =
+            executor.generate_greedy_stream(&summary_prompt, 256, &CHAT_INTERRUPTED, |event| {
+                filter.push(&event.text);
+                Ok(())
+            })?;
+        ensure!(
+            generation.finish_reason != Gemma4FinishReason::Cancelled,
+            "conversation summarization cancelled"
+        );
+        let (summary, _, _) = filter.finish();
+        ensure!(
+            !summary.trim().is_empty(),
+            "Gemma conversation summarizer returned an empty summary"
+        );
+        replace_oldest_gemma4_pair_with_summary(messages, summary.trim())?;
+        eprintln!("conversation history summarized");
+        eprintln!(
+            "{}",
+            json!({"event":"conversation_compaction","model_id":selection.id,"executor":"resident","compaction_count":1,"summarized_input_tokens":summarized_input_tokens,"summary_tokens":generation.generation.generated_token_ids.len(),"resident_bytes":generation.metrics.resident_bytes,"weight_upload_bytes":generation.metrics.weight_upload_bytes,"readback_bytes":generation.metrics.readback_bytes,"command_buffers":generation.metrics.command_buffers})
+        );
+    }
+    Ok(())
+}
+
+fn replace_oldest_gemma4_pair_with_summary(
+    messages: &mut Vec<Gemma4ChatMessage>,
+    summary: &str,
+) -> Result<()> {
+    ensure!(
+        !summary.trim().is_empty(),
+        "Gemma conversation summary is empty"
+    );
+    let offset = usize::from(
+        messages
+            .first()
+            .is_some_and(|message| message.role == Gemma4ChatRole::System),
+    );
+    ensure!(
+        messages.len() >= offset + 3,
+        "no older complete Gemma pair is available to summarize"
+    );
+    ensure!(
+        messages[offset].role == Gemma4ChatRole::User
+            && messages[offset + 1].role == Gemma4ChatRole::Model,
+        "oldest Gemma history entries are not a complete pair"
+    );
+    let replacement = Gemma4ChatMessage::new(Gemma4ChatRole::System, summary.trim());
+    if offset == 1 {
+        messages.splice(0..3, [replacement]);
+    } else {
+        messages.splice(0..2, [replacement]);
+    }
+    Ok(())
+}
+
+fn gemma4_finish_reason(reason: Gemma4FinishReason) -> &'static str {
+    match reason {
+        Gemma4FinishReason::Eos => "eos",
+        Gemma4FinishReason::MaxTokens => "max_tokens",
+        Gemma4FinishReason::Cancelled => "cancelled",
+    }
+}
+
+#[derive(Default)]
+struct ThoughtFilter {
+    pending: String,
+    in_thought: bool,
+    visible: String,
+    thoughts: String,
+}
+
+impl ThoughtFilter {
+    fn push(&mut self, fragment: &str) -> String {
+        const OPEN: &str = "<|channel>thought";
+        const CLOSE: &str = "<channel|>";
+        const MARKERS: &[&str] = &[
+            OPEN,
+            CLOSE,
+            "<|turn>",
+            "<turn|>",
+            "<eos>",
+            "<bos>",
+            "<|endoftext|>",
+        ];
+        self.pending.push_str(fragment);
+        let mut output = String::new();
+        loop {
+            let found = MARKERS
+                .iter()
+                .filter_map(|marker| self.pending.find(marker).map(|index| (index, *marker)))
+                .min_by_key(|(index, _)| *index);
+            if let Some((index, marker)) = found {
+                let prefix: String = self.pending.drain(..index).collect();
+                if self.in_thought {
+                    self.thoughts.push_str(&prefix);
+                } else {
+                    self.visible.push_str(&prefix);
+                    output.push_str(&prefix);
+                }
+                self.pending.drain(..marker.len());
+                if marker == OPEN {
+                    self.in_thought = true;
+                } else if marker == CLOSE {
+                    self.in_thought = false;
+                }
+            } else {
+                let keep = self
+                    .pending
+                    .char_indices()
+                    .map(|(index, _)| self.pending.len() - index)
+                    .find(|length| {
+                        let suffix = &self.pending[self.pending.len() - length..];
+                        MARKERS.iter().any(|marker| marker.starts_with(suffix))
+                    })
+                    .unwrap_or(0);
+                let emit_len = self.pending.len() - keep;
+                let prefix: String = self.pending.drain(..emit_len).collect();
+                if self.in_thought {
+                    self.thoughts.push_str(&prefix);
+                } else {
+                    self.visible.push_str(&prefix);
+                    output.push_str(&prefix);
+                }
+                break;
+            }
+        }
+        output
+    }
+    fn finish(mut self) -> (String, String, String) {
+        let tail = std::mem::take(&mut self.pending);
+        if self.in_thought {
+            self.thoughts.push_str(&tail);
+        } else {
+            self.visible.push_str(&tail);
+        }
+        (
+            self.visible,
+            self.thoughts,
+            if self.in_thought { String::new() } else { tail },
+        )
+    }
+}
+
+fn run_gemma4_turn(
+    model: &Gemma4E2bModel,
+    executor: &mut Gemma4E2bExecutor<'_>,
+    messages: &[Gemma4ChatMessage],
+    max_tokens: usize,
+    show_thoughts: bool,
+    selection: &ModelSelection,
+    session: &mut ChatSessionMetrics,
+) -> Result<String> {
+    let rendered = render_gemma4_chat(messages)?;
+    ensure!(
+        model.tokenize(&rendered)?.len() + max_tokens <= 4096,
+        "Gemma chat turn exceeds the 4096-token context limit"
+    );
+    print!("model> ");
+    io::stdout().flush()?;
+    let mut filter = ThoughtFilter::default();
+    let mut count = 0usize;
+    let generation =
+        executor.generate_greedy_stream(&rendered, max_tokens, &CHAT_INTERRUPTED, |event| {
+            count += 1;
+            let text = filter.push(&event.text);
+            print!("{text}");
+            io::stdout().flush()?;
+            Ok(())
+        })?;
+    let (visible, thoughts, tail) = filter.finish();
+    print!("{tail}\n");
+    io::stdout().flush()?;
+    if show_thoughts && !thoughts.is_empty() {
+        eprintln!("thought> {thoughts}");
+    }
+    emit_gemma4_metrics(selection, &generation)?;
+    append_gemma4_performance_record(selection, &generation, &visible)?;
+    session.turns += 1;
+    session.generated_tokens += count;
+    session.active_turn_time += generation.metrics.host_wall_time;
+    Ok(visible)
+}
+
+fn emit_gemma4_metrics(selection: &ModelSelection, generation: &Gemma4Generation) -> Result<()> {
+    eprintln!(
+        "{}",
+        json!({"event":"generation_metrics","model_id":selection.id,"executor":"resident","format":"gguf-gemma4-q4_0","token_ids":generation.generation.generated_token_ids,"finish_reason":gemma4_finish_reason(generation.finish_reason),"resident_bytes":generation.metrics.resident_bytes,"weight_upload_bytes":generation.metrics.weight_upload_bytes,"readback_bytes":generation.metrics.readback_bytes,"command_buffers":generation.metrics.command_buffers,"prefill_command_buffers":generation.metrics.prefill_command_buffers,"decode_command_buffers":generation.metrics.decode_command_buffers,"timing":{"prefill_ms":generation.metrics.prefill.as_secs_f64()*1000.0,"decode_ms":generation.metrics.decode.as_secs_f64()*1000.0,"host_ms":generation.metrics.host_wall_time.as_secs_f64()*1000.0}})
+    );
+    Ok(())
+}
+
+fn append_gemma4_performance_record(
+    selection: &ModelSelection,
+    generation: &Gemma4Generation,
+    visible: &str,
+) -> Result<()> {
+    append_jsonl_record(
+        Path::new(CHAT_PERFORMANCE_LOG),
+        &json!({"model_id":selection.id,"executor":"resident","format":"gguf-gemma4-q4_0","generated_tokens":generation.generation.generated_token_ids.len(),"finish_reason":gemma4_finish_reason(generation.finish_reason),"visible_chars":visible.chars().count(),"resident_bytes":generation.metrics.resident_bytes,"weight_upload_bytes":generation.metrics.weight_upload_bytes,"readback_bytes":generation.metrics.readback_bytes,"command_buffers":generation.metrics.command_buffers}),
+    )?;
+    eprintln!("chat performance log: {CHAT_PERFORMANCE_LOG}");
+    Ok(())
 }
 
 fn load_verified_model(selection: &ModelSelection) -> Result<LoadedModel> {
@@ -707,11 +1023,14 @@ fn write_stream_event(writer: &mut impl Write, event: &GenerationEvent) -> Resul
     Ok(())
 }
 
-fn parse_chat_args(args: &[String]) -> Result<(Vec<String>, Option<String>, usize, ExecutorMode)> {
+fn parse_chat_args(
+    args: &[String],
+) -> Result<(Vec<String>, Option<String>, usize, ExecutorMode, bool)> {
     let mut model_args = Vec::new();
     let mut prompt = None;
     let mut max_tokens = 64;
     let mut mode = ExecutorMode::Resident;
+    let mut show_thoughts = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -745,11 +1064,12 @@ fn parse_chat_args(args: &[String]) -> Result<(Vec<String>, Option<String>, usiz
                     _ => bail!("--executor must be `reference` or `resident`"),
                 };
             }
+            "--show-thoughts" => show_thoughts = true,
             flag => bail!("unknown chat option: {flag}"),
         };
         index += 1;
     }
-    Ok((model_args, prompt, max_tokens, mode))
+    Ok((model_args, prompt, max_tokens, mode, show_thoughts))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -813,7 +1133,7 @@ mod phase_07_tests {
 
     #[test]
     fn chat_arguments_parse_one_shot_and_reject_zero_max_tokens() {
-        let (model, prompt, max, mode) = parse_chat_args(&[
+        let (model, prompt, max, mode, show_thoughts) = parse_chat_args(&[
             "--model".into(),
             "small".into(),
             "--prompt".into(),
@@ -826,6 +1146,7 @@ mod phase_07_tests {
         assert_eq!(prompt.as_deref(), Some("hello"));
         assert_eq!(max, 7);
         assert_eq!(mode, ExecutorMode::Resident);
+        assert!(!show_thoughts);
         assert!(
             parse_chat_args(&[
                 "--model".into(),
@@ -839,7 +1160,7 @@ mod phase_07_tests {
 
     #[test]
     fn chat_accepts_explicit_resident_executor_only() {
-        let (_, _, _, mode) = parse_chat_args(&[
+        let (_, _, _, mode, _) = parse_chat_args(&[
             "--model".into(),
             "small".into(),
             "--executor".into(),
@@ -856,6 +1177,80 @@ mod phase_07_tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn thought_filter_handles_markers_split_across_fragments() {
+        let mut filter = ThoughtFilter::default();
+        let mut streamed = String::new();
+        for fragment in [
+            "Visible <|chan",
+            "nel>thoughtsecret",
+            " text<chan",
+            "nel|> answer",
+        ] {
+            streamed.push_str(&filter.push(fragment));
+        }
+        let (visible, thoughts, tail) = filter.finish();
+        streamed.push_str(&tail);
+        assert_eq!(visible, "Visible  answer");
+        assert_eq!(streamed, visible);
+        assert_eq!(thoughts, "secret text");
+    }
+
+    #[test]
+    fn gemma_protocol_tokens_are_neither_streamed_nor_saved_to_history() {
+        let mut filter = ThoughtFilter::default();
+        let mut streamed = String::new();
+        for fragment in ["I noted **zephyr**.<tur", "n|><turn|><|tu", "rn><e", "os>"] {
+            streamed.push_str(&filter.push(fragment));
+        }
+        let (visible, thoughts, tail) = filter.finish();
+        streamed.push_str(&tail);
+        assert_eq!(visible, "I noted **zephyr**.");
+        assert_eq!(streamed, visible);
+        assert!(thoughts.is_empty());
+        assert!(
+            render_gemma4_chat(&[
+                Gemma4ChatMessage::new(Gemma4ChatRole::User, "What is the code word?"),
+                Gemma4ChatMessage::new(Gemma4ChatRole::Model, visible),
+                Gemma4ChatMessage::new(Gemma4ChatRole::User, "Repeat it"),
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn show_thoughts_flag_is_parsed_for_family_validation() {
+        let (_, _, _, _, show) = parse_chat_args(&[
+            "--model".into(),
+            "gemma4-e2b-q4_0".into(),
+            "--show-thoughts".into(),
+        ])
+        .unwrap();
+        assert!(show);
+    }
+
+    #[test]
+    fn deterministic_compaction_replaces_oldest_pairs_atomically_and_keeps_newest() {
+        let mut messages = vec![
+            Gemma4ChatMessage::new(Gemma4ChatRole::User, "old user"),
+            Gemma4ChatMessage::new(Gemma4ChatRole::Model, "old answer"),
+            Gemma4ChatMessage::new(Gemma4ChatRole::User, "middle user"),
+            Gemma4ChatMessage::new(Gemma4ChatRole::Model, "middle answer"),
+            Gemma4ChatMessage::new(Gemma4ChatRole::User, "newest user"),
+        ];
+        replace_oldest_gemma4_pair_with_summary(&mut messages, "summary one").unwrap();
+        assert_eq!(
+            messages[0],
+            Gemma4ChatMessage::new(Gemma4ChatRole::System, "summary one")
+        );
+        assert_eq!(messages.last().unwrap().content, "newest user");
+        replace_oldest_gemma4_pair_with_summary(&mut messages, "summary two").unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "summary two");
+        assert_eq!(messages[1].content, "newest user");
+        assert!(replace_oldest_gemma4_pair_with_summary(&mut messages, "impossible").is_err());
     }
 
     #[test]

@@ -476,6 +476,132 @@ pub struct Gemma4E2bModel {
     resident_weights: Mutex<Gemma4ResidentWeights>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gemma4ChatRole {
+    System,
+    User,
+    Model,
+}
+
+impl Gemma4ChatRole {
+    fn label(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::User => "user",
+            Self::Model => "model",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Gemma4ChatMessage {
+    pub role: Gemma4ChatRole,
+    pub content: String,
+}
+
+impl Gemma4ChatMessage {
+    pub fn new(role: Gemma4ChatRole, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: content.into(),
+        }
+    }
+}
+
+pub fn render_gemma4_chat(messages: &[Gemma4ChatMessage]) -> Result<String> {
+    ensure!(!messages.is_empty(), "Gemma chat conversation is empty");
+    let mut expected_user = true;
+    let mut rendered = String::new();
+    for (index, message) in messages.iter().enumerate() {
+        let content = message.content.trim();
+        ensure!(!content.is_empty(), "Gemma chat message {index} is empty");
+        ensure!(
+            !["<|turn>", "<turn|>", "<|channel>", "<channel|>"]
+                .iter()
+                .any(|token| content.contains(token)),
+            "Gemma chat message {index} contains reserved control tokens"
+        );
+        match message.role {
+            Gemma4ChatRole::System => ensure!(
+                index == 0,
+                "Gemma system message may only be the first conversation turn"
+            ),
+            Gemma4ChatRole::User => {
+                ensure!(expected_user, "Gemma chat roles must alternate user/model");
+                expected_user = false;
+            }
+            Gemma4ChatRole::Model => {
+                ensure!(!expected_user, "Gemma chat roles must alternate user/model");
+                expected_user = true;
+            }
+        }
+        rendered.push_str("<|turn>");
+        rendered.push_str(message.role.label());
+        rendered.push('\n');
+        rendered.push_str(content);
+        rendered.push_str("<turn|>\n");
+    }
+    ensure!(
+        !expected_user,
+        "Gemma conversation must end with a user turn"
+    );
+    rendered.push_str("<|turn>model\n");
+    Ok(rendered)
+}
+
+#[cfg(test)]
+mod gemma4_chat_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_one_and_multi_turn_rendering() {
+        assert_eq!(
+            render_gemma4_chat(&[Gemma4ChatMessage::new(Gemma4ChatRole::User, "Hello")]).unwrap(),
+            "<|turn>user\nHello<turn|>\n<|turn>model\n"
+        );
+        assert_eq!(
+            render_gemma4_chat(&[
+                Gemma4ChatMessage::new(Gemma4ChatRole::User, "one"),
+                Gemma4ChatMessage::new(Gemma4ChatRole::Model, "answer"),
+                Gemma4ChatMessage::new(Gemma4ChatRole::User, "two"),
+            ])
+            .unwrap(),
+            "<|turn>user\none<turn|>\n<|turn>model\nanswer<turn|>\n<|turn>user\ntwo<turn|>\n<|turn>model\n"
+        );
+    }
+
+    #[test]
+    fn invalid_roles_and_reserved_tokens_are_rejected() {
+        assert!(
+            render_gemma4_chat(&[Gemma4ChatMessage::new(Gemma4ChatRole::Model, "bad")]).is_err()
+        );
+        assert!(
+            render_gemma4_chat(&[
+                Gemma4ChatMessage::new(Gemma4ChatRole::User, "one"),
+                Gemma4ChatMessage::new(Gemma4ChatRole::User, "two"),
+            ])
+            .is_err()
+        );
+        assert!(
+            render_gemma4_chat(&[Gemma4ChatMessage::new(
+                Gemma4ChatRole::User,
+                "inject <turn|>"
+            )])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn internal_system_summary_must_precede_a_user_turn() {
+        let rendered = render_gemma4_chat(&[
+            Gemma4ChatMessage::new(Gemma4ChatRole::System, "Earlier facts"),
+            Gemma4ChatMessage::new(Gemma4ChatRole::User, "Continue"),
+        ])
+        .unwrap();
+        assert!(rendered.starts_with("<|turn>system\nEarlier facts<turn|>"));
+    }
+}
+
 #[derive(Default)]
 struct Gemma4ResidentWeights {
     buffers: HashMap<String, GpuBuffer>,
@@ -527,9 +653,7 @@ impl Gemma4E2bModel {
             self.gguf.metadata.contains_key("tokenizer.chat_template"),
             "Gemma 4 GGUF is missing tokenizer.chat_template"
         );
-        let content = user.trim();
-        ensure!(!content.is_empty(), "Gemma chat prompt is empty");
-        Ok(format!("<|turn>user\n{content}<turn|>\n<|turn>model\n"))
+        render_gemma4_chat(&[Gemma4ChatMessage::new(Gemma4ChatRole::User, user)])
     }
 
     pub fn gguf(&self) -> &GgufModel {

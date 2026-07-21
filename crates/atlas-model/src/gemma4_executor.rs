@@ -4,7 +4,10 @@
 //! cache, mixed full/sliding attention, and final Q6_K tied projection are
 //! architectural state, not optional Llama features.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, ensure};
 use atlas_core::GgufTensorType;
@@ -49,7 +52,21 @@ pub struct Gemma4Metrics {
 pub struct Gemma4Generation {
     pub generation: Generation,
     pub metrics: Gemma4Metrics,
-    pub stopped_on_eos: bool,
+    pub finish_reason: Gemma4FinishReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gemma4FinishReason {
+    Eos,
+    MaxTokens,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Gemma4TokenEvent {
+    pub token_id: u32,
+    pub text: String,
+    pub latency: Duration,
 }
 
 pub struct Gemma4E2bExecutor<'a> {
@@ -110,7 +127,7 @@ pub struct Gemma4E2bExecutor<'a> {
     rope_cos_host: Vec<f32>,
     rope_sin_host: Vec<f32>,
     rope_freq_factors: Vec<f32>,
-    weight_upload_bytes: u64,
+    pending_weight_upload_bytes: u64,
 }
 
 impl<'a> Gemma4E2bExecutor<'a> {
@@ -267,7 +284,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
             rope_cos_host: vec![0.0; head / 2],
             rope_sin_host: vec![0.0; head / 2],
             rope_freq_factors,
-            weight_upload_bytes,
+            pending_weight_upload_bytes: weight_upload_bytes,
         })
     }
 
@@ -407,6 +424,21 @@ impl<'a> Gemma4E2bExecutor<'a> {
         prompt: &str,
         max_new_tokens: usize,
     ) -> Result<Gemma4Generation> {
+        static NEVER_CANCEL: AtomicBool = AtomicBool::new(false);
+        self.generate_greedy_stream(prompt, max_new_tokens, &NEVER_CANCEL, |_| Ok(()))
+    }
+
+    pub fn reset(&mut self) {
+        self.position = 0;
+    }
+
+    pub fn generate_greedy_stream(
+        &mut self,
+        prompt: &str,
+        max_new_tokens: usize,
+        cancelled: &AtomicBool,
+        mut emit: impl FnMut(Gemma4TokenEvent) -> Result<()>,
+    ) -> Result<Gemma4Generation> {
         ensure!(max_new_tokens > 0, "max_new_tokens must be positive");
         let prompt_ids = self.model.tokenize(prompt)?;
         ensure!(!prompt_ids.is_empty(), "prompt tokenizes to no tokens");
@@ -428,15 +460,34 @@ impl<'a> Gemma4E2bExecutor<'a> {
         let prefill_commands = runtime.command_buffer_count() - command_before;
         let decode_started = Instant::now();
         let mut generated = Vec::new();
-        let mut eos = false;
+        let mut finish_reason = Gemma4FinishReason::MaxTokens;
+        let mut decoded = String::new();
+        let mut token_latency = prefill;
         for index in 0..max_new_tokens {
+            if cancelled.load(Ordering::Acquire) {
+                finish_reason = Gemma4FinishReason::Cancelled;
+                break;
+            }
             generated.push(selected);
+            let next_decoded = self.model.decode(&generated)?;
+            let fragment = next_decoded
+                .strip_prefix(&decoded)
+                .unwrap_or(&next_decoded)
+                .to_owned();
+            decoded = next_decoded;
+            emit(Gemma4TokenEvent {
+                token_id: selected,
+                text: fragment,
+                latency: token_latency,
+            })?;
             if selected == self.model.config.eos_token_id {
-                eos = true;
+                finish_reason = Gemma4FinishReason::Eos;
                 break;
             }
             if index + 1 < max_new_tokens {
+                let token_started = Instant::now();
                 selected = self.forward_token(selected)?;
+                token_latency = token_started.elapsed();
             }
         }
         let ids = [prompt_ids.clone(), generated.clone()].concat();
@@ -445,6 +496,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
         } else {
             Vec::new()
         };
+        let weight_upload_bytes = std::mem::take(&mut self.pending_weight_upload_bytes);
         Ok(Gemma4Generation {
             generation: Generation {
                 prompt_token_ids: prompt_ids,
@@ -455,7 +507,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
             },
             metrics: Gemma4Metrics {
                 resident_bytes: self.resident_bytes(),
-                weight_upload_bytes: self.weight_upload_bytes,
+                weight_upload_bytes,
                 readback_bytes: runtime.readback_bytes() - readback_before,
                 command_buffers: runtime.command_buffer_count() - command_before,
                 prefill_command_buffers: prefill_commands,
@@ -466,7 +518,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 decode: decode_started.elapsed(),
                 host_wall_time: started.elapsed(),
             },
-            stopped_on_eos: eos,
+            finish_reason,
         })
     }
 

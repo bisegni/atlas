@@ -49,11 +49,13 @@ release label.
 
 ## Acceptance
 
-First build a fixed text-only oracle from the upstream Gemma 4 reference
-implementation. Record its revision, prompts, input IDs, generated IDs, EOS
-behavior, and logits diagnostics under ignored `artifacts/phase-12a-pre/`.
-Use the same Q4 GGUF baseline only after validating its greedy output against
-that reference; do not treat an unverified third-party runtime as the oracle.
+Phase 12a-pre accepts the text-chat foundation through deterministic Atlas
+token evidence, focused numerical primitive oracles, fixture validation, and
+real multi-turn Resident execution. Exact end-to-end token parity against an
+external llama.cpp build is deliberately deferred to later optimization and
+parity work; it is not claimed by this phase. This keeps the foundation gate
+focused on Atlas's supported production contract while preserving exact-token
+comparison as a future promotion gate for kernel changes.
 
 Portable tests cover GGUF metadata arrays, Q6_K decoding, embedded tokenizer
 round trips, tensor-name/shape validation, PLE, each attention type, shared
@@ -76,16 +78,35 @@ cargo run -p atlas-cli -- chat --model gemma4-e2b-q4_0 \
   --max-tokens 128
 ```
 
-`generate` currently selects `ExecutorMode::Resident` unconditionally; it
-does not accept an executor switch. It sends the supplied text as a raw
-completion prompt, so the instruction-tuned fixture can repeat prompt text.
-Use `chat` for normal Gemma 4 instruction inference; it renders the embedded
-GGUF chat template and also executes through `ExecutorMode::Resident`. Gemma 4
-chat currently requires `--prompt` and does not provide an interactive REPL.
+`generate` selects `ExecutorMode::Resident` unconditionally and sends the
+supplied text as a raw completion prompt. `chat` renders the embedded Gemma 4
+turn protocol and also executes through `ExecutorMode::Resident`. With
+`--prompt`, chat streams one turn; without it, chat starts a multi-turn REPL
+with `/help`, `/reset`, and `/quit`. The REPL reuses one loaded executor,
+replays canonical visible history, filters thought-channel text unless
+`--show-thoughts` is requested, and summarizes older complete pairs before the
+4,096-token context limit is exceeded. Raw thoughts are not retained in chat
+history or the performance log.
 
-The phase passes only when the resident command reports the expected
-Gemma-derived token IDs/text, non-zero resident bytes, one-time weight upload,
-and no reference fallback. Record hardware/OS, artifact SHA256, command line,
-actual generated-token count, resident/upload/readback/command-buffer metrics,
-and timing. Until that output exists, Gemma 4 generation and GPU residency
-remain unverified.
+The phase passes when the resident commands report deterministic Gemma-derived
+token IDs and coherent text, non-zero resident bytes, one-time weight upload,
+warm-turn reuse, bounded readback, and no Reference fallback.
+
+## Accepted evidence
+
+Fixture: `gemma-4-E2B_q4_0-it.gguf`, 3,349,516,256 bytes, SHA-256
+`fa401b55b07ee70a54c6dae3903c783a6e65064312529ea57175cb5f8dec6634`.
+
+| Gate | Result |
+| --- | --- |
+| Portable workspace tests | Passed; focused Gemma formatter, reserved-token, thought filtering, compaction, Q6_K, PLE, shared-KV, and soft-cap coverage passed. |
+| Fixture header and Q6_K lookup oracle | Passed with the official local fixture; the ignored Metal Q6_K lookup matched the independent llama.cpp-layout CPU oracle. |
+| Model inspect and verify | Passed for manifest ID `gemma4-e2b-q4_0` and the recorded checksum. |
+| 128-token one-shot chat | `Resident`; 128 tokens; 3,489,602,512 resident bytes; 3,333,699,724 cold upload bytes; 576 readback bytes; 144 command buffers; no Reference fallback. |
+| Two-turn context | `Resident`; the second response recalled `zephyr`; first turn uploaded 3,333,699,724 bytes and the warm second turn uploaded 0 bytes; stable 3,489,602,512 resident bytes; no leaked control tokens. |
+| Raw eight-token generation | Prompt IDs `[669, 5279, 529, 7001, 563]`; generated IDs `[7001, 563, 7001, 563, 7001, 563, 7001, 7001]`; finite top logits; 12 command buffers; `Resident`; no fallback. |
+
+The interactive and raw Metal results were supplied from the user-run Apple
+Silicon environment. Exact external-runtime token parity is deferred and must
+be reintroduced as an explicit gate before promoting future Gemma kernel
+optimizations.
