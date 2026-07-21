@@ -1544,6 +1544,7 @@ fn resident_embedding_kernel(model: &AtlasModel, name: &str) -> Result<&'static 
         None => "embedding_lookup_f32",
         Some(GgufTensorType::Q4_0) => "embedding_lookup_q4_0",
         Some(GgufTensorType::Q8_0) => "embedding_lookup_q8_0",
+        Some(GgufTensorType::Q6K) => "embedding_lookup_q6_k",
         Some(other) => anyhow::bail!("unsupported packed embedding format {other:?}"),
     })
 }

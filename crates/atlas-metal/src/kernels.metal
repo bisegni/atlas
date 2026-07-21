@@ -205,6 +205,28 @@ kernel void embedding_lookup_q8_0(
     if (id >= tokens * hidden) return; uint token = token_ids[id / hidden]; if (token >= vocabulary) return; uint column = id % hidden; uint block = column / 32; device const uchar *base = weights + (token * (hidden / 32) + block) * 34; float scale = float(*(device const half *)base); output[id] = float((char)base[2 + (column % 32)]) * scale;
 }
 
+// GGML block_q6_K: f16 block scale, 128 low nibbles, 64 packed high-bit
+// pairs, then sixteen signed per-group scales.  Gemma 4 E2B's two embedding
+// tables use this format while its projections remain Q4_0.
+kernel void embedding_lookup_q6_k(
+    device const uchar *weights [[buffer(0)]], device const uint *token_ids [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &vocabulary [[buffer(3)]],
+    constant uint &hidden [[buffer(4)]], constant uint &tokens [[buffer(5)]],
+    uint id [[thread_position_in_grid]]) {
+    if (id >= tokens * hidden) return;
+    uint token = token_ids[id / hidden];
+    if (token >= vocabulary) return;
+    uint column = id % hidden;
+    uint block = column / 256;
+    uint index = column % 256;
+    device const uchar *base = weights + (token * (hidden / 256) + block) * 210;
+    uchar low = (index & 1) ? base[2 + index / 2] >> 4 : base[2 + index / 2] & 15;
+    uchar high = (base[130 + index / 4] >> ((index % 4) * 2)) & 3;
+    int quantized = int((high << 4) | low) - 32;
+    int group_scale = int((char) base[194 + index / 16]);
+    output[id] = float(quantized * group_scale) * float(*(device const half *)base);
+}
+
 // One-token decode projection.  The resident command path keeps input,
 // weights, and output in Metal buffers; this kernel is deliberately separate
 // from the correctness reference so it can be specialized per GPU family

@@ -19,6 +19,7 @@ pub enum GgufTensorType {
     F16,
     Q4_0,
     Q8_0,
+    Q6K,
 }
 
 impl GgufTensorType {
@@ -28,6 +29,7 @@ impl GgufTensorType {
             Self::F16 => 1,
             Self::Q4_0 => 2,
             Self::Q8_0 => 8,
+            Self::Q6K => 14,
         }
     }
     fn from_raw(raw: u32) -> Result<Self, CoreError> {
@@ -36,6 +38,7 @@ impl GgufTensorType {
             1 => Ok(Self::F16),
             2 => Ok(Self::Q4_0),
             8 => Ok(Self::Q8_0),
+            14 => Ok(Self::Q6K),
             _ => Err(CoreError::InvalidInput(format!(
                 "unsupported GGUF tensor type {raw}"
             ))),
@@ -47,6 +50,7 @@ impl GgufTensorType {
             Self::F16 => 2,
             Self::Q4_0 => 18,
             Self::Q8_0 => 34,
+            Self::Q6K => 210,
         }
     }
     pub fn encoded_bytes(self, elements: usize) -> Result<usize, CoreError> {
@@ -54,14 +58,15 @@ impl GgufTensorType {
             Self::F32 | Self::F16 => elements
                 .checked_mul(self.block_bytes())
                 .ok_or_else(|| CoreError::InvalidInput("GGUF tensor byte size overflows".into())),
-            Self::Q4_0 | Self::Q8_0 => {
-                if !elements.is_multiple_of(GGML_QK) {
+            Self::Q4_0 | Self::Q8_0 | Self::Q6K => {
+                let block = if self == Self::Q6K { 256 } else { GGML_QK };
+                if !elements.is_multiple_of(block) {
                     return Err(CoreError::InvalidInput(format!(
-                        "packed GGUF tensor has {elements} elements, not a multiple of {GGML_QK}"
+                        "packed GGUF tensor has {elements} elements, not a multiple of {block}"
                     )));
                 }
                 elements
-                    .checked_div(GGML_QK)
+                    .checked_div(block)
                     .and_then(|n| n.checked_mul(self.block_bytes()))
                     .ok_or_else(|| {
                         CoreError::InvalidInput("GGUF packed tensor byte size overflows".into())
@@ -110,17 +115,10 @@ impl GgufModel {
         for _ in 0..metadata_count {
             let key = r.string()?;
             let value_type = r.u32()?;
-            let value = match value_type {
-                8 => r.string()?,
-                4 => r.u32()?.to_string(),
-                10 => r.u64()?.to_string(),
-                _ => {
-                    return Err(CoreError::InvalidInput(format!(
-                        "unsupported GGUF metadata type {value_type} for {key}"
-                    )));
-                }
-            };
-            metadata.insert(key, value);
+            let value = r.metadata_value(value_type)?;
+            if let Some(value) = value {
+                metadata.insert(key, value);
+            }
         }
         let mut tensors = Vec::with_capacity(tensor_count);
         for _ in 0..tensor_count {
@@ -355,6 +353,26 @@ pub fn dequantize_block(
     block: &[u8],
     output: &mut [f32],
 ) -> Result<(), CoreError> {
+    if kind == GgufTensorType::Q6K {
+        if output.len() != 256 || block.len() != kind.block_bytes() {
+            return Err(CoreError::InvalidInput("invalid Q6_K block".into()));
+        }
+        let delta = f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let ql = &block[2..130];
+        let qh = &block[130..194];
+        let scales = &block[194..210];
+        for index in 0usize..256 {
+            let low = if index.is_multiple_of(2) {
+                ql[index / 2] & 0x0f
+            } else {
+                ql[index / 2] >> 4
+            };
+            let high = (qh[index / 4] >> ((index % 4) * 2)) & 0x03;
+            output[index] =
+                (((high << 4) | low) as i8 - 32) as f32 * scales[index / 16] as i8 as f32 * delta;
+        }
+        return Ok(());
+    }
     if output.len() != GGML_QK || block.len() != kind.block_bytes() {
         return Err(CoreError::InvalidInput("invalid GGUF block".into()));
     }
@@ -413,6 +431,47 @@ impl<'a> Reader<'a> {
             .map(str::to_owned)
             .map_err(|_| CoreError::InvalidInput("GGUF string is not UTF-8".into()))
     }
+    /// Read a GGUF metadata value, retaining scalar values Atlas consumes and
+    /// safely skipping descriptive values such as `general.tags` arrays.
+    fn metadata_value(&mut self, value_type: u32) -> Result<Option<String>, CoreError> {
+        match value_type {
+            0 => Ok(Some(self.take(1)?[0].to_string())),
+            1 => Ok(Some((self.take(1)?[0] as i8).to_string())),
+            2 => Ok(Some(
+                u16::from_le_bytes(self.take(2)?.try_into().unwrap()).to_string(),
+            )),
+            3 => Ok(Some(
+                i16::from_le_bytes(self.take(2)?.try_into().unwrap()).to_string(),
+            )),
+            4 => Ok(Some(self.u32()?.to_string())),
+            5 => Ok(Some(
+                i32::from_le_bytes(self.take(4)?.try_into().unwrap()).to_string(),
+            )),
+            6 => Ok(Some(
+                f32::from_le_bytes(self.take(4)?.try_into().unwrap()).to_string(),
+            )),
+            7 => Ok(Some((self.take(1)?[0] != 0).to_string())),
+            8 => Ok(Some(self.string()?)),
+            9 => {
+                let element_type = self.u32()?;
+                let count = self.usize_u64("metadata array length")?;
+                for _ in 0..count {
+                    let _ = self.metadata_value(element_type)?;
+                }
+                Ok(None)
+            }
+            10 => Ok(Some(self.u64()?.to_string())),
+            11 => Ok(Some(
+                i64::from_le_bytes(self.take(8)?.try_into().unwrap()).to_string(),
+            )),
+            12 => Ok(Some(
+                f64::from_le_bytes(self.take(8)?.try_into().unwrap()).to_string(),
+            )),
+            _ => Err(CoreError::InvalidInput(format!(
+                "unsupported GGUF metadata type {value_type}"
+            ))),
+        }
+    }
 }
 fn put_u32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_le_bytes());
@@ -440,22 +499,8 @@ fn header_end(data: &[u8]) -> Result<usize, CoreError> {
     let metadata = r.usize_u64("metadata count")?;
     for _ in 0..metadata {
         let _ = r.string()?;
-        match r.u32()? {
-            8 => {
-                let _ = r.string()?;
-            }
-            4 => {
-                let _ = r.u32()?;
-            }
-            10 => {
-                let _ = r.u64()?;
-            }
-            _ => {
-                return Err(CoreError::InvalidInput(
-                    "unsupported GGUF metadata type".into(),
-                ));
-            }
-        }
+        let value_type = r.u32()?;
+        let _ = r.metadata_value(value_type)?;
     }
     for _ in 0..tensors {
         let _ = r.string()?;

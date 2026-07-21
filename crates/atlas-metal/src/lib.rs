@@ -516,6 +516,7 @@ mod macos {
                 "matvec_q8_0",
                 "embedding_lookup_q4_0",
                 "embedding_lookup_q8_0",
+                "embedding_lookup_q6_k",
                 "quantize_q4_0",
                 "quantize_q8_0",
                 "matvec_tiled_f32",

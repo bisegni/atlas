@@ -181,3 +181,28 @@ sha256 = "9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c"
 path = "model.gguf"
 bytes = 1818645568
 sha256 = "93d9e0daff5d47459777eadb0a06dc5e070e3d4f191ce0846ce52834911a3387"
+
+[[models]]
+id = "llama-3.2-1b-instruct-q4_0"
+source = "mukel/Llama-3.2-1B-Instruct-GGUF"
+revision = "362f192"
+path = "models/gguf/llama-3.2-1b-instruct-q4_0"
+architecture = "LlamaForCausalLM"
+tokenizer = "tokenizer.json"
+format = "gguf-q4_0"
+bytes = 712295846
+
+[[models.files]]
+path = "config.json"
+bytes = 877
+sha256 = "2febf68cea25bf4611be02b7536f2488a5ba523bb1134986e3610152abe74fdb"
+
+[[models.files]]
+path = "tokenizer.json"
+bytes = 9085657
+sha256 = "79e3e522635f3171300913bb421464a87de6222182a0570b9b2ccba2a964b2b4"
+
+[[models.files]]
+path = "model.gguf"
+bytes = 703209312
+sha256 = "d5ae64fa20798099b37cedd1ebd54d3d66a003928d6c72db5d66900a4ac0c75a"

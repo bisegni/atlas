@@ -18,7 +18,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use atlas_core::{GgufModel, GgufTensorType, read_safetensors_tensor_f32};
+use atlas_core::{GgufModel, GgufTensorType, f16_bits_to_f32, read_safetensors_tensor_f32};
 use atlas_metal::GpuBuffer;
 use atlas_ops::{ExecutionMode, NeuralOps};
 use serde_json::Value;
@@ -727,13 +727,19 @@ fn gguf_weight_map(root: &Path) -> Result<HashMap<String, WeightSource>> {
         let bytes = model.tensor_data(tensor)?.to_vec();
         let source = match tensor.tensor_type {
             GgufTensorType::F32 => WeightSource::GgufF32(bytes),
-            GgufTensorType::Q4_0 | GgufTensorType::Q8_0 => WeightSource::GgufPacked {
-                bytes,
-                format: tensor.tensor_type,
-            },
-            GgufTensorType::F16 => bail!(
-                "GGUF F16 tensor `{}` is not supported by Atlas Phase 11a",
-                tensor.name
+            GgufTensorType::Q4_0 | GgufTensorType::Q8_0 | GgufTensorType::Q6K => {
+                WeightSource::GgufPacked {
+                    bytes,
+                    format: tensor.tensor_type,
+                }
+            }
+            GgufTensorType::F16 => WeightSource::GgufF32(
+                bytes
+                    .chunks_exact(2)
+                    .flat_map(|chunk| {
+                        f16_bits_to_f32(u16::from_le_bytes(chunk.try_into().unwrap())).to_le_bytes()
+                    })
+                    .collect(),
             ),
         };
         weights.insert(name, source);
