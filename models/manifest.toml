@@ -210,7 +210,7 @@ sha256 = "d5ae64fa20798099b37cedd1ebd54d3d66a003928d6c72db5d66900a4ac0c75a"
 [[models]]
 id = "gemma4-e2b-q4_0"
 source = "google/gemma-4-E2B-it-qat-q4_0-gguf"
-revision = "main"
+revision = "675cff42a74c774d6cb76f76d8eacb49b48c9b93"
 path = "models/gguf/gemma-4-e2b-it-q4_0"
 architecture = "gemma4"
 tokenizer = "embedded"

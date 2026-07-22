@@ -25,6 +25,13 @@ descriptors, classified pooled Metal allocations with telemetry, and a
 correctness-first FP32 neural operator suite with distinct prefill/decode
 projection paths. Model fixtures remain ignored by Git.
 
+Gemma 4 E2B Q4_0 runs through the GPU-resident executor with interactive chat,
+one-command-buffer prompt submission, packed Q4_0/Q6_K projection kernels, and
+append-only performance metrics. The current implementation materially improves
+the original throughput, while longer-workload prefill and decode optimization
+remains open. See the
+[current evidence and next implementation strategies](docs/atlas-metal-phases/phase-12a-perf-gemma4-resident-performance.md#next-implementation-strategies).
+
 ## Plan structure
 
 - [Main architecture plan](docs/Atlas_Metal_Inference_Engine_Plan.md) —
@@ -114,19 +121,97 @@ Talk to the model directly (omit `--prompt` for the REPL):
 cargo run -p atlas-cli -- chat --model small --prompt 'The capital of France is' --max-tokens 32
 ```
 
-For the instruction-tuned Gemma 4 E2B fixture, use `chat` so Atlas applies the
-chat template embedded in the GGUF:
+## Chat with Gemma 4
+
+Gemma 4 chat requires Apple Silicon with Metal and this local GGUF fixture:
+
+```text
+models/gguf/gemma-4-e2b-it-q4_0/gemma-4-E2B_q4_0-it.gguf
+```
+
+Model fixtures are developer-local and ignored by Git. Download the pinned
+3.3 GB text model non-interactively through Atlas. The optional JSON search
+shows the immutable candidate ID without opening the model browser:
 
 ```zsh
-cargo run -p atlas-cli -- chat --model gemma4-e2b-q4_0 \
+cargo run --release -p atlas-cli -- model search \
+  --provider huggingface --json \
+  google/gemma-4-E2B-it-qat-q4_0-gguf
+```
+
+Pass that pinned candidate ID directly to the non-interactive downloader:
+
+```zsh
+cargo run --release -p atlas-cli -- model download \
+  'huggingface:google/gemma-4-E2B-it-qat-q4_0-gguf@675cff42a74c774d6cb76f76d8eacb49b48c9b93:gguf-gemma4-q4_0:gemma-4-E2B_q4_0-it.gguf' \
+  --id gemma4-e2b-q4_0
+```
+
+The command downloads only the text GGUF, not the separate multimodal
+projector. It validates the embedded `gemma4` architecture, supported packed
+tensor formats, pinned filename, byte count, and SHA-256 before registering the
+fixture. The public repository does not currently require authentication. For
+a gated/private Hugging Face artifact, set `HF_TOKEN` in the environment or run
+`cargo run -p atlas-cli -- provider login huggingface` first.
+
+If the registered fixture directory already exists, Atlas refuses to overwrite
+it. Verify the downloaded model and confirm that Metal is available:
+
+```zsh
+cargo run --release -p atlas-cli -- model verify --model gemma4-e2b-q4_0
+cargo run -p atlas-cli -- metal-info
+```
+
+The verification command should report `"verified": true`. Then start chat as
+shown below.
+
+Start an optimized interactive chat:
+
+```zsh
+cargo run --release -p atlas-cli -- chat \
+  --model gemma4-e2b-q4_0 \
+  --max-tokens 128
+```
+
+Wait for the `you>` prompt and type a message. The REPL supports:
+
+- `/help` to show the available commands;
+- `/reset` to clear conversation history while keeping the loaded model warm;
+- `/quit` to exit.
+
+For example:
+
+```text
+Atlas Gemma 4 chat. Commands: /reset, /help, /quit
+you> hi
+model> Hello! How can I help you today? 😊
+```
+
+Run a single non-interactive turn by supplying `--prompt`:
+
+```zsh
+cargo run --release -p atlas-cli -- chat \
+  --model gemma4-e2b-q4_0 \
   --prompt 'Explain the history and importance of Paris.' \
   --max-tokens 128
 ```
 
-Gemma 4 chat currently requires `--prompt`; interactive REPL input is not yet
-available for this model family. The command always uses the GPU-resident
-executor. Use `generate --max-new-tokens N --greedy` only for raw completion
-and parity diagnostics because it does not apply the instruction template.
+Gemma 4 chat applies the instruction template embedded in the GGUF and always
+uses the GPU-resident executor. Thought-channel text is filtered by default;
+pass `--show-thoughts` only when it is intentionally needed. The raw
+`generate --max-new-tokens N --greedy` command is for completion and parity
+diagnostics and does not apply the chat template.
+
+Each completed turn prints Resident performance metrics and appends one JSON
+record to `artifacts/chat-performance.jsonl`. The first turn includes the model
+weight upload. After `/reset`, later turns in the same process should report
+`"weight_upload_bytes": 0`.
+
+The current warm canonical `hi` workload reaches approximately 39 tok/s
+prefill and 40 tok/s decode on the measured Apple M2 Max, with one prefill
+command buffer and 3,489,602,512 Resident bytes. Longer-workload performance
+remains open; see the prioritized
+[Gemma 4 next implementation strategies](docs/atlas-metal-phases/phase-12a-perf-gemma4-resident-performance.md#next-implementation-strategies).
 
 The supported product interface is currently the local CLI. HTTP serving is
 intentionally deferred until the final API phase, after sampling, quantized

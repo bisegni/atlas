@@ -195,6 +195,38 @@ kernel void matvec_q4_0_blocked(
     if (lane == 0) output[row] = total;
 }
 
+// Four rows per SIMD-group, sixteen rows per threadgroup. Eight lanes own a
+// row; each lane consumes four input values and two packed bytes per block.
+kernel void matvec_q4_0_16row(
+    device const float *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
+    constant uint &output_width [[buffer(4)]], uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint simdgroup = tid / 32;
+    uint lane = tid % 32;
+    uint row_in_simd = lane / 8;
+    uint column = lane % 8;
+    uint row = group * 16 + simdgroup * 4 + row_in_simd;
+    float sum = 0.0f;
+    if (row < output_width) {
+        uint blocks = input_width / 32;
+        for (uint block = 0; block < blocks; ++block) {
+            device const uchar *base = weights + (row * blocks + block) * 18;
+            float scale = float(*(device const half *)base);
+            uchar packed0 = base[2 + column];
+            uchar packed1 = base[2 + column + 8];
+            sum += input[block * 32 + column] * float(int(packed0 & 15) - 8) * scale;
+            sum += input[block * 32 + column + 8] * float(int(packed1 & 15) - 8) * scale;
+            sum += input[block * 32 + column + 16] * float(int(packed0 >> 4) - 8) * scale;
+            sum += input[block * 32 + column + 24] * float(int(packed1 >> 4) - 8) * scale;
+        }
+    }
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (column == 0 && row < output_width) output[row] = sum;
+}
+
 kernel void matvec_q8_0(
     device const float *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
     device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
@@ -265,6 +297,34 @@ kernel void matvec_q6_k(
     output[row] = sum;
 }
 
+// Q6_K vocabulary projection with eight rows per threadgroup. A half-SIMD
+// owns one row and evaluates sixteen values per 256-value block.
+kernel void matvec_q6_k_8row(
+    device const float *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
+    constant uint &output_width [[buffer(4)]], uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint simdgroup = tid / 32;
+    uint lane = tid % 32;
+    uint row_in_simd = lane / 16;
+    uint column = lane % 16;
+    uint row = group * 8 + simdgroup * 2 + row_in_simd;
+    float sum = 0.0f;
+    if (row < output_width) {
+        uint blocks = input_width / 256;
+        for (uint block = 0; block < blocks; ++block) {
+            device const uchar *base = weights + (row * blocks + block) * 210;
+            for (uint index = column; index < 256; index += 16)
+                sum += input[block * 256 + index] * q6_k_value(base, index);
+        }
+    }
+    sum += simd_shuffle_xor(sum, 8);
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (column == 0 && row < output_width) output[row] = sum;
+}
+
 kernel void matvec_f16(
     device const float *input [[buffer(0)]], device const half *weights [[buffer(1)]],
     device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
@@ -326,6 +386,12 @@ kernel void gelu_trace_f32(
 
 kernel void copy_f32(
     device const float *input [[buffer(0)]], device float *output [[buffer(1)]],
+    constant uint &count [[buffer(2)]], uint id [[thread_position_in_grid]]) {
+    if (id < count) output[id] = input[id];
+}
+
+kernel void copy_u32(
+    device const uint *input [[buffer(0)]], device uint *output [[buffer(1)]],
     constant uint &count [[buffer(2)]], uint id [[thread_position_in_grid]]) {
     if (id < count) output[id] = input[id];
 }

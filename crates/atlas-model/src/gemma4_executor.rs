@@ -50,6 +50,34 @@ pub struct Gemma4Metrics {
     pub prefill: Duration,
     pub decode: Duration,
     pub host_wall_time: Duration,
+    pub prefill_path: &'static str,
+    pub prefill_chunk_size: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gemma4PrefillPlan {
+    pub prompt_tokens: usize,
+    pub chunk_size: usize,
+    pub chunks: usize,
+}
+
+impl Gemma4PrefillPlan {
+    pub fn new(prompt_tokens: usize, max_context: usize) -> Result<Self> {
+        ensure!(
+            prompt_tokens > 0,
+            "Gemma prefill requires at least one token"
+        );
+        ensure!(
+            prompt_tokens <= max_context,
+            "Gemma prefill exceeds context capacity"
+        );
+        let chunk_size = prompt_tokens.min(128);
+        Ok(Self {
+            prompt_tokens,
+            chunk_size,
+            chunks: prompt_tokens.div_ceil(chunk_size),
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -111,9 +139,14 @@ pub struct Gemma4E2bExecutor<'a> {
     validity: GpuBuffer,
     stage_max_abs: GpuBuffer,
     hidden: GpuBuffer,
+    ple_total: GpuBuffer,
     ple_width: GpuBuffer,
     head_full: GpuBuffer,
     head_swa: GpuBuffer,
+    q_width_full: GpuBuffer,
+    q_width_swa: GpuBuffer,
+    ffn_widths: Vec<GpuBuffer>,
+    ple_offsets: Vec<GpuBuffer>,
     layers: GpuBuffer,
     heads: GpuBuffer,
     kv_heads: GpuBuffer,
@@ -126,10 +159,10 @@ pub struct Gemma4E2bExecutor<'a> {
     ple_input_scale: GpuBuffer,
     ple_embedding_scale: GpuBuffer,
     final_softcap: GpuBuffer,
-    rope_cos: GpuBuffer,
-    rope_sin: GpuBuffer,
-    rope_cos_host: Vec<f32>,
-    rope_sin_host: Vec<f32>,
+    rope_full_cos: GpuBuffer,
+    rope_full_sin: GpuBuffer,
+    rope_swa_cos: GpuBuffer,
+    rope_swa_sin: GpuBuffer,
     rope_freq_factors: Vec<f32>,
     pending_weight_upload_bytes: u64,
 }
@@ -267,9 +300,29 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 (GEMMA4_TRACE_GLOBAL_STAGES + c.layers * GEMMA4_TRACE_STAGES_PER_LAYER) * 4,
             )?,
             hidden: runtime.upload_u32(&[u32::try_from(h)?])?,
+            ple_total: runtime.upload_u32(&[u32::try_from(ple_total)?])?,
             ple_width: runtime.upload_u32(&[u32::try_from(c.per_layer_embedding_size)?])?,
             head_full: runtime.upload_u32(&[u32::try_from(c.key_length)?])?,
             head_swa: runtime.upload_u32(&[u32::try_from(c.key_length_swa)?])?,
+            q_width_full: runtime
+                .upload_u32(&[u32::try_from(c.attention_heads * c.key_length)?])?,
+            q_width_swa: runtime
+                .upload_u32(&[u32::try_from(c.attention_heads * c.key_length_swa)?])?,
+            ffn_widths: c
+                .feed_forward_sizes
+                .iter()
+                .map(|width| -> Result<GpuBuffer> {
+                    Ok(runtime.upload_u32(&[u32::try_from(*width)?])?)
+                })
+                .collect::<Result<Vec<_>>>()?,
+            ple_offsets: (0..c.layers)
+                .map(|layer| -> Result<GpuBuffer> {
+                    Ok(
+                        runtime
+                            .upload_u32(&[u32::try_from(layer * c.per_layer_embedding_size)?])?,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?,
             layers: runtime.upload_u32(&[u32::try_from(c.layers)?])?,
             heads: runtime.upload_u32(&[u32::try_from(c.attention_heads)?])?,
             kv_heads: runtime.upload_u32(&[1])?,
@@ -283,10 +336,10 @@ impl<'a> Gemma4E2bExecutor<'a> {
             ple_embedding_scale: runtime
                 .upload_f32(&[(c.per_layer_embedding_size as f32).sqrt()])?,
             final_softcap: runtime.upload_f32(&[c.final_logit_softcap])?,
-            rope_cos: allocate(head / 2)?,
-            rope_sin: allocate(head / 2)?,
-            rope_cos_host: vec![0.0; head / 2],
-            rope_sin_host: vec![0.0; head / 2],
+            rope_full_cos: allocate(head / 2)?,
+            rope_full_sin: allocate(head / 2)?,
+            rope_swa_cos: allocate(head / 2)?,
+            rope_swa_sin: allocate(head / 2)?,
             rope_freq_factors,
             pending_weight_upload_bytes: weight_upload_bytes,
         })
@@ -351,46 +404,6 @@ impl<'a> Gemma4E2bExecutor<'a> {
         self.model.resident_weight(name)
     }
 
-    fn write_rope(&mut self, sliding: bool) -> Result<()> {
-        let c = &self.model.config;
-        let theta = if sliding {
-            c.rope_theta_swa
-        } else {
-            c.rope_theta
-        };
-        let head = if sliding {
-            c.key_length_swa
-        } else {
-            c.key_length
-        };
-        let rotary = if sliding {
-            c.rope_dimensions_swa
-        } else {
-            c.rope_dimensions
-        };
-        ensure!(
-            rotary > 0 && rotary <= head && rotary.is_multiple_of(2),
-            "Gemma 4 rotary width {rotary} is invalid for head width {head}"
-        );
-        for pair in 0..head / 2 {
-            let factor = if sliding {
-                1.0
-            } else {
-                self.rope_freq_factors[pair]
-            };
-            let angle = gemma4_rope_angle(self.position, pair, rotary, theta, factor);
-            self.rope_cos_host[pair] = angle.cos();
-            self.rope_sin_host[pair] = angle.sin();
-        }
-        self.model
-            .runtime()
-            .write_f32(&self.rope_cos, &self.rope_cos_host)?;
-        self.model
-            .runtime()
-            .write_f32(&self.rope_sin, &self.rope_sin_host)?;
-        Ok(())
-    }
-
     fn matvec(
         &self,
         command: &mut atlas_metal::ResidentCommand<'_>,
@@ -398,25 +411,21 @@ impl<'a> Gemma4E2bExecutor<'a> {
         weight: &GpuBuffer,
         output: &GpuBuffer,
         input_width: &GpuBuffer,
+        output_width_buffer: &GpuBuffer,
         output_width: usize,
         format: GgufTensorType,
     ) -> Result<()> {
         let kernel = match format {
-            GgufTensorType::Q4_0 => "matvec_q4_0_blocked",
-            GgufTensorType::Q6K => "matvec_q6_k",
+            GgufTensorType::Q4_0 => "matvec_q4_0_16row",
+            GgufTensorType::Q6K => "matvec_q6_k_8row",
             GgufTensorType::F16 => "matvec_f16",
             other => anyhow::bail!("unsupported Gemma matvec format {other:?}"),
         };
-        let output_width_buffer = self
-            .model
-            .runtime()
-            .upload_u32(&[u32::try_from(output_width)?])?;
-        let buffers = &[input, weight, output, input_width, &output_width_buffer];
+        let buffers = &[input, weight, output, input_width, output_width_buffer];
         if format == GgufTensorType::Q4_0 {
-            // matvec_q4_0_blocked assigns one SIMD group to each output row.
-            // A flat dispatch makes `lane` exceed 31 and leaves most rows
-            // unwritten, producing uninitialized NaNs in Gemma projections.
-            command.dispatch_threadgroups_1d(kernel, buffers, output_width, 32)?;
+            command.dispatch_threadgroups_1d(kernel, buffers, output_width.div_ceil(16), 128)?;
+        } else if format == GgufTensorType::Q6K {
+            command.dispatch_threadgroups_1d(kernel, buffers, output_width.div_ceil(8), 128)?;
         } else {
             command.dispatch_1d(kernel, buffers, output_width)?;
         }
@@ -477,9 +486,13 @@ impl<'a> Gemma4E2bExecutor<'a> {
         let started = Instant::now();
         self.position = 0;
         let prefill_started = Instant::now();
+        let plan = Gemma4PrefillPlan::new(prompt_ids.len(), self.max_context)?;
         let mut selected = 0;
-        for token in &prompt_ids {
-            selected = self.forward_token(*token)?;
+        let chunk_count = plan.chunks;
+        for (chunk_index, chunk) in prompt_ids.chunks(plan.chunk_size).enumerate() {
+            if let Some(token) = self.forward_tokens(chunk, chunk_index + 1 == chunk_count)? {
+                selected = token;
+            }
         }
         let prefill = prefill_started.elapsed();
         let prefill_commands = runtime.command_buffer_count() - command_before;
@@ -547,6 +560,8 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 prefill,
                 decode: decode_started.elapsed(),
                 host_wall_time: started.elapsed(),
+                prefill_path: "resident_chunked_command",
+                prefill_chunk_size: plan.chunk_size,
             },
             finish_reason,
         })
@@ -557,12 +572,175 @@ impl<'a> Gemma4E2bExecutor<'a> {
             self.position < self.max_context,
             "Gemma executor context exhausted"
         );
+        let runtime = self.model.runtime();
+        runtime.write_u32(&self.token, &[token])?;
+        runtime.write_u32(&self.position_buffer, &[u32::try_from(self.position)?])?;
+        let rope_pairs = self
+            .model
+            .config
+            .key_length
+            .max(self.model.config.key_length_swa)
+            / 2;
+        let mut full_cos = vec![0.0; rope_pairs];
+        let mut full_sin = vec![0.0; rope_pairs];
+        let mut swa_cos = vec![0.0; rope_pairs];
+        let mut swa_sin = vec![0.0; rope_pairs];
+        for pair in 0..rope_pairs {
+            let full_angle = gemma4_rope_angle(
+                self.position,
+                pair,
+                self.model.config.rope_dimensions,
+                self.model.config.rope_theta,
+                self.rope_freq_factors[pair],
+            );
+            let swa_angle = gemma4_rope_angle(
+                self.position,
+                pair,
+                self.model.config.rope_dimensions_swa,
+                self.model.config.rope_theta_swa,
+                1.0,
+            );
+            full_cos[pair] = full_angle.cos();
+            full_sin[pair] = full_angle.sin();
+            swa_cos[pair] = swa_angle.cos();
+            swa_sin[pair] = swa_angle.sin();
+        }
+        runtime.write_f32(&self.rope_full_cos, &full_cos)?;
+        runtime.write_f32(&self.rope_full_sin, &full_sin)?;
+        runtime.write_f32(&self.rope_swa_cos, &swa_cos)?;
+        runtime.write_f32(&self.rope_swa_sin, &swa_sin)?;
+        let rope_full_cos = self.rope_full_cos.clone();
+        let rope_full_sin = self.rope_full_sin.clone();
+        let rope_swa_cos = self.rope_swa_cos.clone();
+        let rope_swa_sin = self.rope_swa_sin.clone();
+        let trace_stages = std::env::var_os("ATLAS_GEMMA4_TRACE_STAGES").is_some();
+        let mut command = runtime.begin_resident_command_with_exact_timing(trace_stages)?;
+        self.encode_current_token(
+            &mut command,
+            0,
+            true,
+            rope_pairs,
+            &rope_full_cos,
+            &rope_full_sin,
+            &rope_swa_cos,
+            &rope_swa_sin,
+        )?;
+        command.finish()?;
+        self.position += 1;
+        Ok(runtime.read_u32(&self.selected)?)
+    }
+
+    fn forward_tokens(&mut self, tokens: &[u32], select_last: bool) -> Result<Option<u32>> {
+        ensure!(!tokens.is_empty(), "Gemma token batch must not be empty");
+        ensure!(
+            self.position + tokens.len() <= self.max_context,
+            "Gemma executor context exhausted"
+        );
+        // Prompt tokens are known before execution. Keep them and their
+        // positions in GPU-visible buffers, then encode the dependent token
+        // forwards into one command buffer. Scratch and KV buffers are reused
+        // in dispatch order; only the final token selection is read back.
+        let runtime = self.model.runtime();
+        let token_batch = runtime.upload_u32(tokens)?;
+        let positions = (self.position..self.position + tokens.len())
+            .map(u32::try_from)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let position_batch = runtime.upload_u32(&positions)?;
+        let rope_pairs = self
+            .model
+            .config
+            .key_length
+            .max(self.model.config.key_length_swa)
+            / 2;
+        let mut full_cos = vec![0.0; tokens.len() * rope_pairs];
+        let mut full_sin = vec![0.0; tokens.len() * rope_pairs];
+        let mut swa_cos = vec![0.0; tokens.len() * rope_pairs];
+        let mut swa_sin = vec![0.0; tokens.len() * rope_pairs];
+        for (batch_index, position) in (self.position..self.position + tokens.len()).enumerate() {
+            for pair in 0..rope_pairs {
+                let full_angle = gemma4_rope_angle(
+                    position,
+                    pair,
+                    self.model.config.rope_dimensions,
+                    self.model.config.rope_theta,
+                    self.rope_freq_factors[pair],
+                );
+                let swa_angle = gemma4_rope_angle(
+                    position,
+                    pair,
+                    self.model.config.rope_dimensions_swa,
+                    self.model.config.rope_theta_swa,
+                    1.0,
+                );
+                full_cos[batch_index * rope_pairs + pair] = full_angle.cos();
+                full_sin[batch_index * rope_pairs + pair] = full_angle.sin();
+                swa_cos[batch_index * rope_pairs + pair] = swa_angle.cos();
+                swa_sin[batch_index * rope_pairs + pair] = swa_angle.sin();
+            }
+        }
+        let full_cos = runtime.upload_f32(&full_cos)?;
+        let full_sin = runtime.upload_f32(&full_sin)?;
+        let swa_cos = runtime.upload_f32(&swa_cos)?;
+        let swa_sin = runtime.upload_f32(&swa_sin)?;
+        let trace_stages = std::env::var_os("ATLAS_GEMMA4_TRACE_STAGES").is_some();
+        let mut command = runtime.begin_resident_command_with_exact_timing(trace_stages)?;
+        for index in 0..tokens.len() {
+            command.dispatch_1d_at(
+                "copy_u32",
+                &[
+                    (&token_batch, index * std::mem::size_of::<u32>()),
+                    (&self.token, 0),
+                    (&self.one, 0),
+                ],
+                1,
+            )?;
+            command.dispatch_1d_at(
+                "copy_u32",
+                &[
+                    (&position_batch, index * std::mem::size_of::<u32>()),
+                    (&self.position_buffer, 0),
+                    (&self.one, 0),
+                ],
+                1,
+            )?;
+            self.encode_current_token(
+                &mut command,
+                index,
+                select_last && index + 1 == tokens.len(),
+                rope_pairs,
+                &full_cos,
+                &full_sin,
+                &swa_cos,
+                &swa_sin,
+            )?;
+            self.position += 1;
+        }
+        command.finish()?;
+        select_last
+            .then(|| runtime.read_u32(&self.selected))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    fn encode_current_token(
+        &mut self,
+        mut command: &mut atlas_metal::ResidentCommand<'_>,
+        batch_index: usize,
+        select_output: bool,
+        rope_pairs: usize,
+        full_cos: &GpuBuffer,
+        full_sin: &GpuBuffer,
+        swa_cos: &GpuBuffer,
+        swa_sin: &GpuBuffer,
+    ) -> Result<()> {
+        ensure!(
+            self.position < self.max_context,
+            "Gemma executor context exhausted"
+        );
         let c = &self.model.config;
         let runtime = self.model.runtime();
         let h = c.hidden_size;
         let ple_total = c.layers * c.per_layer_embedding_size;
-        runtime.write_u32(&self.token, &[token])?;
-        runtime.write_u32(&self.position_buffer, &[u32::try_from(self.position)?])?;
         let trace_stages = std::env::var_os("ATLAS_GEMMA4_TRACE_STAGES").is_some();
         let trace_gelu = trace_stages && std::env::var_os("ATLAS_GEMMA4_TRACE_GELU").is_some();
         let trace_sync = trace_stages && std::env::var_os("ATLAS_GEMMA4_TRACE_SYNC").is_some();
@@ -573,7 +751,6 @@ impl<'a> Gemma4E2bExecutor<'a> {
         let per_layer_embd = self.weight("per_layer_token_embd.weight", GgufTensorType::Q6K)?;
         let per_layer_proj = self.weight("per_layer_model_proj.weight", GgufTensorType::F16)?;
         let per_layer_norm = self.weight("per_layer_proj_norm.weight", GgufTensorType::F32)?;
-        let mut command = runtime.begin_resident_command_with_exact_timing(trace_sync)?;
         command.dispatch_1d(
             "embedding_lookup_q6_k",
             &[
@@ -604,7 +781,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 1,
             )?;
         }
-        let ple_total_buffer = runtime.upload_u32(&[u32::try_from(ple_total)?])?;
+        let ple_total_buffer = &self.ple_total;
         command.dispatch_1d(
             "embedding_lookup_q6_k",
             &[
@@ -669,6 +846,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
             &per_layer_proj,
             &self.ple_projected,
             &self.hidden,
+            &self.ple_total,
             ple_total,
             GgufTensorType::F16,
         )?;
@@ -781,7 +959,17 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 c.key_length
             };
             let q_width = c.attention_heads * head;
-            self.write_rope(sliding)?;
+            let q_width_buffer = if sliding {
+                &self.q_width_swa
+            } else {
+                &self.q_width_full
+            };
+            let rope_offset = batch_index * rope_pairs * std::mem::size_of::<f32>();
+            let (cos, sin) = if sliding {
+                (swa_cos, swa_sin)
+            } else {
+                (full_cos, full_sin)
+            };
             let head_width = if sliding {
                 &self.head_swa
             } else {
@@ -808,10 +996,10 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 &wq,
                 &self.q,
                 &self.hidden,
+                q_width_buffer,
                 q_width,
                 GgufTensorType::Q4_0,
             )?;
-            let q_width_buffer = runtime.upload_u32(&[u32::try_from(q_width)?])?;
             command.dispatch_1d(
                 "rms_norm_groups_in_place_f32",
                 &[&self.q, &q_norm, head_width, &self.heads, &self.epsilon],
@@ -822,14 +1010,14 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 &[&self.q, &self.rope_input, &self.heads, head_width],
                 q_width / 2,
             )?;
-            command.dispatch_1d(
+            command.dispatch_1d_at(
                 "rope_f32",
                 &[
-                    &self.rope_input,
-                    &self.rope_cos,
-                    &self.rope_sin,
-                    &self.rope_output,
-                    head_width,
+                    (&self.rope_input, 0),
+                    (cos, rope_offset),
+                    (sin, rope_offset),
+                    (&self.rope_output, 0),
+                    (head_width, 0),
                 ],
                 q_width / 2,
             )?;
@@ -850,6 +1038,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
                     &wk,
                     &self.k,
                     &self.hidden,
+                    head_width,
                     head,
                     GgufTensorType::Q4_0,
                 )?;
@@ -859,6 +1048,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
                     &wv,
                     &self.v,
                     &self.hidden,
+                    head_width,
                     head,
                     GgufTensorType::Q4_0,
                 )?;
@@ -877,14 +1067,14 @@ impl<'a> Gemma4E2bExecutor<'a> {
                     &[&self.k, &self.rope_input, &self.one, head_width],
                     head / 2,
                 )?;
-                command.dispatch_1d(
+                command.dispatch_1d_at(
                     "rope_f32",
                     &[
-                        &self.rope_input,
-                        &self.rope_cos,
-                        &self.rope_sin,
-                        &self.rope_output,
-                        head_width,
+                        (&self.rope_input, 0),
+                        (cos, rope_offset),
+                        (sin, rope_offset),
+                        (&self.rope_output, 0),
+                        (head_width, 0),
                     ],
                     head / 2,
                 )?;
@@ -935,7 +1125,8 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 &self.attention,
                 &wo,
                 &self.work,
-                &q_width_buffer,
+                q_width_buffer,
+                &self.hidden,
                 h,
                 GgufTensorType::Q4_0,
             )?;
@@ -1002,7 +1193,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 32,
             )?;
             let ffn = c.feed_forward_sizes[layer];
-            let ffn_buffer = runtime.upload_u32(&[u32::try_from(ffn)?])?;
+            let ffn_buffer = &self.ffn_widths[layer];
             let gate = self.weight(&format!("{p}.ffn_gate.weight"), GgufTensorType::Q4_0)?;
             let up = self.weight(&format!("{p}.ffn_up.weight"), GgufTensorType::Q4_0)?;
             let down = self.weight(&format!("{p}.ffn_down.weight"), GgufTensorType::Q4_0)?;
@@ -1012,6 +1203,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 &gate,
                 &self.gate,
                 &self.hidden,
+                ffn_buffer,
                 ffn,
                 GgufTensorType::Q4_0,
             )?;
@@ -1048,6 +1240,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 &up,
                 &self.up,
                 &self.hidden,
+                ffn_buffer,
                 ffn,
                 GgufTensorType::Q4_0,
             )?;
@@ -1141,7 +1334,8 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 &self.product,
                 &down,
                 &self.work,
-                &ffn_buffer,
+                ffn_buffer,
+                &self.hidden,
                 h,
                 GgufTensorType::Q4_0,
             )?;
@@ -1191,6 +1385,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 &inp_gate,
                 &self.gate,
                 &self.hidden,
+                &self.ple_width,
                 c.per_layer_embedding_size,
                 GgufTensorType::Q4_0,
             )?;
@@ -1228,8 +1423,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 )?;
             }
             // Current layer PLE is a contiguous [256] slice in the resident [layer][width] table.
-            let ple_offset =
-                runtime.upload_u32(&[u32::try_from(layer * c.per_layer_embedding_size)?])?;
+            let ple_offset = &self.ple_offsets[layer];
             command.dispatch_1d(
                 "vector_multiply_offset_f32",
                 &[
@@ -1261,6 +1455,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 &projection,
                 &self.work,
                 &self.ple_width,
+                &self.hidden,
                 h,
                 GgufTensorType::Q4_0,
             )?;
@@ -1319,6 +1514,9 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 )?;
             }
         }
+        if !select_output {
+            return Ok(());
+        }
         let output_norm = self.weight("output_norm.weight", GgufTensorType::F32)?;
         command.dispatch_threadgroups_1d(
             "rms_norm_decode_f32",
@@ -1338,6 +1536,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
             &token_embd,
             &self.logits,
             &self.hidden,
+            &self.vocab,
             c.vocab_size,
             GgufTensorType::Q6K,
         )?;
@@ -1370,8 +1569,6 @@ impl<'a> Gemma4E2bExecutor<'a> {
         } else {
             String::new()
         };
-        command.finish()?;
-        self.position += 1;
         if trace_stages {
             let marker = runtime.read_u32(&self.validity)?;
             if marker != u32::MAX {
@@ -1442,13 +1639,23 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 );
             }
         }
-        Ok(runtime.read_u32(&self.selected)?)
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{gemma4_rope_angle, gemma4_should_finish};
+    use super::{Gemma4PrefillPlan, gemma4_rope_angle, gemma4_should_finish};
+
+    #[test]
+    fn prefill_plan_batches_short_prompts_and_bounds_long_prompts() {
+        let short = Gemma4PrefillPlan::new(10, 4096).unwrap();
+        assert_eq!((short.chunk_size, short.chunks), (10, 1));
+        let long = Gemma4PrefillPlan::new(300, 4096).unwrap();
+        assert_eq!((long.chunk_size, long.chunks), (128, 3));
+        assert!(Gemma4PrefillPlan::new(0, 4096).is_err());
+        assert!(Gemma4PrefillPlan::new(4097, 4096).is_err());
+    }
 
     #[test]
     fn gemma4_rope_honors_proportional_factors_and_partial_rotary_width() {

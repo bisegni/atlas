@@ -876,7 +876,7 @@ fn run_gemma4_turn(
 fn emit_gemma4_metrics(selection: &ModelSelection, generation: &Gemma4Generation) -> Result<()> {
     eprintln!(
         "{}",
-        json!({"event":"generation_metrics","model_id":selection.id,"executor":"resident","format":"gguf-gemma4-q4_0","finish_reason":gemma4_finish_reason(generation.finish_reason),"resident_bytes":generation.metrics.resident_bytes,"weight_upload_bytes":generation.metrics.weight_upload_bytes,"readback_bytes":generation.metrics.readback_bytes,"command_buffers":generation.metrics.command_buffers,"prefill_command_buffers":generation.metrics.prefill_command_buffers,"decode_command_buffers":generation.metrics.decode_command_buffers,"prefill_tok_s":gemma4_prefill_tokens_per_second(generation),"decode_tok_s":gemma4_decode_tokens_per_second(generation),"timing":{"prefill_ms":generation.metrics.prefill.as_secs_f64()*1000.0,"decode_ms":generation.metrics.decode.as_secs_f64()*1000.0,"host_ms":generation.metrics.host_wall_time.as_secs_f64()*1000.0}})
+        json!({"event":"generation_metrics","model_id":selection.id,"executor":"resident","format":"gguf-gemma4-q4_0","finish_reason":gemma4_finish_reason(generation.finish_reason),"resident_bytes":generation.metrics.resident_bytes,"weight_upload_bytes":generation.metrics.weight_upload_bytes,"readback_bytes":generation.metrics.readback_bytes,"command_buffers":generation.metrics.command_buffers,"prefill_command_buffers":generation.metrics.prefill_command_buffers,"decode_command_buffers":generation.metrics.decode_command_buffers,"prefill_path":generation.metrics.prefill_path,"prefill_chunk_size":generation.metrics.prefill_chunk_size,"prompt_tokens":generation.generation.prompt_token_ids.len(),"generated_tokens":generation.generation.generated_token_ids.len(),"prefill_tok_s":gemma4_prefill_tokens_per_second(generation),"decode_tok_s":gemma4_decode_tokens_per_second(generation),"timing":{"prefill_ms":generation.metrics.prefill.as_secs_f64()*1000.0,"decode_ms":generation.metrics.decode.as_secs_f64()*1000.0,"host_ms":generation.metrics.host_wall_time.as_secs_f64()*1000.0}})
     );
     Ok(())
 }
@@ -888,7 +888,7 @@ fn append_gemma4_performance_record(
 ) -> Result<()> {
     append_jsonl_record(
         Path::new(CHAT_PERFORMANCE_LOG),
-        &json!({"model_id":selection.id,"executor":"resident","format":"gguf-gemma4-q4_0","prompt_tokens":generation.generation.prompt_token_ids.len(),"generated_tokens":generation.generation.generated_token_ids.len(),"finish_reason":gemma4_finish_reason(generation.finish_reason),"visible_chars":visible.chars().count(),"prefill_tok_s":gemma4_prefill_tokens_per_second(generation),"decode_tok_s":gemma4_decode_tokens_per_second(generation),"resident_bytes":generation.metrics.resident_bytes,"weight_upload_bytes":generation.metrics.weight_upload_bytes,"readback_bytes":generation.metrics.readback_bytes,"command_buffers":generation.metrics.command_buffers}),
+        &json!({"model_id":selection.id,"executor":"resident","format":"gguf-gemma4-q4_0","prompt_tokens":generation.generation.prompt_token_ids.len(),"generated_tokens":generation.generation.generated_token_ids.len(),"finish_reason":gemma4_finish_reason(generation.finish_reason),"visible_chars":visible.chars().count(),"prefill_tok_s":gemma4_prefill_tokens_per_second(generation),"decode_tok_s":gemma4_decode_tokens_per_second(generation),"host_ms":generation.metrics.host_wall_time.as_secs_f64()*1000.0,"resident_bytes":generation.metrics.resident_bytes,"weight_upload_bytes":generation.metrics.weight_upload_bytes,"readback_bytes":generation.metrics.readback_bytes,"command_buffers":generation.metrics.command_buffers,"prefill_command_buffers":generation.metrics.prefill_command_buffers,"decode_command_buffers":generation.metrics.decode_command_buffers,"prefill_path":generation.metrics.prefill_path,"prefill_chunk_size":generation.metrics.prefill_chunk_size}),
     )?;
     eprintln!("chat performance log: {CHAT_PERFORMANCE_LOG}");
     Ok(())
@@ -1441,6 +1441,8 @@ mod phase_07_tests {
                 prefill: Duration::from_millis(20),
                 decode: Duration::from_millis(10),
                 host_wall_time: Duration::from_millis(30),
+                prefill_path: "resident_chunked_command",
+                prefill_chunk_size: 4,
             },
             finish_reason: Gemma4FinishReason::Eos,
         };
@@ -2663,17 +2665,20 @@ fn model_download(args: &[String]) -> Result<()> {
         "unsupported provider model ID"
     );
     let manifest = load_manifest()?;
-    ensure!(
-        !manifest.models.iter().any(|model| model.id == id),
-        "model ID `{id}` already exists"
+    let existing = manifest.models.into_iter().find(|model| model.id == id);
+    let destination = existing.as_ref().map_or_else(
+        || Path::new("models/hf").join(&id),
+        |model| model.path.clone(),
     );
-    let destination = Path::new("models/hf").join(&id);
     ensure!(
         !destination.exists(),
         "model destination already exists: {}",
         destination.display()
     );
-    let staging = Path::new("models/hf").join(format!(".{id}.staging-{}", std::process::id()));
+    let staging = destination
+        .parent()
+        .unwrap_or_else(|| Path::new("models/hf"))
+        .join(format!(".{id}.staging-{}", std::process::id()));
     ensure!(
         !staging.exists(),
         "model staging directory already exists: {}",
@@ -2681,21 +2686,24 @@ fn model_download(args: &[String]) -> Result<()> {
     );
     let result = (|| -> Result<()> {
         let downloaded = providers::download_hugging_face(candidate, &staging, allow_auth)?;
+        if let Some(record) = &existing {
+            ensure!(
+                downloaded.repository == record.source && downloaded.revision == record.revision,
+                "download candidate does not match pinned manifest source/revision for `{id}`"
+            );
+        }
         let gguf_file = downloaded
             .files
             .iter()
             .find(|file| file.ends_with(".gguf"))
             .cloned();
-        let format = if let Some(file) = gguf_file {
-            fs::rename(staging.join(file), staging.join("model.gguf"))?;
-            let gguf = GgufModel::open(staging.join("model.gguf"))?;
-            ensure!(
-                gguf.metadata
-                    .get("general.architecture")
-                    .map(String::as_str)
-                    == Some("llama"),
-                "GGUF architecture is not Llama"
-            );
+        let (format, kind, model_file) = if let Some(file) = gguf_file {
+            let source_path = staging.join(&file);
+            let gguf = GgufModel::open(&source_path)?;
+            let architecture = gguf
+                .metadata
+                .get("general.architecture")
+                .map(String::as_str);
             let has_q4 = gguf
                 .tensors
                 .iter()
@@ -2704,6 +2712,10 @@ fn model_download(args: &[String]) -> Result<()> {
                 .tensors
                 .iter()
                 .any(|tensor| tensor.tensor_type == GgufTensorType::Q8_0);
+            let has_q6 = gguf
+                .tensors
+                .iter()
+                .any(|tensor| tensor.tensor_type == GgufTensorType::Q6K);
             let q4_only = gguf.tensors.iter().all(|tensor| {
                 matches!(
                     tensor.tensor_type,
@@ -2716,12 +2728,32 @@ fn model_download(args: &[String]) -> Result<()> {
                     GgufTensorType::Q8_0 | GgufTensorType::F32
                 )
             });
-            if q4_only && has_q4 {
-                "gguf-q4_0"
-            } else if q8_only && has_q8 {
-                "gguf-q8_0"
+            if architecture == Some("gemma4") {
+                ensure!(
+                    has_q4
+                        && has_q6
+                        && gguf.tensors.iter().all(|tensor| matches!(
+                            tensor.tensor_type,
+                            GgufTensorType::Q4_0
+                                | GgufTensorType::Q6K
+                                | GgufTensorType::F16
+                                | GgufTensorType::F32
+                        )),
+                    "Gemma 4 GGUF contains unsupported tensor encodings"
+                );
+                (
+                    "gguf-gemma4-q4_0",
+                    ManifestModelKind::Gemma4E2b,
+                    Some(PathBuf::from(file)),
+                )
+            } else if architecture == Some("llama") && q4_only && has_q4 {
+                fs::rename(source_path, staging.join("model.gguf"))?;
+                ("gguf-q4_0", ManifestModelKind::Llama, None)
+            } else if architecture == Some("llama") && q8_only && has_q8 {
+                fs::rename(source_path, staging.join("model.gguf"))?;
+                ("gguf-q8_0", ManifestModelKind::Llama, None)
             } else {
-                bail!("GGUF contains mixed or unsupported tensor encodings")
+                bail!("GGUF architecture or tensor encodings are unsupported")
             }
         } else {
             fixture_details(&staging)?;
@@ -2741,26 +2773,43 @@ fn model_download(args: &[String]) -> Result<()> {
                     );
                 }
             }
-            "safetensors-fp32"
+            ("safetensors-fp32", ManifestModelKind::Llama, None)
         };
-        fs::rename(&staging, &destination)?;
-        if let Err(error) = register_download_manifest(
-            &id,
-            &downloaded.repository,
-            &downloaded.revision,
-            &destination,
-            format,
-        ) {
-            let _ = fs::remove_dir_all(&destination);
-            return Err(error);
+        if let Some(record) = &existing {
+            ensure!(
+                record.format == format && record.manifest_kind()? == kind,
+                "downloaded artifact does not match pinned manifest contract for `{id}`"
+            );
+            ensure!(
+                kind != ManifestModelKind::Gemma4E2b || record.model_file == model_file,
+                "downloaded Gemma artifact filename does not match pinned manifest contract for `{id}`"
+            );
         }
-        verify_manifest_model(
-            &load_manifest()?
-                .models
-                .into_iter()
-                .find(|record| record.id == id)
-                .context("registered model missing from manifest")?,
-        )?;
+        fs::rename(&staging, &destination)?;
+        if existing.is_none() {
+            if let Err(error) = register_download_manifest(
+                &id,
+                &downloaded.repository,
+                &downloaded.revision,
+                &destination,
+                format,
+                kind,
+                model_file.as_deref(),
+            ) {
+                let _ = fs::remove_dir_all(&destination);
+                return Err(error);
+            }
+        }
+        let verification = load_manifest()?
+            .models
+            .into_iter()
+            .find(|record| record.id == id)
+            .context("registered model missing from manifest")
+            .and_then(|record| verify_manifest_model(&record));
+        if let Err(error) = verification {
+            let _ = fs::remove_dir_all(&destination);
+            return Err(error.context("downloaded model failed manifest verification"));
+        }
         println!(
             "{}",
             json!({"event":"model_downloaded","provider":"huggingface","model_id":id,"source":downloaded.repository,"revision":downloaded.revision,"format":format,"path":destination})
@@ -2779,14 +2828,24 @@ fn register_download_manifest(
     revision: &str,
     directory: &Path,
     format: &str,
+    kind: ManifestModelKind,
+    model_file: Option<&Path>,
 ) -> Result<()> {
     let files: Vec<String> = fs::read_dir(directory)?
         .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
         .collect::<std::io::Result<_>>()?;
-    ensure!(
-        files.contains(&"config.json".into()) && files.contains(&"tokenizer.json".into()),
-        "download is missing config.json or tokenizer.json"
-    );
+    if kind == ManifestModelKind::Llama {
+        ensure!(
+            files.contains(&"config.json".into()) && files.contains(&"tokenizer.json".into()),
+            "download is missing config.json or tokenizer.json"
+        );
+    } else {
+        let model_file = model_file.context("Gemma download is missing its GGUF filename")?;
+        ensure!(
+            files.iter().any(|file| Path::new(file) == model_file),
+            "Gemma download is missing its selected GGUF"
+        );
+    }
     let mut text = fs::read_to_string(MODEL_MANIFEST)?;
     let bytes: u64 = files
         .iter()
@@ -2794,7 +2853,16 @@ fn register_download_manifest(
         .collect::<std::io::Result<Vec<_>>>()?
         .into_iter()
         .sum();
-    text.push_str(&format!("\n[[models]]\nid = \"{id}\"\nsource = \"{source}\"\nrevision = \"{revision}\"\npath = \"{}\"\narchitecture = \"LlamaForCausalLM\"\ntokenizer = \"tokenizer.json\"\nformat = \"{format}\"\nbytes = {bytes}\n", directory.display()));
+    let contract = match kind {
+        ManifestModelKind::Llama => {
+            "architecture = \"LlamaForCausalLM\"\ntokenizer = \"tokenizer.json\"\n".to_owned()
+        }
+        ManifestModelKind::Gemma4E2b => format!(
+            "architecture = \"gemma4\"\ntokenizer = \"embedded\"\nembedded_tokenizer = true\nmodel_file = \"{}\"\n",
+            model_file.expect("Gemma model file was checked").display()
+        ),
+    };
+    text.push_str(&format!("\n[[models]]\nid = \"{id}\"\nsource = \"{source}\"\nrevision = \"{revision}\"\npath = \"{}\"\n{contract}format = \"{format}\"\nbytes = {bytes}\n", directory.display()));
     for file in files {
         let path = directory.join(&file);
         text.push_str(&format!(

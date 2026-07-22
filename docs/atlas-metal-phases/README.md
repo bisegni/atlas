@@ -26,7 +26,7 @@ cross-phase exit rules.
 | 11c | [Model providers and Hugging Face discovery]([done]%20phase-11c-model-providers.md) |
 | 12 | [Quantized CLI acceptance]([done]%20phase-12-quantized-cli-acceptance.md) |
 | 12a-pre | [Gemma 4 E2B resident text-generation foundation]([done]%20phase-12a-pre-gemma4-e2b-text-generation.md) |
-| 12a-perf | [Gemma 4 Resident performance remediation](phase-12a-perf-gemma4-resident-performance.md) |
+| 12a-perf | [Gemma 4 Resident performance remediation](phase-12a-perf-gemma4-resident-performance.md) — open; see [next implementation strategies](phase-12a-perf-gemma4-resident-performance.md#next-implementation-strategies) |
 | 12.1 | [Resident decode performance remediation](phase-12a-resident-decode-performance.md) |
 | 12b | [Gemma 4 agentic tools](phase-12b-gemma4-agentic-tools.md) |
 | 13 | [Atlas local attention](phase-13-local-attention.md) |
