@@ -245,7 +245,7 @@ fn provider_command(args: &[String]) -> Result<()> {
 fn runtime_command(args: &[String]) -> Result<()> {
     CHAT_INTERRUPTED.store(false, Ordering::Release);
     install_chat_sigint_handler();
-    let (model_args, prompt, max_tokens, mode, show_thoughts) = parse_chat_args(args)?;
+    let (model_args, prompt, token_limit, mode, show_thoughts) = parse_chat_args(args)?;
     ensure!(
         !show_thoughts,
         "--show-thoughts is only valid for Gemma 4 chat"
@@ -257,10 +257,13 @@ fn runtime_command(args: &[String]) -> Result<()> {
     let prompt = prompt.context("atlas runtime requires --prompt")?;
     let selection = resolve_model(&model_args)?;
     let model = AtlasModel::load(&selection.directory)?;
-    let mut runtime = AtlasRuntime::new(&model, RuntimeConfig::default())?;
+    let runtime_config = RuntimeConfig::default();
+    let prompt_tokens = model.tokenize(&prompt)?.len();
+    let resolved_limit = token_limit.resolve(prompt_tokens, runtime_config.max_context)?;
+    let mut runtime = AtlasRuntime::new(&model, runtime_config)?;
     let session = runtime.submit(RuntimeRequest {
         prompt,
-        max_new_tokens: max_tokens,
+        max_new_tokens: resolved_limit.max_new_tokens,
         sampling: SamplingConfig::default(),
     })?;
     let mut stdout = io::stdout();
@@ -300,6 +303,8 @@ fn runtime_command(args: &[String]) -> Result<()> {
             "queue_wait_ms": completion.metrics.queue_wait.as_millis(),
             "ttft_ms": completion.metrics.executor.ttft.as_millis(),
             "decode_tokens": completion.metrics.executor.decode_tokens,
+            "max_new_tokens": resolved_limit.max_new_tokens,
+            "token_limit_source": resolved_limit.source,
             "cache_resident_bytes": completion.metrics.executor.resident_bytes,
             "cancelled": completion.metrics.cancelled,
             "error": completion.metrics.error,
@@ -311,12 +316,12 @@ fn runtime_command(args: &[String]) -> Result<()> {
 fn chat(args: &[String]) -> Result<()> {
     CHAT_INTERRUPTED.store(false, Ordering::Release);
     install_chat_sigint_handler();
-    let (model_args, prompt, max_tokens, mode, show_thoughts) = parse_chat_args(args)?;
+    let (model_args, prompt, token_limit, mode, show_thoughts) = parse_chat_args(args)?;
     let selection = resolve_model(&model_args)?;
     let model = match load_verified_model(&selection)? {
         LoadedModel::Llama(model) => model,
         LoadedModel::Gemma4E2b(model) => {
-            return gemma4_chat(&model, prompt, max_tokens, show_thoughts, &selection);
+            return gemma4_chat(&model, prompt, token_limit, show_thoughts, &selection);
         }
     };
     ensure!(
@@ -328,16 +333,16 @@ fn chat(args: &[String]) -> Result<()> {
     }
     if let Some(prompt) = prompt {
         let mut turn_metrics = ChatTurnMetrics::new();
-        print_completion(
+        let (result, resolved_limit) = print_completion(
             &model,
             &prompt,
-            max_tokens,
+            token_limit,
             mode,
             &selection.id,
             selection.manifest.as_ref().map_or(0, |record| record.bytes),
             &mut turn_metrics,
-        )
-        .and_then(|result| append_chat_performance_record(&selection.id, &model, mode, &result))?;
+        )?;
+        append_chat_performance_record(&selection.id, &model, mode, &result, resolved_limit)?;
         return Ok(());
     }
     eprintln!("Atlas chat. Commands: /reset, /help, /quit");
@@ -380,10 +385,10 @@ fn chat(args: &[String]) -> Result<()> {
             }
         }
         let mut turn_metrics = ChatTurnMetrics::new();
-        let result = match print_completion(
+        let (result, resolved_limit) = match print_completion(
             &model,
             &history,
-            max_tokens,
+            token_limit,
             mode,
             &selection.id,
             selection.manifest.as_ref().map_or(0, |record| record.bytes),
@@ -397,7 +402,7 @@ fn chat(args: &[String]) -> Result<()> {
             }
             Err(error) => return Err(error),
         };
-        append_chat_performance_record(&selection.id, &model, mode, &result)?;
+        append_chat_performance_record(&selection.id, &model, mode, &result, resolved_limit)?;
         session_metrics.record(&turn_metrics);
         history.push_str(&model.decode(&result.generation.generated_token_ids)?);
         history.push('\n');
@@ -453,25 +458,29 @@ impl ChatTurnMetrics {
 fn print_completion(
     model: &AtlasModel,
     prompt: &str,
-    max_tokens: usize,
+    token_limit: ChatTokenLimit,
     mode: ExecutorMode,
     model_id: &str,
     model_bytes: u64,
     turn_metrics: &mut ChatTurnMetrics,
-) -> Result<ExecutorGeneration> {
-    let mut executor = AtlasExecutor::new(
-        model,
-        ExecutorConfig {
-            mode,
-            ..Default::default()
-        },
-    )?;
+) -> Result<(ExecutorGeneration, ResolvedTokenLimit)> {
+    let config = ExecutorConfig {
+        mode,
+        ..Default::default()
+    };
+    let prompt_tokens = model.tokenize(prompt)?.len();
+    let resolved_limit = token_limit.resolve(prompt_tokens, config.max_context)?;
+    let mut executor = AtlasExecutor::new(model, config)?;
     let mut stdout = io::stdout();
-    let result =
-        executor.generate_greedy_stream(prompt, max_tokens, &CHAT_INTERRUPTED, |event| {
+    let result = executor.generate_greedy_stream(
+        prompt,
+        resolved_limit.max_new_tokens,
+        &CHAT_INTERRUPTED,
+        |event| {
             turn_metrics.record_event(&event);
             write_stream_event(&mut stdout, &event)
-        })?;
+        },
+    )?;
     writeln!(stdout)?;
     stdout.flush()?;
     eprintln!(
@@ -483,6 +492,8 @@ fn print_completion(
             "format": model.format_name(),
             "model_bytes": model_bytes,
             "finish_reason": format!("{:?}", result.finish_reason).to_lowercase(),
+            "max_new_tokens": resolved_limit.max_new_tokens,
+            "token_limit_source": resolved_limit.source,
             "resident_bytes": result.metrics.resident_bytes,
             "weight_upload_bytes": result.metrics.weight_upload_bytes,
             "readback_bytes": result.metrics.readback_bytes,
@@ -491,7 +502,7 @@ fn print_completion(
             "decode_tok_s": result.metrics.decode_tokens_per_second(),
         })
     );
-    Ok(result)
+    Ok((result, resolved_limit))
 }
 
 fn print_gemma4_generation(
@@ -549,7 +560,7 @@ fn print_gemma4_generation(
 fn gemma4_chat(
     model: &Gemma4E2bModel,
     prompt: Option<String>,
-    max_tokens: usize,
+    token_limit: ChatTokenLimit,
     show_thoughts: bool,
     selection: &ModelSelection,
 ) -> Result<()> {
@@ -562,7 +573,7 @@ fn gemma4_chat(
             model,
             &mut executor,
             &messages,
-            max_tokens,
+            token_limit,
             show_thoughts,
             selection,
             &mut session,
@@ -598,12 +609,12 @@ fn gemma4_chat(
                 messages.push(Gemma4ChatMessage::new(Gemma4ChatRole::User, text))
             }
         }
-        compact_gemma4_history(model, &mut executor, &mut messages, max_tokens, selection)?;
+        compact_gemma4_history(model, &mut executor, &mut messages, token_limit, selection)?;
         match run_gemma4_turn(
             model,
             &mut executor,
             &messages,
-            max_tokens,
+            token_limit,
             show_thoughts,
             selection,
             &mut session,
@@ -623,10 +634,13 @@ fn compact_gemma4_history(
     model: &Gemma4E2bModel,
     executor: &mut Gemma4E2bExecutor<'_>,
     messages: &mut Vec<Gemma4ChatMessage>,
-    response_budget: usize,
+    token_limit: ChatTokenLimit,
     selection: &ModelSelection,
 ) -> Result<()> {
-    while model.tokenize(&render_gemma4_chat(messages)?)?.len() + response_budget > 4096 {
+    while model.tokenize(&render_gemma4_chat(messages)?)?.len()
+        + token_limit.minimum_response_budget()
+        > 4096
+    {
         let offset = usize::from(
             messages
                 .first()
@@ -833,23 +847,21 @@ fn run_gemma4_turn(
     model: &Gemma4E2bModel,
     executor: &mut Gemma4E2bExecutor<'_>,
     messages: &[Gemma4ChatMessage],
-    max_tokens: usize,
+    token_limit: ChatTokenLimit,
     show_thoughts: bool,
     selection: &ModelSelection,
     session: &mut ChatSessionMetrics,
 ) -> Result<String> {
     let rendered = render_gemma4_chat(messages)?;
-    ensure!(
-        model.tokenize(&rendered)?.len() + max_tokens <= 4096,
-        "Gemma chat turn exceeds the 4096-token context limit"
-    );
+    let prompt_tokens = model.tokenize(&rendered)?.len();
+    let resolved_limit = token_limit.resolve(prompt_tokens, 4096)?;
     print!("model> ");
     io::stdout().flush()?;
     let mut filter = ThoughtFilter::default();
     let mut count = 0usize;
     let generation = executor.generate_greedy_chat_stream(
         &rendered,
-        max_tokens,
+        resolved_limit.max_new_tokens,
         &CHAT_INTERRUPTED,
         |event| {
             count += 1;
@@ -865,18 +877,22 @@ fn run_gemma4_turn(
     if show_thoughts && !thoughts.is_empty() {
         eprintln!("thought> {thoughts}");
     }
-    emit_gemma4_metrics(selection, &generation)?;
-    append_gemma4_performance_record(selection, &generation, &visible)?;
+    emit_gemma4_metrics(selection, &generation, resolved_limit)?;
+    append_gemma4_performance_record(selection, &generation, &visible, resolved_limit)?;
     session.turns += 1;
     session.generated_tokens += count;
     session.active_turn_time += generation.metrics.host_wall_time;
     Ok(visible)
 }
 
-fn emit_gemma4_metrics(selection: &ModelSelection, generation: &Gemma4Generation) -> Result<()> {
+fn emit_gemma4_metrics(
+    selection: &ModelSelection,
+    generation: &Gemma4Generation,
+    resolved_limit: ResolvedTokenLimit,
+) -> Result<()> {
     eprintln!(
         "{}",
-        json!({"event":"generation_metrics","model_id":selection.id,"executor":"resident","format":"gguf-gemma4-q4_0","finish_reason":gemma4_finish_reason(generation.finish_reason),"resident_bytes":generation.metrics.resident_bytes,"weight_upload_bytes":generation.metrics.weight_upload_bytes,"readback_bytes":generation.metrics.readback_bytes,"command_buffers":generation.metrics.command_buffers,"prefill_command_buffers":generation.metrics.prefill_command_buffers,"decode_command_buffers":generation.metrics.decode_command_buffers,"prefill_path":generation.metrics.prefill_path,"prefill_chunk_size":generation.metrics.prefill_chunk_size,"prompt_tokens":generation.generation.prompt_token_ids.len(),"generated_tokens":generation.generation.generated_token_ids.len(),"prefill_tok_s":gemma4_prefill_tokens_per_second(generation),"decode_tok_s":gemma4_decode_tokens_per_second(generation),"timing":{"prefill_ms":generation.metrics.prefill.as_secs_f64()*1000.0,"decode_ms":generation.metrics.decode.as_secs_f64()*1000.0,"host_ms":generation.metrics.host_wall_time.as_secs_f64()*1000.0}})
+        json!({"event":"generation_metrics","model_id":selection.id,"executor":"resident","format":"gguf-gemma4-q4_0","finish_reason":gemma4_finish_reason(generation.finish_reason),"max_new_tokens":resolved_limit.max_new_tokens,"token_limit_source":resolved_limit.source,"resident_bytes":generation.metrics.resident_bytes,"weight_upload_bytes":generation.metrics.weight_upload_bytes,"readback_bytes":generation.metrics.readback_bytes,"command_buffers":generation.metrics.command_buffers,"prefill_command_buffers":generation.metrics.prefill_command_buffers,"decode_command_buffers":generation.metrics.decode_command_buffers,"prefill_path":generation.metrics.prefill_path,"prefill_chunk_size":generation.metrics.prefill_chunk_size,"prompt_tokens":generation.generation.prompt_token_ids.len(),"generated_tokens":generation.generation.generated_token_ids.len(),"prefill_tok_s":gemma4_prefill_tokens_per_second(generation),"decode_tok_s":gemma4_decode_tokens_per_second(generation),"timing":{"prefill_ms":generation.metrics.prefill.as_secs_f64()*1000.0,"decode_ms":generation.metrics.decode.as_secs_f64()*1000.0,"host_ms":generation.metrics.host_wall_time.as_secs_f64()*1000.0}})
     );
     Ok(())
 }
@@ -885,10 +901,11 @@ fn append_gemma4_performance_record(
     selection: &ModelSelection,
     generation: &Gemma4Generation,
     visible: &str,
+    resolved_limit: ResolvedTokenLimit,
 ) -> Result<()> {
     append_jsonl_record(
         Path::new(CHAT_PERFORMANCE_LOG),
-        &json!({"model_id":selection.id,"executor":"resident","format":"gguf-gemma4-q4_0","prompt_tokens":generation.generation.prompt_token_ids.len(),"generated_tokens":generation.generation.generated_token_ids.len(),"finish_reason":gemma4_finish_reason(generation.finish_reason),"visible_chars":visible.chars().count(),"prefill_tok_s":gemma4_prefill_tokens_per_second(generation),"decode_tok_s":gemma4_decode_tokens_per_second(generation),"host_ms":generation.metrics.host_wall_time.as_secs_f64()*1000.0,"resident_bytes":generation.metrics.resident_bytes,"weight_upload_bytes":generation.metrics.weight_upload_bytes,"readback_bytes":generation.metrics.readback_bytes,"command_buffers":generation.metrics.command_buffers,"prefill_command_buffers":generation.metrics.prefill_command_buffers,"decode_command_buffers":generation.metrics.decode_command_buffers,"prefill_path":generation.metrics.prefill_path,"prefill_chunk_size":generation.metrics.prefill_chunk_size}),
+        &json!({"model_id":selection.id,"executor":"resident","format":"gguf-gemma4-q4_0","prompt_tokens":generation.generation.prompt_token_ids.len(),"generated_tokens":generation.generation.generated_token_ids.len(),"finish_reason":gemma4_finish_reason(generation.finish_reason),"max_new_tokens":resolved_limit.max_new_tokens,"token_limit_source":resolved_limit.source,"visible_chars":visible.chars().count(),"prefill_tok_s":gemma4_prefill_tokens_per_second(generation),"decode_tok_s":gemma4_decode_tokens_per_second(generation),"host_ms":generation.metrics.host_wall_time.as_secs_f64()*1000.0,"resident_bytes":generation.metrics.resident_bytes,"weight_upload_bytes":generation.metrics.weight_upload_bytes,"readback_bytes":generation.metrics.readback_bytes,"command_buffers":generation.metrics.command_buffers,"prefill_command_buffers":generation.metrics.prefill_command_buffers,"decode_command_buffers":generation.metrics.decode_command_buffers,"prefill_path":generation.metrics.prefill_path,"prefill_chunk_size":generation.metrics.prefill_chunk_size}),
     )?;
     eprintln!("chat performance log: {CHAT_PERFORMANCE_LOG}");
     Ok(())
@@ -988,6 +1005,7 @@ fn chat_performance_record(
     model: &AtlasModel,
     mode: ExecutorMode,
     result: &ExecutorGeneration,
+    resolved_limit: ResolvedTokenLimit,
 ) -> Result<Value> {
     let timestamp_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1001,6 +1019,8 @@ fn chat_performance_record(
         "prompt_tokens": result.generation.prompt_token_ids.len(),
         "generated_tokens": result.generation.generated_token_ids.len(),
         "finish_reason": format!("{:?}", result.finish_reason).to_lowercase(),
+        "max_new_tokens": resolved_limit.max_new_tokens,
+        "token_limit_source": resolved_limit.source,
         "ttft_ms": result.metrics.ttft.as_secs_f64() * 1000.0,
         "prefill_tok_s": result.metrics.prefill_tokens_per_second(),
         "decode_tok_s": result.metrics.decode_tokens_per_second(),
@@ -1034,11 +1054,12 @@ fn append_chat_performance_record(
     model: &AtlasModel,
     mode: ExecutorMode,
     result: &ExecutorGeneration,
+    resolved_limit: ResolvedTokenLimit,
 ) -> Result<()> {
     let path = Path::new(CHAT_PERFORMANCE_LOG);
     append_jsonl_record(
         path,
-        &chat_performance_record(model_id, model, mode, result)?,
+        &chat_performance_record(model_id, model, mode, result, resolved_limit)?,
     )?;
     eprintln!("chat performance log: {}", path.display());
     Ok(())
@@ -1052,12 +1073,61 @@ fn write_stream_event(writer: &mut impl Write, event: &GenerationEvent) -> Resul
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatTokenLimit {
+    Context,
+    Explicit(usize),
+}
+
+impl ChatTokenLimit {
+    fn minimum_response_budget(self) -> usize {
+        match self {
+            Self::Context => 1,
+            Self::Explicit(max_new_tokens) => max_new_tokens,
+        }
+    }
+
+    fn resolve(self, prompt_tokens: usize, max_context: usize) -> Result<ResolvedTokenLimit> {
+        ensure!(
+            prompt_tokens < max_context,
+            "prompt uses {prompt_tokens} tokens and leaves no generation capacity in the {max_context}-token context"
+        );
+        let remaining = max_context - prompt_tokens;
+        let (max_new_tokens, source) = match self {
+            Self::Context => (remaining, "context"),
+            Self::Explicit(max_new_tokens) => {
+                ensure!(
+                    max_new_tokens <= remaining,
+                    "--max-tokens {max_new_tokens} exceeds the {remaining} tokens remaining in the {max_context}-token context"
+                );
+                (max_new_tokens, "explicit")
+            }
+        };
+        Ok(ResolvedTokenLimit {
+            max_new_tokens,
+            source,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResolvedTokenLimit {
+    max_new_tokens: usize,
+    source: &'static str,
+}
+
 fn parse_chat_args(
     args: &[String],
-) -> Result<(Vec<String>, Option<String>, usize, ExecutorMode, bool)> {
+) -> Result<(
+    Vec<String>,
+    Option<String>,
+    ChatTokenLimit,
+    ExecutorMode,
+    bool,
+)> {
     let mut model_args = Vec::new();
     let mut prompt = None;
-    let mut max_tokens = 64;
+    let mut token_limit = ChatTokenLimit::Context;
     let mut mode = ExecutorMode::Resident;
     let mut show_thoughts = false;
     let mut index = 0;
@@ -1078,12 +1148,13 @@ fn parse_chat_args(
             }
             "--max-tokens" => {
                 index += 1;
-                max_tokens = args
+                let max_tokens = args
                     .get(index)
                     .context("--max-tokens needs a value")?
                     .parse()
                     .context("parse --max-tokens")?;
                 ensure!(max_tokens > 0, "--max-tokens must be positive");
+                token_limit = ChatTokenLimit::Explicit(max_tokens);
             }
             "--executor" => {
                 index += 1;
@@ -1098,7 +1169,7 @@ fn parse_chat_args(
         };
         index += 1;
     }
-    Ok((model_args, prompt, max_tokens, mode, show_thoughts))
+    Ok((model_args, prompt, token_limit, mode, show_thoughts))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1162,7 +1233,7 @@ mod phase_07_tests {
 
     #[test]
     fn chat_arguments_parse_one_shot_and_reject_zero_max_tokens() {
-        let (model, prompt, max, mode, show_thoughts) = parse_chat_args(&[
+        let (model, prompt, token_limit, mode, show_thoughts) = parse_chat_args(&[
             "--model".into(),
             "small".into(),
             "--prompt".into(),
@@ -1173,7 +1244,7 @@ mod phase_07_tests {
         .unwrap();
         assert_eq!(model, ["--model", "small"]);
         assert_eq!(prompt.as_deref(), Some("hello"));
-        assert_eq!(max, 7);
+        assert_eq!(token_limit, ChatTokenLimit::Explicit(7));
         assert_eq!(mode, ExecutorMode::Resident);
         assert!(!show_thoughts);
         assert!(
@@ -1185,6 +1256,33 @@ mod phase_07_tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn chat_defaults_to_remaining_context_capacity() {
+        let (_, _, token_limit, _, _) =
+            parse_chat_args(&["--model".into(), "small".into()]).unwrap();
+        assert_eq!(token_limit, ChatTokenLimit::Context);
+        assert_eq!(
+            token_limit.resolve(17, 4096).unwrap(),
+            ResolvedTokenLimit {
+                max_new_tokens: 4079,
+                source: "context",
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_chat_limit_must_fit_remaining_context() {
+        assert_eq!(
+            ChatTokenLimit::Explicit(32).resolve(64, 1024).unwrap(),
+            ResolvedTokenLimit {
+                max_new_tokens: 32,
+                source: "explicit",
+            }
+        );
+        assert!(ChatTokenLimit::Explicit(33).resolve(992, 1024).is_err());
+        assert!(ChatTokenLimit::Context.resolve(1024, 1024).is_err());
     }
 
     #[test]

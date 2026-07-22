@@ -118,8 +118,12 @@ cargo run -p atlas-cli -- fixture verify --model small
 Talk to the model directly (omit `--prompt` for the REPL):
 
 ```zsh
-cargo run -p atlas-cli -- chat --model small --prompt 'The capital of France is' --max-tokens 32
+cargo run -p atlas-cli -- chat --model small --prompt 'The capital of France is'
 ```
+
+When `--max-tokens` is omitted, chat generates until EOS or the remaining
+executor context is exhausted. Pass `--max-tokens N` when a fixed response
+budget is required for a benchmark or reproducible workload.
 
 ## Chat with Gemma 4
 
@@ -169,8 +173,7 @@ Start an optimized interactive chat:
 
 ```zsh
 cargo run --release -p atlas-cli -- chat \
-  --model gemma4-e2b-q4_0 \
-  --max-tokens 128
+  --model gemma4-e2b-q4_0
 ```
 
 Wait for the `you>` prompt and type a message. The REPL supports:
@@ -192,8 +195,7 @@ Run a single non-interactive turn by supplying `--prompt`:
 ```zsh
 cargo run --release -p atlas-cli -- chat \
   --model gemma4-e2b-q4_0 \
-  --prompt 'Explain the history and importance of Paris.' \
-  --max-tokens 128
+  --prompt 'Explain the history and importance of Paris.'
 ```
 
 Gemma 4 chat applies the instruction template embedded in the GGUF and always
