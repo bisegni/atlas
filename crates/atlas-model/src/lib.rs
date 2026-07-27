@@ -7,6 +7,7 @@
 
 pub mod executor;
 pub mod gemma4_executor;
+pub mod inference;
 pub mod kv_cache;
 pub mod runtime;
 pub mod sampling;

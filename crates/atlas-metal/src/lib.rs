@@ -163,6 +163,64 @@ mod macos {
             Ok(())
         }
 
+        /// Offset-aware variant of [`Self::dispatch_threadgroups_1d`].  This
+        /// is needed when one command owns an immutable table of scalar
+        /// controls: every encoded dispatch must retain its own table entry
+        /// until the command buffer completes.
+        pub fn dispatch_threadgroups_1d_at(
+            &mut self,
+            kernel: &'static str,
+            buffers: &[(&GpuBuffer, usize)],
+            threadgroups: usize,
+            threads_per_threadgroup: usize,
+        ) -> Result<(), MetalError> {
+            let encode_started = Instant::now();
+            if self.encoder.is_none() {
+                self.encoder = Some(
+                    self.command_buffer
+                        .computeCommandEncoder()
+                        .ok_or(MetalError::CommandCreation)?,
+                );
+            }
+            let encoder = self.encoder.as_ref().expect("compute encoder exists");
+            let pipeline = self
+                .runtime
+                .pipelines
+                .get(kernel)
+                .ok_or_else(|| MetalError::MissingKernel(kernel.into()))?;
+            encoder.setComputePipelineState(&**pipeline);
+            for (index, (buffer, offset)) in buffers.iter().enumerate() {
+                if *offset > buffer.bytes {
+                    return Err(MetalError::InvalidInput(
+                        "resident buffer offset is out of range".into(),
+                    ));
+                }
+                unsafe {
+                    encoder.setBuffer_offset_atIndex(Some(buffer.native()), *offset, index);
+                }
+            }
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: threadgroups.max(1),
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: threads_per_threadgroup,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.complete_profiled_dispatch(
+                kernel,
+                0,
+                threadgroups,
+                threads_per_threadgroup,
+                encode_started.elapsed(),
+            )?;
+            Ok(())
+        }
+
         pub fn dispatch_1d(
             &mut self,
             kernel: &'static str,
@@ -515,12 +573,14 @@ mod macos {
                 "matvec_q4_0",
                 "matvec_q4_0_blocked",
                 "matvec_q4_0_16row",
+                "matmul_q4_0_batch_16row",
                 "matvec_q8_0",
                 "embedding_lookup_q4_0",
                 "embedding_lookup_q8_0",
                 "embedding_lookup_q6_k",
                 "matvec_q6_k",
                 "matvec_q6_k_8row",
+                "matmul_q6_k_batch_8row",
                 "matvec_f16",
                 "gelu_f32",
                 "gelu_trace_f32",
@@ -547,9 +607,14 @@ mod macos {
                 "rope_half_to_interleaved_f32",
                 "rope_interleaved_to_half_f32",
                 "kv_append_decode_f32",
+                "kv_append_decode_q8_0",
+                "kv_append_decode_q4_0",
                 "attention_decode_f32",
                 "attention_decode_fused_f32",
                 "attention_decode_fused_gemma4_f32",
+                "attention_decode_fused_gemma4_simd_f32",
+                "attention_decode_fused_gemma4_simd_q8_0",
+                "attention_decode_fused_gemma4_simd_q4_0",
                 "attention_scores_resident_f32",
                 "masked_softmax_resident_f32",
                 "attention_values_resident_f32",

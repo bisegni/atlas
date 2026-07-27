@@ -5,8 +5,9 @@
 Atlas materially improves Gemma 4 E2B Q4_0 prefill and decode throughput on
 Apple Silicon while preserving the completed Phase 12a-pre text, streaming,
 multi-turn, thought-filtering, context-compaction, and Resident-only contracts.
-The production CLI remains normal `chat`; this phase does not add public
-benchmark or profiling modes.
+The production CLI remains normal `chat`. The separate `profile` command is a
+diagnostic-only exception: it isolates each selected Metal dispatch to obtain
+exact GPU timings and never writes to the normal chat-performance record.
 
 ## Implementation status
 
@@ -48,8 +49,9 @@ the chunk, and only the final selected token is read back.
 
 This changes the canonical ten-token prompt from ten prefill command buffers to
 one. The selected path and effective chunk size are observable as
-`prefill_path: "resident_chunked_command"` and `prefill_chunk_size` in both the
-terminal metrics and `artifacts/chat-performance.jsonl`.
+`prefill_path: "resident_chunked_command"`, `prefill_chunk_size`, and
+`prefill_chunks` in both the terminal metrics and
+`artifacts/chat-performance.jsonl`.
 
 This is command-buffer batching, not yet a layer-major matrix-matrix prefill
 implementation. Layers still process the prompt tokens in dependency order
@@ -112,6 +114,79 @@ Hello! How can I help you today? 😊
 
 Resident errors are still surfaced directly; there is no Reference fallback.
 
+#### Growing-context decode profile
+
+`atlas-cli profile` runs a fixed 128-token Resident decode diagnostic and
+records exact per-dispatch Metal timings at decode positions 1, 32, 64, and
+128. It aggregates GPU time, CPU encode time, and dispatch count by Q4/Q6
+projection, RMS/RoPE, KV append, Gemma attention, MLP/residual, softcap,
+argmax, and other work. Each sample includes the absolute context position,
+attention-key count, full/sliding layer counts, Resident bytes, and readback
+bytes.
+
+This diagnostic intentionally submits and waits for every observed dispatch.
+It is therefore unsuitable as a throughput measurement and does not alter
+`chat` or `generate`, which retain one command buffer for each decode token.
+Its append-only artifact is separate from the authoritative normal-runtime
+record:
+
+```zsh
+cargo run --release -p atlas-cli -- profile --model gemma4-e2b-q4_0
+```
+
+The command prints JSON and appends it to
+`artifacts/phase-12a/gemma4-resident-decode-profile.jsonl`.
+
+The profiler also reports the selected attention pipeline. The SIMD-group KV
+traversal is the production Resident default: it reduced the profiled Gemma
+attention family from 17.54 ms to 12.88 ms at context 142 (26.6%) while the
+pinned canonical Resident-token test still passed. The old barrier-heavy
+pipeline remains available only for diagnostic A/B comparison:
+
+```zsh
+ATLAS_GEMMA4_ATTENTION_BASELINE=1 cargo run --release -p atlas-cli -- profile --model gemma4-e2b-q4_0
+```
+
+#### Experimental KV-cache precision
+
+The production default remains an FP32 Resident K/V cache, which is the only
+mode covered by the pinned exact-token acceptance gate. `chat`, `generate`,
+and the diagnostic `profile` also accept an explicit experimental cache type:
+
+```zsh
+cargo run --release -p atlas-cli -- chat --model gemma4-e2b-q4_0 \
+  --kv-cache-type q8_0 --max-tokens 128
+```
+
+Supported values are `f32` (default), `q8_0`, and `q4_0`. Q8/Q4 cache only
+pack transient K/V entries; query activations, online softmax, and attention
+outputs remain FP32. Metrics record `kv_cache_type` and `kv_cache_bytes`.
+There is no fallback from a selected packed mode to F32 or Reference execution.
+
+#### Fixed-workload benchmark
+
+`benchmark` is a diagnostic-only Resident command for matched-length decode
+measurements. Unlike normal `chat` and `generate`, it keeps selecting after an
+EOS or end-turn marker until exactly `--decode-tokens` selections have run.
+This prevents an early EOS from making one KV-cache mode appear faster simply
+because it did less work. It applies the normal Gemma chat template to the
+supplied user prompt so it matches the F32 chat workload, but it never changes
+normal stopping semantics:
+
+```zsh
+cargo run --release -p atlas-cli -- benchmark --model gemma4-e2b-q4_0 \
+  --kv-cache-type f32 --prompt '...' --decode-tokens 128
+```
+
+Each invocation appends one JSON record to
+`artifacts/phase-12a-perf/gemma4-fixed-workload.jsonl`, including the first EOS
+position (if any), completed fixed decode count, deterministic token-stream
+digest, Resident/KV bytes, command-buffer and transfer metrics, selected
+kernels, and prefill/decode throughput. Q8/Q4 records are experimental:
+acceptance requires repeatable fixed completion and lower KV residency, not
+F32 token equality. The acceptance runner retains the normal F32 chat gate and
+also records six matched 128-token benchmark runs for every cache type.
+
 ## Current measured evidence
 
 The following measurements were collected on Apple M2 Max with the release
@@ -153,12 +228,12 @@ must preserve exact greedy token output before promotion.
    to the shared KV cache in one batched operation. Fuse score scaling, masking,
    softmax, and value accumulation only when a focused oracle test proves the
    same numerical and token-selection result.
-3. **Profile long-context decode separately.** The short decode reaches about
-   40 tok/s while the 103-step workload reaches only 27.02 tok/s. Capture
-   per-kernel GPU time as context grows to determine whether attention scans,
-   KV-cache layout, projection traffic, synchronization, or token selection is
-   responsible for the decline. Optimize the measured dominant stage rather
-   than assuming the Q4_0 projections remain dominant.
+3. **Use the growing-context profile before decode optimization.** The short
+   decode reaches about 40 tok/s while the 103-step workload reaches only
+   27.02 tok/s. Run the implemented profile first to determine whether
+   attention scans, KV-cache layout, projection traffic, synchronization, or
+   token selection is responsible for the decline. Optimize the measured
+   dominant stage rather than assuming the Q4_0 projections remain dominant.
 4. **Improve KV-cache access locality.** Evaluate a layout that lets one SIMD
    group read contiguous key/value elements for the active attention window.
    Preserve shared-KV ownership and bounded sliding-window behavior. Compare
@@ -331,6 +406,23 @@ following are true:
 
 Mark completion with the `[done]` filename convention and update the phase
 index only after the Apple-Silicon acceptance evidence passes.
+
+### Reproducible acceptance runner
+
+Run the pinned 59-token prompt once cold and five times warm, evaluate every
+throughput/residency/token gate, print the verdict, and save the raw records
+plus JSON summary under `artifacts/phase-12a-perf/`:
+
+```zsh
+scripts/run-gemma4-performance-acceptance.sh
+```
+
+The runner executes the same workload and exact decode profile for `f32`,
+`q8_0`, and `q4_0` KV caches, storing each mode in its own subdirectory plus
+one aggregate summary. Its exit status remains the strict F32 phase gate;
+packed modes are recorded as experimental comparisons. It intentionally unsets
+the diagnostic baseline-attention override so the F32 run measures the
+production SIMD path.
 
 ## External software
 

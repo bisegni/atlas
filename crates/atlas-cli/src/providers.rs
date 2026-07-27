@@ -286,19 +286,12 @@ impl HuggingFaceProvider {
             .get("sha")
             .and_then(Value::as_str)
             .context("Hugging Face model is missing immutable sha")?;
-        let config_architecture = metadata
-            .get("config")
-            .and_then(|v| v.get("architectures"))
-            .and_then(Value::as_array)
-            .and_then(|v| v.first())
-            .and_then(Value::as_str);
         let gguf_architecture = metadata
             .get("gguf")
             .and_then(|value| value.get("architecture"))
             .and_then(Value::as_str);
-        let llama = config_architecture == Some("LlamaForCausalLM");
         let gemma4 = gguf_architecture == Some("gemma4");
-        if !llama && !gemma4 {
+        if !gemma4 {
             return Ok(Vec::new());
         }
         let siblings = metadata
@@ -309,44 +302,13 @@ impl HuggingFaceProvider {
             .iter()
             .filter_map(|v| v.get("rfilename").and_then(Value::as_str))
             .collect();
-        if llama && (!files.contains(&"config.json") || !files.contains(&"tokenizer.json")) {
-            return Ok(Vec::new());
-        }
-        let safe = files
+        let formats: Vec<(&str, Option<&str>)> = files
             .iter()
-            .filter(|name| name.ends_with(".safetensors"))
-            .count();
-        let gguf = files.iter().filter(|name| name.ends_with(".gguf")).count();
-        if files
-            .iter()
-            .any(|name| name.contains("model") && name.ends_with(".bin"))
-        {
-            return Ok(Vec::new());
-        }
-        let formats: Vec<(&str, Option<&str>)> = if safe > 0 && gguf == 0 {
-            vec![("safetensors-fp32", None)]
-        } else if safe == 0 {
-            files
-                .iter()
-                .filter_map(|file| {
-                    if gemma4
-                        && file.ends_with(".gguf")
-                        && file.contains("q4_0")
-                        && !file.contains("mmproj")
-                    {
-                        Some(("gguf-gemma4-q4_0", Some(*file)))
-                    } else if file.ends_with(".gguf") && file.contains("Q4_0") {
-                        Some(("gguf-q4_0", Some(*file)))
-                    } else if file.ends_with(".gguf") && file.contains("Q8_0") {
-                        Some(("gguf-q8_0", Some(*file)))
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+            .filter_map(|file| {
+                (file.ends_with(".gguf") && file.contains("q4_0") && !file.contains("mmproj"))
+                    .then_some(("gguf-gemma4-q4_0", Some(*file)))
+            })
+            .collect();
         if formats.is_empty() {
             return Ok(Vec::new());
         }
@@ -382,11 +344,7 @@ impl HuggingFaceProvider {
                 provider: HUGGING_FACE.into(),
                 repository: repository.into(),
                 revision: revision.into(),
-                architecture: if gemma4 {
-                    "gemma4".into()
-                } else {
-                    "LlamaForCausalLM".into()
-                },
+                architecture: "gemma4".into(),
                 format: format.into(),
                 artifact: artifact.map(str::to_owned),
                 bytes: artifact
@@ -442,21 +400,14 @@ pub fn download_hugging_face(
     let metadata = HuggingFaceProvider::get_json(&format!(
         "https://huggingface.co/api/models/{repository}/revision/{revision}?blobs=true"
     ))?;
-    let config_architecture = metadata
-        .get("config")
-        .and_then(|v| v.get("architectures"))
-        .and_then(Value::as_array)
-        .and_then(|v| v.first())
-        .and_then(Value::as_str);
     let gguf_architecture = metadata
         .get("gguf")
         .and_then(|value| value.get("architecture"))
         .and_then(Value::as_str);
-    let llama = config_architecture == Some("LlamaForCausalLM");
     let gemma4 = gguf_architecture == Some("gemma4");
     ensure!(
-        llama || gemma4,
-        "provider artifact architecture is unsupported"
+        gemma4,
+        "provider artifact is unsupported; Atlas accepts only Gemma 4 E2B Q4_0 GGUF"
     );
     let gated = is_gated(&metadata);
     let access_token = if gated && allow_auth {
@@ -480,35 +431,10 @@ pub fn download_hugging_face(
         .filter_map(|v| v.get("rfilename").and_then(Value::as_str))
         .map(str::to_owned)
         .collect();
-    let mut files = if llama {
-        vec!["config.json".to_owned(), "tokenizer.json".to_owned()]
-    } else {
-        Vec::new()
-    };
+    let mut files = Vec::new();
     match advertised_format {
-        "safetensors-fp32" => {
-            let weights: Vec<_> = all
-                .iter()
-                .filter(|name| name.ends_with(".safetensors"))
-                .cloned()
-                .collect();
-            ensure!(
-                !weights.is_empty(),
-                "resolved repository has no SafeTensors artifacts"
-            );
-            files.extend(weights);
-            if all
-                .iter()
-                .any(|name| name == "model.safetensors.index.json")
-            {
-                files.push("model.safetensors.index.json".into());
-            }
-        }
-        "gguf-q4_0" | "gguf-q8_0" | "gguf-gemma4-q4_0" => {
-            ensure!(
-                advertised_format != "gguf-gemma4-q4_0" || gemma4,
-                "Gemma GGUF format requires gemma4 architecture"
-            );
+        "gguf-gemma4-q4_0" => {
+            ensure!(gemma4, "Gemma GGUF format requires gemma4 architecture");
             let weights: Vec<_> = all
                 .iter()
                 .filter(|name| name.ends_with(".gguf"))
@@ -590,7 +516,18 @@ impl ModelProvider for HuggingFaceProvider {
             if let Some(id) = item.get("id").and_then(Value::as_str) {
                 let compatible = Self::candidate(id)?;
                 if compatible.is_empty() {
-                    candidates.push(ModelCandidate { provider: HUGGING_FACE.into(), repository: id.into(), revision: "unknown".into(), architecture: "unsupported".into(), format: "unsupported".into(), artifact: None, bytes: 0, requires_auth: false, downloadable: false, reason: Some("not a complete Atlas-supported Llama artifact or Gemma 4 E2B Q4_0 GGUF".into()) });
+                    candidates.push(ModelCandidate {
+                        provider: HUGGING_FACE.into(),
+                        repository: id.into(),
+                        revision: "unknown".into(),
+                        architecture: "unsupported".into(),
+                        format: "unsupported".into(),
+                        artifact: None,
+                        bytes: 0,
+                        requires_auth: false,
+                        downloadable: false,
+                        reason: Some("not a complete Atlas-supported Gemma 4 E2B Q4_0 GGUF".into()),
+                    });
                 } else {
                     candidates.extend(compatible);
                 }
@@ -660,8 +597,8 @@ mod tests {
     }
 
     #[test]
-    fn metadata_fixture_keeps_only_supported_complete_llama_artifacts() {
-        let supported = json!({
+    fn metadata_fixture_rejects_legacy_llama_artifacts() {
+        let legacy = json!({
             "sha": "0123456789abcdef",
             "config": {"architectures": ["LlamaForCausalLM"]},
             "siblings": [
@@ -679,28 +616,13 @@ mod tests {
                 {"rfilename": "model.safetensors"}
             ]
         });
-        let mixed = json!({
-            "sha": "0123456789abcdef",
-            "config": {"architectures": ["LlamaForCausalLM"]},
-            "siblings": [
-                {"rfilename": "config.json"},
-                {"rfilename": "tokenizer.json"},
-                {"rfilename": "model.safetensors"},
-                {"rfilename": "model-Q4_0.gguf"}
-            ]
-        });
-
-        let candidates =
-            HuggingFaceProvider::candidate_from_metadata("org/model", &supported).unwrap();
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].bytes, 15);
         assert!(
-            HuggingFaceProvider::candidate_from_metadata("org/model", &unsupported)
+            HuggingFaceProvider::candidate_from_metadata("org/model", &legacy)
                 .unwrap()
                 .is_empty()
         );
         assert!(
-            HuggingFaceProvider::candidate_from_metadata("org/model", &mixed)
+            HuggingFaceProvider::candidate_from_metadata("org/model", &unsupported)
                 .unwrap()
                 .is_empty()
         );
