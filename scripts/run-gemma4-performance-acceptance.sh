@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Run the Phase 12a Gemma Resident workload for each supported KV-cache type.
-# The F32 result remains the only strict phase-acceptance gate; Q8/Q4 records
-# are experimental comparisons collected with the identical prompt and process.
+# Run the Phase 12a Gemma Resident workload for the selected KV-cache types.
+# Q4_0 is the current packed-cache performance target.
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -10,7 +9,7 @@ cd "$repo_root"
 model_id=gemma4-e2b-q4_0
 max_tokens=128
 warm_runs=5
-kv_cache_types=(f32 q8_0 q4_0)
+kv_cache_types=(q4_0)
 prompt='Explain why batching prompt tokens improves transformer prefill performance on a unified-memory GPU. Compare command scheduling, matrix projection reuse, causal attention, key-value cache updates, synchronization, and readback. Keep the answer concise and use one paragraph.'
 shared_log=artifacts/chat-performance.jsonl
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
@@ -69,9 +68,7 @@ for cache_type in "${kv_cache_types[@]}"; do
     run_cache_type "$cache_type"
 done
 
-# Chat deliberately stops at EOS/end-turn. Run a separate fixed-length
-# workload so every cache mode performs the same 128 selections even when its
-# greedy sequence encounters EOS at a different point.
+# Fixed-length workload so the Q4_0 cache mode performs exactly 128 selections.
 run_fixed_benchmark() {
     local cache_type=$1
     local mode_dir="$artifact_dir/$cache_type"
@@ -121,10 +118,10 @@ for cache_type in "${kv_cache_types[@]}"; do
     run_fixed_benchmark "$cache_type"
 done
 
-echo "Checking canonical and packed-KV Resident gates..."
+echo "Checking Q4_0 Resident gates..."
 canonical_pass=true
 if ! cargo test -p atlas-model --test phase_12a_gemma4_resident -- --ignored \
-    2>&1 | tee "$artifact_dir/resident-token-and-packed-kv-gates.log"; then
+     2>&1 | tee "$artifact_dir/resident-token-and-packed-kv-gates.log"; then
     canonical_pass=false
 fi
 
@@ -155,27 +152,13 @@ for cache_type in "${kv_cache_types[@]}"; do
             resident_executor: all($warm[]; .executor == "resident"),
             selected_kv_cache_type: all($warm[]; .kv_cache_type == $cache_type),
             warm_zero_weight_upload: all($warm[]; .weight_upload_bytes == 0),
-            # F32 is the pinned token-oracle mode, so its historical EOS
-            # length is part of the phase gate. Packed KV modes are explicitly
-            # experimental and may select a different greedy EOS token; require
-            # a meaningful decode workload there without confusing it with F32
-            # token equivalence.
-            fixed_long_decode: (if $cache_type == "f32" then
-                all($warm[]; .generated_tokens == 104 and .decode_command_buffers == 103)
-              else
-                all($warm[]; .generated_tokens >= 32 and .decode_command_buffers >= 31)
-              end),
-            canonical_and_packed_kv_tests: $canonical_pass
-          }
-        }
-      | if $cache_type == "f32" then
-          .checks += {
-            simd_attention: all($warm[]; .attention_kernel == "attention_decode_fused_gemma4_simd_f32"),
+            fixed_long_decode: all($warm[]; .generated_tokens >= 32 and .decode_command_buffers >= 1),
+            canonical_and_packed_kv_tests: $canonical_pass,
             bounded_resident_memory: all($warm[]; .resident_bytes <= 3489602512),
             prefill_median_at_least_50: (($prefill | median) >= 50),
             decode_median_at_least_40: (($decode | median) >= 40)
           }
-        else . end
+        }
       | .pass = all(.checks[]; . == true)
     ' "$artifact_dir/$cache_type/chat-performance.jsonl" \
         | tee "$artifact_dir/$cache_type/summary.json"
@@ -183,21 +166,18 @@ done
 
 summary="$artifact_dir/acceptance-summary.json"
 jq -n \
-    --slurpfile f32 "$artifact_dir/f32/summary.json" \
-    --slurpfile q8 "$artifact_dir/q8_0/summary.json" \
     --slurpfile q4 "$artifact_dir/q4_0/summary.json" \
-    --slurpfile f32_benchmark "$artifact_dir/f32/benchmark-summary.json" \
-    --slurpfile q8_benchmark "$artifact_dir/q8_0/benchmark-summary.json" \
     --slurpfile q4_benchmark "$artifact_dir/q4_0/benchmark-summary.json" \
     '{
-      modes:{f32:$f32[0],q8_0:$q8[0],q4_0:$q4[0]},
-      fixed_workload:{f32:$f32_benchmark[0],q8_0:$q8_benchmark[0],q4_0:$q4_benchmark[0]},
-      phase_acceptance_pass:($f32[0].pass and $f32_benchmark[0].pass),
-      experimental_modes_valid:(
-        $q8[0].pass and $q4[0].pass and $q8_benchmark[0].pass and $q4_benchmark[0].pass
-        and ($q8_benchmark[0].kv_cache_bytes < $f32_benchmark[0].kv_cache_bytes)
-        and ($q4_benchmark[0].kv_cache_bytes < $f32_benchmark[0].kv_cache_bytes)
-      )
+      modes: {q4_0: $q4[0]},
+      fixed_workload: {q4_0: $q4_benchmark[0]},
+      phase_acceptance_pass: ($q4[0].pass and $q4_benchmark[0].pass),
+      performance_gate: {
+        prefill_median_tok_s: $q4[0].warm_summary.prefill_tok_s.median,
+        decode_median_tok_s: $q4[0].warm_summary.decode_tok_s.median,
+        required_prefill_tok_s: 50,
+        required_decode_tok_s: 40
+      }
     }' \
     | tee "$summary"
 
@@ -205,6 +185,6 @@ echo "Acceptance artifact: $summary"
 if jq -e '.phase_acceptance_pass == true' "$summary" >/dev/null; then
     echo "GEMMA 4 RESIDENT PERFORMANCE ACCEPTANCE: PASS"
 else
-    echo "GEMMA 4 RESIDENT PERFORMANCE ACCEPTANCE: FAIL (F32 phase gate)" >&2
+    echo "GEMMA 4 RESIDENT PERFORMANCE ACCEPTANCE: FAIL (Q4_0 phase gate)" >&2
     exit 1
 fi

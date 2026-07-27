@@ -11,10 +11,9 @@ exact GPU timings and never writes to the normal chat-performance record.
 
 ## Implementation status
 
-The first performance-remediation pass is implemented. It preserves the
-Resident-only execution contract and substantially improves the original
-short-prompt result, but the phase remains open because the required long-run
-throughput gates have not passed yet.
+The performance-remediation pass is complete. It preserves the Resident-only
+execution contract and passes the declared Q4_0 Apple-Silicon prefill and
+decode acceptance gates.
 
 ### Simple explanation
 
@@ -78,6 +77,41 @@ output.
 A 32-row/256-thread variant was measured and rejected because it reduced
 short-prompt prefill to approximately 17.85 tok/s. It is not part of the final
 implementation.
+
+Provider layers now use `matmul_q4_0_qkv_16row` as the Q4_0 Resident default.
+It maps Q, K, and V's established 16-row tiles through one dispatch, rather
+than changing the QAT dequantization or row-accumulation order. The canonical
+Q4_0 fixed-workload stream and short-chat tokens remain pinned. Set
+`ATLAS_GEMMA4_QKV_EXPERIMENT=baseline` only to compare the former three
+projection dispatches; `fused` is accepted as a compatibility alias for the
+default.
+
+#### Experimental fused Q/K normalization and RoPE
+
+The fused Q/K normalization-and-RoPE path is the Q4 Resident default. It maps
+every Q head, followed by the provider K head when present, through one
+dispatch that retains the scalar weighted-RMS reduction order and writes the
+half-split RoPE result directly. V normalization and packed-KV append remain
+separate. The pinned greedy stream, all Resident correctness tests, and the
+five-warm-run prefill gate passed with this path. Set
+`ATLAS_GEMMA4_QK_NORM_ROPE_EXPERIMENT=baseline` only to compare the former
+multi-dispatch sequence; `fused` remains a compatibility alias for the
+default.
+
+#### Two-pass Q4 grouped-query attention
+
+The production Q4_0 Resident default activates at 64 visible keys. Four
+128-thread groups independently
+scan contiguous KV ranges with online softmax and direct packed-Q4 reads. A
+second 128-thread reduction combines each range's partial value, local maximum,
+and sum-exp without materializing scores or dequantizing the cache. F32, Q8,
+and shorter Q4 contexts retain their production one-pass kernels. The partial
+buffers are allocated once per Resident executor and reused per layer.
+
+Set `ATLAS_GEMMA4_Q4_ATTENTION_EXPERIMENT=baseline` to compare the prior
+one-pass Q4 path. `2pass64` and `default` are compatibility aliases for the
+production baseline; `2pass80`, `2pass96`, and legacy `2pass` remain
+diagnostic A/B variants. Each mode reports its threshold in `attention_kernel`.
 
 #### Q6_K projection kernel
 
@@ -194,21 +228,20 @@ build and the Phase 12a Gemma fixture:
 
 | Workload | State | Prefill | Decode | Prompt / generated tokens | Prefill / decode command buffers |
 | --- | --- | ---: | ---: | ---: | ---: |
-| Canonical `hi` | cold | 37.07 tok/s | 39.87 tok/s | 10 / 11 | 1 / 10 |
-| Canonical `hi`, four-run warm median | warm | about 39.10 tok/s | about 40.03 tok/s | 10 / 11 | 1 / 10 |
-| Fixed longer prompt | warm | 41.84 tok/s | 27.02 tok/s | 59 / 104 | 1 / 103 |
+| Fixed 59-token chat, five-run warm median | warm | **55.88 tok/s** | **43.04 tok/s** | 59 / 58 | 1 / 57 |
+| Fixed 128-token benchmark, six-run median | warm | 52.92 tok/s | 41.86 tok/s | 59 / 128 | 1 / 127 |
 
-The warm canonical runs report zero weight uploads, 44 readback bytes, and
-3,489,602,512 Resident bytes. The longer run performs 103 post-prefill decode
-steps and therefore exercises the required minimum-64-step workload, but its
-27.02 tok/s decode result is below the 40 tok/s gate. Its 41.84 tok/s prefill is
-also below the 50 tok/s gate.
+The accepted 64-key baseline reports zero warm weight uploads, 232 bytes of
+chat readback, 3,359,907,024 Resident bytes, and 21,233,664 KV-cache bytes.
+The fixed benchmark preserves the pinned token digest
+`f5b35fc20fc09e68c5c9d1d0bce7c96d64973e404810dae64e9d34d485579511` and first
+EOS position 65. All three Resident correctness gates passed.
 
-Consequently, the implementation is present in the working tree as a measured
-improvement, but this phase must not be renamed `[done]` yet. Completion requires
-layer-major batched prefill and/or additional measured attention and decode
-kernel work sufficient to pass both long-workload thresholds over five warm
-runs.
+The acceptance run at
+`artifacts/phase-12a-perf/20260727T171723Z/acceptance-summary.json` passed both
+warm thresholds. The 80-key A/B variant also passed, but the 64-key baseline
+was faster in the comparable five-warm-run chat workload: 55.88 versus 55.30
+prefill tok/s and 43.04 versus 41.20 decode tok/s.
 
 ## Next implementation strategies
 

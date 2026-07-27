@@ -114,6 +114,35 @@ kernel void rms_norm_decode_f32(
     }
 }
 
+// Experimental Gemma decode epilogue.  This retains the 32-lane reduction
+// and explicit intermediate arithmetic of rms_norm_decode_f32, then writes
+// the following residual in the same dispatch.  It is intentionally opt-in:
+// its value is fewer dispatch boundaries, not a changed numerical contract.
+kernel void gemma4_rms_residual_f32(
+    device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]],
+    device const float *residual [[buffer(2)]],
+    // Keep the normalized vector as a volatile device-memory intermediate.
+    // The baseline writes this value in rms_norm_decode_f32, then reloads it
+    // in vector_add_f32; retaining that rounding boundary is required for
+    // greedy-token parity.
+    device volatile float *normalized [[buffer(3)]], device float *output [[buffer(4)]],
+    constant uint &hidden [[buffer(5)]], constant float &epsilon [[buffer(6)]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    float squared_sum = 0.0f;
+    for (uint column = lane; column < hidden; column += 32) {
+        float value = input[column];
+        squared_sum += value * value;
+    }
+    float inverse_rms = rsqrt(simd_sum(squared_sum) / float(hidden) + epsilon);
+    for (uint column = lane; column < hidden; column += 32) {
+        normalized[column] = input[column] * inverse_rms * weight[column];
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint column = lane; column < hidden; column += 32) {
+        output[column] = residual[column] + normalized[column];
+    }
+}
+
 kernel void matvec_f32(
     device const float *input [[buffer(0)]], device const float *weights [[buffer(1)]],
     device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
@@ -225,6 +254,107 @@ kernel void matvec_q4_0_16row(
     sum += simd_shuffle_xor(sum, 2);
     sum += simd_shuffle_xor(sum, 1);
     if (column == 0 && row < output_width) output[row] = sum;
+}
+
+// Fused Q/K/V projection dispatch for Gemma provider layers.  The dispatch
+// keeps the established 16-row Q4 tile and accumulation order, but maps the
+// group range across the Q, K, and V matrices so one command encoder launch
+// replaces three independent projection launches.
+kernel void matmul_q4_0_qkv_16row(
+    device const float *input [[buffer(0)]],
+    device const uchar *q_weights [[buffer(1)]],
+    device const uchar *k_weights [[buffer(2)]],
+    device const uchar *v_weights [[buffer(3)]],
+    device float *q_output [[buffer(4)]],
+    device float *k_output [[buffer(5)]],
+    device float *v_output [[buffer(6)]],
+    constant uint &input_width [[buffer(7)]],
+    constant uint &q_width [[buffer(8)]],
+    constant uint &kv_width [[buffer(9)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint q_groups = (q_width + 15) / 16;
+    uint kv_groups = (kv_width + 15) / 16;
+    uint projection = group < q_groups ? 0 : (group < q_groups + kv_groups ? 1 : 2);
+    uint local_group = projection == 0 ? group :
+        (projection == 1 ? group - q_groups : group - q_groups - kv_groups);
+    uint output_width = projection == 0 ? q_width : kv_width;
+    uint simdgroup = tid / 32;
+    uint lane = tid % 32;
+    uint row_in_simd = lane / 8;
+    uint column = lane % 8;
+    uint row = local_group * 16 + simdgroup * 4 + row_in_simd;
+    float sum = 0.0f;
+    if (row < output_width) {
+        uint blocks = input_width / 32;
+        device const uchar *weights = projection == 0 ? q_weights :
+            (projection == 1 ? k_weights : v_weights);
+        for (uint block = 0; block < blocks; ++block) {
+            device const uchar *base = weights + (row * blocks + block) * 18;
+            float scale = float(*(device const half *)base);
+            uchar packed0 = base[2 + column];
+            uchar packed1 = base[2 + column + 8];
+            sum += input[block * 32 + column] * float(int(packed0 & 15) - 8) * scale;
+            sum += input[block * 32 + column + 8] * float(int(packed1 & 15) - 8) * scale;
+            sum += input[block * 32 + column + 16] * float(int(packed0 >> 4) - 8) * scale;
+            sum += input[block * 32 + column + 24] * float(int(packed1 >> 4) - 8) * scale;
+        }
+    }
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (column == 0 && row < output_width) {
+        if (projection == 0) q_output[row] = sum;
+        else if (projection == 1) k_output[row] = sum;
+        else v_output[row] = sum;
+    }
+}
+
+// Fused FFN gate/up projection dispatch. Both matrices consume the same
+// normalized token vector, so this follows the Q/K/V fusion shape: retain the
+// proven 16-row Q4 tile while replacing two command-encoder launches with one.
+// The gate and up outputs remain independent FP32 buffers and use the exact
+// same per-row accumulation order as matvec_q4_0_16row.
+kernel void matmul_q4_0_gate_up_16row(
+    device const float *input [[buffer(0)]],
+    device const uchar *gate_weights [[buffer(1)]],
+    device const uchar *up_weights [[buffer(2)]],
+    device float *gate_output [[buffer(3)]],
+    device float *up_output [[buffer(4)]],
+    constant uint &input_width [[buffer(5)]],
+    constant uint &output_width [[buffer(6)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint groups = (output_width + 15) / 16;
+    uint projection = group < groups ? 0 : 1;
+    uint local_group = projection == 0 ? group : group - groups;
+    uint simdgroup = tid / 32;
+    uint lane = tid % 32;
+    uint row_in_simd = lane / 8;
+    uint column = lane % 8;
+    uint row = local_group * 16 + simdgroup * 4 + row_in_simd;
+    float sum = 0.0f;
+    if (row < output_width) {
+        uint blocks = input_width / 32;
+        device const uchar *weights = projection == 0 ? gate_weights : up_weights;
+        for (uint block = 0; block < blocks; ++block) {
+            device const uchar *base = weights + (row * blocks + block) * 18;
+            float scale = float(*(device const half *)base);
+            uchar packed0 = base[2 + column];
+            uchar packed1 = base[2 + column + 8];
+            sum += input[block * 32 + column] * float(int(packed0 & 15) - 8) * scale;
+            sum += input[block * 32 + column + 8] * float(int(packed1 & 15) - 8) * scale;
+            sum += input[block * 32 + column + 16] * float(int(packed0 >> 4) - 8) * scale;
+            sum += input[block * 32 + column + 24] * float(int(packed1 >> 4) - 8) * scale;
+        }
+    }
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (column == 0 && row < output_width) {
+        if (projection == 0) gate_output[row] = sum;
+        else up_output[row] = sum;
+    }
 }
 
 // Batched prefill building block.  Inputs and outputs are row-major
@@ -698,6 +828,52 @@ kernel void rope_interleaved_to_half_f32(
     }
 }
 
+// Gemma applies weighted RMS normalization to every Q/K head immediately
+// before RoPE.  Decode previously materialized an interleaved scratch layout
+// and used three dispatches per tensor (normalize, convert, rotate, convert
+// back).  Q and a provider K are independent, so map the threadgroup range
+// over Q heads followed by the optional one K head and write their half-split
+// RoPE result directly.  Each group deliberately keeps the scalar reduction
+// order of rms_norm_groups_in_place_f32 for greedy-token parity.
+kernel void gemma4_qk_norm_rope_fused_f32(
+    device const float *q_input [[buffer(0)]],
+    device const float *k_input [[buffer(1)]],
+    device const float *q_weight [[buffer(2)]],
+    device const float *k_weight [[buffer(3)]],
+    device const float *cosine [[buffer(4)]],
+    device const float *sine [[buffer(5)]],
+    device float *q_output [[buffer(6)]],
+    device float *k_output [[buffer(7)]],
+    constant uint &head_dim [[buffer(8)]],
+    constant uint &q_heads [[buffer(9)]],
+    constant uint &has_key [[buffer(10)]],
+    constant float &epsilon [[buffer(11)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    if (tid != 0 || group >= q_heads + has_key) return;
+    bool key = group >= q_heads;
+    uint head = key ? 0 : group;
+    device const float *input = key ? k_input : q_input;
+    device const float *weight = key ? k_weight : q_weight;
+    device float *output = key ? k_output : q_output;
+    uint base = head * head_dim;
+    float squared_sum = 0.0f;
+    for (uint index = 0; index < head_dim; ++index) {
+        float value = input[base + index];
+        squared_sum += value * value;
+    }
+    float inv_rms = rsqrt(squared_sum / float(head_dim) + epsilon);
+    uint pairs = head_dim / 2;
+    for (uint pair = 0; pair < pairs; ++pair) {
+        float x0 = input[base + pair] * inv_rms * weight[pair];
+        float x1 = input[base + pair + pairs] * inv_rms * weight[pair + pairs];
+        float c = cosine[pair];
+        float s = sine[pair];
+        output[base + pair] = x0 * c - x1 * s;
+        output[base + pair + pairs] = x0 * s + x1 * c;
+    }
+}
+
 // KV layout: [K|V][position][kv_head][dimension].
 kernel void kv_append_decode_f32(
     device const float *key [[buffer(0)]], device const float *value [[buffer(1)]],
@@ -1043,6 +1219,283 @@ kernel void attention_decode_fused_gemma4_simd_q4_0(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     for (uint d = tid; d < head_dim; d += threads) output[head * head_dim + d] /= denominator;
+}
+
+// MLX-style split attention for longer Gemma Q4 decode contexts.  The first
+// pass owns a contiguous range of KV positions per (query head, block), keeps
+// online-softmax state local, and writes only one FP32 partial vector plus its
+// max/sum-exp pair.  It never materializes a score matrix or dequantized KV
+// cache.  The second pass combines those four stable partials per query head.
+kernel void attention_decode_fused_gemma4_simd_q4_0_2pass_1(
+    device const float *query [[buffer(0)]], device const uchar *cache [[buffer(1)]],
+    device float *partials [[buffer(2)]], device float *maxima [[buffer(3)]],
+    device float *sums [[buffer(4)]], constant uint &heads [[buffer(5)]],
+    constant uint &kv_heads [[buffer(6)]], constant uint &head_dim [[buffer(7)]],
+    constant uint &capacity [[buffer(8)]], constant uint &key_count [[buffer(9)]],
+    constant uint &blocks [[buffer(10)]], uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]], uint threads [[threads_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    uint head = group / blocks;
+    uint block = group % blocks;
+    if (head >= heads) return;
+    uint start = block * key_count / blocks;
+    uint end = (block + 1) * key_count / blocks;
+    uint slot = block * heads + head;
+    uint partial_base = slot * head_dim;
+    uint kv_head = head / (heads / kv_heads);
+    uint blocks_per_position = (kv_heads * head_dim) / 32;
+    uint value_base = capacity * blocks_per_position;
+    threadgroup float simd_sums[4], maximum, denominator, rescale, weight;
+    maximum = -INFINITY; denominator = 0.0f;
+    for (uint d = tid; d < head_dim; d += threads) partials[partial_base + d] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint key = start; key < end; ++key) {
+        float partial = 0.0f;
+        uint key_element = key * kv_heads * head_dim + kv_head * head_dim;
+        for (uint d = tid; d < head_dim; d += threads) {
+            uint index = key_element + d;
+            partial += query[head * head_dim + d]
+                * kv_q4_0_value(cache + (index / 32) * 18, index % 32);
+        }
+        float simd_total = simd_sum(partial);
+        if (lane == 0) simd_sums[simd_group] = simd_total;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            float score = simd_sums[0] + simd_sums[1] + simd_sums[2] + simd_sums[3];
+            if (score > maximum) {
+                rescale = exp(maximum - score);
+                weight = 1.0f;
+                maximum = score;
+                denominator = denominator * rescale + weight;
+            } else {
+                rescale = 1.0f;
+                weight = exp(score - maximum);
+                denominator += weight;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint d = tid; d < head_dim; d += threads) {
+            uint index = key_element + d;
+            partials[partial_base + d] = partials[partial_base + d] * rescale
+                + weight * kv_q4_0_value(cache + (value_base + index / 32) * 18, index % 32);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        maxima[slot] = maximum;
+        sums[slot] = denominator;
+    }
+}
+
+kernel void attention_decode_fused_gemma4_simd_q4_0_2pass_2(
+    device const float *partials [[buffer(0)]], device const float *maxima [[buffer(1)]],
+    device const float *sums [[buffer(2)]], device float *output [[buffer(3)]],
+    constant uint &heads [[buffer(4)]], constant uint &head_dim [[buffer(5)]],
+    constant uint &blocks [[buffer(6)]], uint head [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]], uint threads [[threads_per_threadgroup]]) {
+    if (head >= heads) return;
+    threadgroup float maximum, denominator;
+    if (tid == 0) {
+        maximum = -INFINITY;
+        for (uint block = 0; block < blocks; ++block) {
+            maximum = max(maximum, maxima[block * heads + head]);
+        }
+        denominator = 0.0f;
+        for (uint block = 0; block < blocks; ++block) {
+            uint slot = block * heads + head;
+            denominator += sums[slot] * exp(maxima[slot] - maximum);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint d = tid; d < head_dim; d += threads) {
+        float value = 0.0f;
+        for (uint block = 0; block < blocks; ++block) {
+            uint slot = block * heads + head;
+            value += partials[slot * head_dim + d] * exp(maxima[slot] - maximum);
+        }
+        output[head * head_dim + d] = value / denominator;
+    }
+}
+
+// Q4 cache-dequantization experiment.  This retains the production
+// 128-thread/four-SIMD-group geometry and accumulation order, but each SIMD
+// group handles complete 32-value Q4 blocks.  The block scale is loaded once
+// by lane zero and broadcast to the group instead of being loaded once per
+// value lane.
+kernel void attention_decode_fused_gemma4_simd_q4_0_cacheopt(
+    device const float *query [[buffer(0)]], device const uchar *cache [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &heads [[buffer(3)]],
+    constant uint &kv_heads [[buffer(4)]], constant uint &head_dim [[buffer(5)]],
+    constant uint &capacity [[buffer(6)]], constant uint &key_count [[buffer(7)]],
+    uint head [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    if (head >= heads) return;
+    uint kv_head = head / (heads / kv_heads);
+    uint blocks_per_head = head_dim / 32;
+    uint blocks_per_position = kv_heads * blocks_per_head;
+    uint value_base = capacity * blocks_per_position;
+    threadgroup float simd_sums[4], maximum, denominator, rescale, weight;
+    maximum = -INFINITY;
+    denominator = 0.0f;
+    for (uint d = tid; d < head_dim; d += 128) output[head * head_dim + d] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint key = 0; key < key_count; ++key) {
+        float partial = 0.0f;
+        uint key_block_base = (key * blocks_per_position) + kv_head * blocks_per_head;
+        for (uint block = simd_group; block < blocks_per_head; block += 4) {
+            uint block_index = key_block_base + block;
+            device const uchar *base = cache + block_index * 18;
+            float scale = simd_broadcast(float(*(device const half *)base), 0);
+            uint index = block * 32 + lane;
+            uchar packed = base[2 + (lane & 15)];
+            uchar nibble = lane < 16 ? packed & 15 : packed >> 4;
+            partial += query[head * head_dim + index]
+                * scale * float(int(nibble) - 8);
+        }
+        float simd_total = simd_sum(partial);
+        if (lane == 0) simd_sums[simd_group] = simd_total;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            float score = simd_sums[0] + simd_sums[1] + simd_sums[2] + simd_sums[3];
+            if (score > maximum) {
+                rescale = exp(maximum - score);
+                weight = 1.0f;
+                maximum = score;
+                denominator = denominator * rescale + weight;
+            } else {
+                rescale = 1.0f;
+                weight = exp(score - maximum);
+                denominator += weight;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint value_block_base = capacity * blocks_per_position + key_block_base;
+        for (uint block = simd_group; block < blocks_per_head; block += 4) {
+            uint block_index = value_block_base + block;
+            device const uchar *base = cache + block_index * 18;
+            float scale = simd_broadcast(float(*(device const half *)base), 0);
+            uint index = block * 32 + lane;
+            uchar packed = base[2 + (lane & 15)];
+            uchar nibble = lane < 16 ? packed & 15 : packed >> 4;
+            uint output_index = head * head_dim + index;
+            output[output_index] = output[output_index] * rescale
+                + weight * scale * float(int(nibble) - 8);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint d = tid; d < head_dim; d += 128)
+        output[head * head_dim + d] /= denominator;
+}
+
+// Q4 cache attention variant for one SIMD group per query head.  The regular
+// Q4 kernel uses four SIMD groups and synchronizes them for every key because
+// it launches 128 threads per head.  A Gemma head is small enough for one
+// SIMD group to cover its dimensions with a strided loop, eliminating the
+// cross-SIMD reduction and reducing the per-key barrier count while retaining
+// the same online-softmax and packed-cache contract.
+kernel void attention_decode_fused_gemma4_simd_q4_0_32(
+    device const float *query [[buffer(0)]], device const uchar *cache [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &heads [[buffer(3)]],
+    constant uint &kv_heads [[buffer(4)]], constant uint &head_dim [[buffer(5)]],
+    constant uint &capacity [[buffer(6)]], constant uint &key_count [[buffer(7)]],
+    uint head [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+    if (head >= heads) return;
+    uint kv_head = head / (heads / kv_heads);
+    uint blocks_per_position = (kv_heads * head_dim) / 32;
+    uint value_base = capacity * blocks_per_position;
+    threadgroup float maximum, denominator, rescale, weight;
+    maximum = -INFINITY;
+    denominator = 0.0f;
+    for (uint d = tid; d < head_dim; d += 32) output[head * head_dim + d] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint key = 0; key < key_count; ++key) {
+        float partial = 0.0f;
+        uint key_element = key * kv_heads * head_dim + kv_head * head_dim;
+        for (uint d = tid; d < head_dim; d += 32) {
+            uint index = key_element + d;
+            partial += query[head * head_dim + d]
+                * kv_q4_0_value(cache + (index / 32) * 18, index % 32);
+        }
+        float score = simd_sum(partial);
+        if (tid == 0) {
+            if (score > maximum) {
+                rescale = exp(maximum - score);
+                weight = 1.0f;
+                maximum = score;
+                denominator = denominator * rescale + weight;
+            } else {
+                rescale = 1.0f;
+                weight = exp(score - maximum);
+                denominator += weight;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint value_offset = value_base + key_element;
+        for (uint d = tid; d < head_dim; d += 32) {
+            uint index = key_element + d;
+            output[head * head_dim + d] = output[head * head_dim + d] * rescale
+                + weight * kv_q4_0_value(cache + (value_offset + d) / 32 * 18, d % 32);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint d = tid; d < head_dim; d += 32)
+        output[head * head_dim + d] /= denominator;
+}
+
+// Two-SIMD-group Q4 attention experiment.  This keeps more parallelism than
+// the 32-thread variant while reducing the four-group reduction used by the
+// production 128-thread kernel.
+kernel void attention_decode_fused_gemma4_simd_q4_0_64(
+    device const float *query [[buffer(0)]], device const uchar *cache [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &heads [[buffer(3)]],
+    constant uint &kv_heads [[buffer(4)]], constant uint &head_dim [[buffer(5)]],
+    constant uint &capacity [[buffer(6)]], constant uint &key_count [[buffer(7)]],
+    uint head [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    if (head >= heads) return;
+    uint kv_head = head / (heads / kv_heads);
+    uint blocks_per_position = (kv_heads * head_dim) / 32;
+    uint value_base = capacity * blocks_per_position;
+    threadgroup float simd_sums[2], maximum, denominator, rescale, weight;
+    maximum = -INFINITY;
+    denominator = 0.0f;
+    for (uint d = tid; d < head_dim; d += 64) output[head * head_dim + d] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint key = 0; key < key_count; ++key) {
+        float partial = 0.0f;
+        uint key_element = key * kv_heads * head_dim + kv_head * head_dim;
+        for (uint d = tid; d < head_dim; d += 64) {
+            uint index = key_element + d;
+            partial += query[head * head_dim + d]
+                * kv_q4_0_value(cache + (index / 32) * 18, index % 32);
+        }
+        float simd_total = simd_sum(partial);
+        if (lane == 0) simd_sums[simd_group] = simd_total;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            float score = simd_sums[0] + simd_sums[1];
+            if (score > maximum) {
+                rescale = exp(maximum - score);
+                weight = 1.0f;
+                maximum = score;
+                denominator = denominator * rescale + weight;
+            } else {
+                rescale = 1.0f;
+                weight = exp(score - maximum);
+                denominator += weight;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint value_offset = value_base + key_element;
+        for (uint d = tid; d < head_dim; d += 64) {
+            uint index = key_element + d;
+            output[head * head_dim + d] = output[head * head_dim + d] * rescale
+                + weight * kv_q4_0_value(cache + (value_offset + d) / 32 * 18, d % 32);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint d = tid; d < head_dim; d += 64)
+        output[head * head_dim + d] /= denominator;
 }
 
 // Resident-layout equivalents of the reference score -> softmax -> value

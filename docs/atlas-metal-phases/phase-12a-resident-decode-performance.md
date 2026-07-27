@@ -34,6 +34,16 @@ upload/readback bytes, and resident bytes.
   surrounding layout/dispatch) using Apple-GPU occupancy and memory-access
   evidence. Do not dequantize a full weight matrix or trade resident bytes for
   an undisclosed FP32 cache.
+- Profile Gemma decode projections as separate Q4 QKV, Q4 FFN gate/up, Q6
+  language-model-head, and remaining projection families. Split normalization
+  and positional work into RMS normalization, fused Q/K norm+RoPE, RoPE
+  rotation, and RoPE layout conversion before selecting the next kernel target.
+  The default FFN gate/up path combines the two same-input Q4 projections into
+  one Metal dispatch. Set
+  `ATLAS_GEMMA4_FFN_GATE_UP_EXPERIMENT=baseline` to recover the separate
+  projection oracle when diagnosing a regression. Its promotion requires
+  exact-token Resident acceptance and a like-for-like warm-throughput
+  improvement.
 - Normal `chat` and `generate` stop at EOS and remain on
   `ExecutorMode::Resident`.
 - Preserve the Phase-12 manifest quality gates and add a regression assertion

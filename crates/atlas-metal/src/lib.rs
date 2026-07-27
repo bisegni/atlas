@@ -71,6 +71,9 @@ mod macos {
     #[derive(Debug, Clone)]
     pub struct ResidentKernelTiming {
         pub kernel: &'static str,
+        /// Optional executor-supplied semantic label for diagnostic profiles.
+        /// This never changes the compiled pipeline selected by `kernel`.
+        pub profiling_label: Option<&'static str>,
         pub threads: usize,
         pub threadgroups: usize,
         pub threads_per_threadgroup: usize,
@@ -123,6 +126,25 @@ mod macos {
             threadgroups: usize,
             threads_per_threadgroup: usize,
         ) -> Result<(), MetalError> {
+            self.dispatch_threadgroups_1d_labeled(
+                kernel,
+                None,
+                buffers,
+                threadgroups,
+                threads_per_threadgroup,
+            )
+        }
+
+        /// As [`Self::dispatch_threadgroups_1d`], with a semantic diagnostic
+        /// label distinct from the Metal pipeline name.
+        pub fn dispatch_threadgroups_1d_labeled(
+            &mut self,
+            kernel: &'static str,
+            profiling_label: Option<&'static str>,
+            buffers: &[&GpuBuffer],
+            threadgroups: usize,
+            threads_per_threadgroup: usize,
+        ) -> Result<(), MetalError> {
             let encode_started = Instant::now();
             if self.encoder.is_none() {
                 self.encoder = Some(
@@ -155,6 +177,7 @@ mod macos {
             );
             self.complete_profiled_dispatch(
                 kernel,
+                profiling_label,
                 0,
                 threadgroups,
                 threads_per_threadgroup,
@@ -213,6 +236,7 @@ mod macos {
             );
             self.complete_profiled_dispatch(
                 kernel,
+                None,
                 0,
                 threadgroups,
                 threads_per_threadgroup,
@@ -224,6 +248,18 @@ mod macos {
         pub fn dispatch_1d(
             &mut self,
             kernel: &'static str,
+            buffers: &[&GpuBuffer],
+            count: usize,
+        ) -> Result<(), MetalError> {
+            self.dispatch_1d_labeled(kernel, None, buffers, count)
+        }
+
+        /// As [`Self::dispatch_1d`], with a semantic diagnostic label distinct
+        /// from the Metal pipeline name.
+        pub fn dispatch_1d_labeled(
+            &mut self,
+            kernel: &'static str,
+            profiling_label: Option<&'static str>,
             buffers: &[&GpuBuffer],
             count: usize,
         ) -> Result<(), MetalError> {
@@ -261,6 +297,7 @@ mod macos {
             );
             self.complete_profiled_dispatch(
                 kernel,
+                profiling_label,
                 count,
                 0,
                 self.runtime.pipeline_thread_width(kernel),
@@ -317,6 +354,7 @@ mod macos {
             );
             self.complete_profiled_dispatch(
                 kernel,
+                None,
                 count,
                 0,
                 self.runtime.pipeline_thread_width(kernel),
@@ -328,6 +366,7 @@ mod macos {
         fn complete_profiled_dispatch(
             &mut self,
             kernel: &'static str,
+            profiling_label: Option<&'static str>,
             threads: usize,
             threadgroups: usize,
             threads_per_threadgroup: usize,
@@ -339,6 +378,7 @@ mod macos {
             let timing = self.submit_current()?;
             self.kernel_timings.push(ResidentKernelTiming {
                 kernel,
+                profiling_label,
                 threads,
                 threadgroups,
                 threads_per_threadgroup,
@@ -569,10 +609,13 @@ mod macos {
                 "embedding_lookup_f32",
                 "rms_norm_f32",
                 "rms_norm_decode_f32",
+                "gemma4_rms_residual_f32",
                 "matvec_f32",
                 "matvec_q4_0",
                 "matvec_q4_0_blocked",
                 "matvec_q4_0_16row",
+                "matmul_q4_0_qkv_16row",
+                "matmul_q4_0_gate_up_16row",
                 "matmul_q4_0_batch_16row",
                 "matvec_q8_0",
                 "embedding_lookup_q4_0",
@@ -589,6 +632,7 @@ mod macos {
                 "rms_norm_groups_f32",
                 "rms_norm_groups_unweighted_f32",
                 "rms_norm_groups_in_place_f32",
+                "gemma4_qk_norm_rope_fused_f32",
                 "rms_norm_groups_in_place_stable_f32",
                 "rms_norm_groups_in_place_unweighted_f32",
                 "softcap_f32",
@@ -615,6 +659,11 @@ mod macos {
                 "attention_decode_fused_gemma4_simd_f32",
                 "attention_decode_fused_gemma4_simd_q8_0",
                 "attention_decode_fused_gemma4_simd_q4_0",
+                "attention_decode_fused_gemma4_simd_q4_0_2pass_1",
+                "attention_decode_fused_gemma4_simd_q4_0_2pass_2",
+                "attention_decode_fused_gemma4_simd_q4_0_32",
+                "attention_decode_fused_gemma4_simd_q4_0_64",
+                "attention_decode_fused_gemma4_simd_q4_0_cacheopt",
                 "attention_scores_resident_f32",
                 "masked_softmax_resident_f32",
                 "attention_values_resident_f32",
