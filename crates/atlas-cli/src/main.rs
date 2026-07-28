@@ -207,16 +207,17 @@ fn run_chat_turn(
     let generation =
         executor.generate_greedy_chat_stream(&prompt, max_tokens, &CHAT_INTERRUPTED, |event| {
             filter.push(&event.text);
+            let visible_fragment = filter.visible_delta();
             let fragment = if show_thoughts {
-                event.text
+                event.text.replace("<turn|>", "")
             } else {
-                filter.visible_delta()
+                visible_fragment.clone()
             };
             if !fragment.is_empty() {
                 print!("{fragment}");
                 io::stdout().flush()?;
-                visible.push_str(&fragment);
             }
+            visible.push_str(&visible_fragment);
             Ok(())
         })?;
     let (final_visible, thoughts) = filter.finish();
@@ -252,6 +253,7 @@ struct ThoughtFilter {
 impl ThoughtFilter {
     fn push(&mut self, text: &str) {
         self.pending.push_str(text);
+        self.strip_end_turn_markers();
         loop {
             if self.in_thought {
                 if let Some(end) = self.pending.find("</think>") {
@@ -266,10 +268,22 @@ impl ThoughtFilter {
                 self.pending.drain(..start + 7);
                 self.in_thought = true;
             } else {
-                self.visible.push_str(&self.pending);
-                self.pending.clear();
+                // The end-of-turn marker is normally one token, but retain a
+                // possible partial marker so it cannot leak into the terminal
+                // or become stored assistant content when token text is split.
+                let retained = trailing_marker_prefix_len(&self.pending, "<turn|>");
+                let visible_len = self.pending.len() - retained;
+                self.visible.push_str(&self.pending[..visible_len]);
+                self.pending.drain(..visible_len);
                 break;
             }
+        }
+    }
+
+    fn strip_end_turn_markers(&mut self) {
+        const END_TURN: &str = "<turn|>";
+        while let Some(start) = self.pending.find(END_TURN) {
+            self.pending.drain(start..start + END_TURN.len());
         }
     }
     fn visible_delta(&mut self) -> String {
@@ -278,13 +292,23 @@ impl ThoughtFilter {
         value
     }
     fn finish(mut self) -> (String, String) {
+        self.strip_end_turn_markers();
         if self.in_thought {
             self.thoughts.push_str(&self.pending);
         } else {
-            self.visible.push_str(&self.pending);
+            let retained = trailing_marker_prefix_len(&self.pending, "<turn|>");
+            let visible_len = self.pending.len() - retained;
+            self.visible.push_str(&self.pending[..visible_len]);
         }
         (self.visible, self.thoughts)
     }
+}
+
+fn trailing_marker_prefix_len(text: &str, marker: &str) -> usize {
+    (1..marker.len())
+        .rev()
+        .find(|&len| text.ends_with(&marker[..len]))
+        .unwrap_or(0)
 }
 
 fn emit_metrics(
@@ -862,7 +886,7 @@ fn metal_info() -> Result<()> {
 
 #[cfg(test)]
 mod kv_cache_cli_tests {
-    use super::{Gemma4KvCacheType, parse_benchmark_args, parse_chat_args};
+    use super::{Gemma4KvCacheType, ThoughtFilter, parse_benchmark_args, parse_chat_args};
 
     #[test]
     fn chat_accepts_explicit_kv_cache_precision() {
@@ -894,5 +918,17 @@ mod kv_cache_cli_tests {
         assert_eq!(tokens, 128);
         assert_eq!(cache_type, Gemma4KvCacheType::Q4_0);
         assert!(parse_benchmark_args(&args[..4]).is_err());
+    }
+
+    #[test]
+    fn chat_filter_hides_end_turn_markers_even_when_split_across_events() {
+        let mut filter = ThoughtFilter::default();
+        filter.push("Hello<turn");
+        assert_eq!(filter.visible_delta(), "Hello");
+        filter.push("|>");
+        assert_eq!(filter.visible_delta(), "");
+        let (visible, thoughts) = filter.finish();
+        assert_eq!(visible, "Hello");
+        assert!(thoughts.is_empty());
     }
 }

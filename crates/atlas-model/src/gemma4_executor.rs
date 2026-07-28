@@ -189,9 +189,19 @@ impl Gemma4PrefillPlan {
     }
 }
 
-fn gemma4_prefill_path(prompt_tokens: usize, stage_tracing: bool) -> &'static str {
-    if prompt_tokens > 1 && !stage_tracing {
+fn gemma4_token_major_prefill_requested() -> bool {
+    std::env::var_os("ATLAS_GEMMA4_PREFILL_TOKEN_MAJOR").is_some()
+}
+
+fn gemma4_prefill_path(
+    prompt_tokens: usize,
+    stage_tracing: bool,
+    token_major_override: bool,
+) -> &'static str {
+    if prompt_tokens > 1 && !stage_tracing && !token_major_override {
         "resident_layer_major"
+    } else if token_major_override {
+        "resident_token_major_command"
     } else {
         "resident_chunked_command"
     }
@@ -1146,6 +1156,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
             prefill_path: gemma4_prefill_path(
                 prompt_ids.len(),
                 std::env::var_os("ATLAS_GEMMA4_TRACE_STAGES").is_some(),
+                gemma4_token_major_prefill_requested(),
             ),
             attention_kernel: gemma4_attention_kernel(self.kv_cache_type),
             kv_cache_type: self.kv_cache_type,
@@ -1215,6 +1226,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
         let prefill_path = gemma4_prefill_path(
             prompt_ids.len(),
             std::env::var_os("ATLAS_GEMMA4_TRACE_STAGES").is_some(),
+            gemma4_token_major_prefill_requested(),
         );
         let mut selected = 0;
         let chunk_count = plan.chunks;
@@ -1406,6 +1418,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
         if gemma4_prefill_path(
             tokens.len(),
             std::env::var_os("ATLAS_GEMMA4_TRACE_STAGES").is_some(),
+            gemma4_token_major_prefill_requested(),
         ) == "resident_layer_major"
         {
             return self.forward_tokens_layer_major(tokens, select_last);
@@ -3209,10 +3222,23 @@ mod tests {
 
     #[test]
     fn layer_major_prefill_is_the_normal_multi_token_resident_path() {
-        assert_eq!(gemma4_prefill_path(1, false), "resident_chunked_command");
-        assert_eq!(gemma4_prefill_path(2, false), "resident_layer_major");
-        assert_eq!(gemma4_prefill_path(128, false), "resident_layer_major");
-        assert_eq!(gemma4_prefill_path(128, true), "resident_chunked_command");
+        assert_eq!(
+            gemma4_prefill_path(1, false, false),
+            "resident_chunked_command"
+        );
+        assert_eq!(gemma4_prefill_path(2, false, false), "resident_layer_major");
+        assert_eq!(
+            gemma4_prefill_path(128, false, false),
+            "resident_layer_major"
+        );
+        assert_eq!(
+            gemma4_prefill_path(128, true, false),
+            "resident_chunked_command"
+        );
+        assert_eq!(
+            gemma4_prefill_path(128, false, true),
+            "resident_token_major_command"
+        );
     }
 
     #[test]

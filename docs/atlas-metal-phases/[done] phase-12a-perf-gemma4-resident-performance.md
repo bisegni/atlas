@@ -63,6 +63,11 @@ row while sharing the batch's Resident matrices and immutable causal controls;
 their correctness and throughput still require the fixture-gated Metal
 acceptance evidence before this path can be considered performance-proven.
 
+Set `ATLAS_GEMMA4_PREFILL_TOKEN_MAJOR=1` to force the retained token-major
+path for a same-build parity comparison. Metrics then report
+`prefill_path: "resident_token_major_command"`; without the override, a
+normal multi-token prompt reports `"resident_layer_major"`.
+
 #### Avoiding discarded prompt output work
 
 Only the last prompt token needs to select the first generated token. Earlier
@@ -453,6 +458,19 @@ plus JSON summary under `artifacts/phase-12a-perf/`:
 ```zsh
 scripts/run-gemma4-performance-acceptance.sh
 ```
+
+For a single-artifact token-major versus layer-major comparison, run:
+
+```zsh
+scripts/run-gemma4-prefill-ab.sh
+```
+
+Its first argument defaults to `ATLAS_GEMMA4_PREFILL_TOKEN_MAJOR=1` and its
+second argument defaults to `-` (no extra variable, therefore layer-major).
+Pass `-` for either argument when no override is wanted. The script stores the
+two raw acceptance summaries and one combined
+`artifacts/phase-12a-prefill-ab/<timestamp>/prefill-ab-summary.json`; its
+nonzero exit status means the fixed 128-token stream or EOS position differs.
 
 The runner executes the same workload and exact decode profile for `f32`,
 `q8_0`, and `q4_0` KV caches, storing each mode in its own subdirectory plus
