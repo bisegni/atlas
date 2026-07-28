@@ -52,10 +52,16 @@ one. The selected path and effective chunk size are observable as
 `prefill_chunks` in both the terminal metrics and
 `artifacts/chat-performance.jsonl`.
 
-This is command-buffer batching, not yet a layer-major matrix-matrix prefill
-implementation. Layers still process the prompt tokens in dependency order
-inside the command buffer. The longer-prompt measurements below show why a
-future layer-major batched projection and attention path is still needed.
+This command-buffer batching was the original accepted implementation. The
+current Resident executor additionally promotes normal multi-token chunks to
+`prefill_path: "resident_layer_major"`: prompt activations are kept in
+row-major GPU matrices and every layer's Q4_0 Q/K/V, attention-output, FFN,
+and PLE projections dispatch as packed matrix-matrix work over the chunk. The
+old token-major command path remains only for stage tracing and single-token
+chunks. K/V append and causal attention retain one logical dispatch per query
+row while sharing the batch's Resident matrices and immutable causal controls;
+their correctness and throughput still require the fixture-gated Metal
+acceptance evidence before this path can be considered performance-proven.
 
 #### Avoiding discarded prompt output work
 
@@ -249,13 +255,11 @@ The following work is intentionally deferred to the next Gemma performance
 iteration. Each strategy must be measured on the normal release `chat` path and
 must preserve exact greedy token output before promotion.
 
-1. **Implement layer-major batched prefill.** Store prompt activations as a
-   `[tokens, hidden]` matrix and process a whole chunk through each transformer
-   layer. Replace repeated Q4_0 matrix-vector projections with packed Q4_0
-   matrix-matrix kernels. This is the most direct route from the current
-   command-buffer batching to actual GPU compute batching and is the primary
-   candidate for reaching the 50 tok/s long-prompt gate.
-2. **Add batched causal and sliding-window attention.** Compute queries, keys,
+1. **Promote and measure layer-major batched prefill.** The executor now stores
+   prompt activations as a `[tokens, hidden]` matrix and dispatches the Q4_0
+   projections as packed matrix-matrix work. Establish exact-token Resident
+   parity and five-warm-run throughput evidence before treating it as accepted.
+2. **Add fully batched causal and sliding-window attention.** Compute queries, keys,
    and values for the prompt chunk together, apply the correct full/sliding
    causal mask across chunk boundaries, and write the resulting keys and values
    to the shared KV cache in one batched operation. Fuse score scaling, masking,

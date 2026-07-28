@@ -96,6 +96,43 @@ kernel void rms_norm_f32(
     for (uint column = 0; column < hidden; ++column) { output[row * hidden + column] = input[row * hidden + column] * inverse_rms * weight[column]; }
 }
 
+// Batched row normalization for prefill.  Unlike the decode kernel, every
+// dispatch row is an independent prompt activation, so one grid thread owns a
+// complete row and preserves the scalar reduction order used by the existing
+// grouped kernels.
+kernel void rms_norm_rows_f32(
+    device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &width [[buffer(3)]],
+    constant uint &rows [[buffer(4)]], constant float &epsilon [[buffer(5)]],
+    uint row [[thread_position_in_grid]]) {
+    if (row >= rows) return;
+    uint base = row * width;
+    float squared_sum = 0.0f;
+    for (uint column = 0; column < width; ++column) {
+        float value = input[base + column];
+        squared_sum += value * value;
+    }
+    float inverse_rms = rsqrt(squared_sum / float(width) + epsilon);
+    for (uint column = 0; column < width; ++column)
+        output[base + column] = input[base + column] * inverse_rms * weight[column];
+}
+
+kernel void rms_norm_rows_unweighted_f32(
+    device const float *input [[buffer(0)]], device float *output [[buffer(1)]],
+    constant uint &width [[buffer(2)]], constant uint &rows [[buffer(3)]],
+    constant float &epsilon [[buffer(4)]], uint row [[thread_position_in_grid]]) {
+    if (row >= rows) return;
+    uint base = row * width;
+    float squared_sum = 0.0f;
+    for (uint column = 0; column < width; ++column) {
+        float value = input[base + column];
+        squared_sum += value * value;
+    }
+    float inverse_rms = rsqrt(squared_sum / float(width) + epsilon);
+    for (uint column = 0; column < width; ++column)
+        output[base + column] = input[base + column] * inverse_rms;
+}
+
 // Decode normalizes one hidden-state row at a time.  A single scalar thread
 // made this a serial bubble between resident projections; keep the same FP32
 // reduction/order per lane but spread the row across one Apple SIMD-group.
@@ -394,6 +431,21 @@ kernel void matmul_q4_0_batch_16row(
     sum += simd_shuffle_xor(sum, 1);
     if (column == 0 && token < batch && row < output_width)
         output[token * output_width + row] = sum;
+}
+
+kernel void matmul_f16_batch(
+    device const float *input [[buffer(0)]], device const half *weights [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
+    constant uint &output_width [[buffer(4)]], constant uint &batch [[buffer(5)]],
+    uint id [[thread_position_in_grid]]) {
+    uint token = id / output_width;
+    uint row = id % output_width;
+    if (token >= batch || row >= output_width) return;
+    float sum = 0.0f;
+    device const float *token_input = input + token * input_width;
+    for (uint column = 0; column < input_width; ++column)
+        sum += token_input[column] * float(weights[row * input_width + column]);
+    output[token * output_width + row] = sum;
 }
 
 kernel void matvec_q8_0(

@@ -21,6 +21,7 @@ const GEMMA4_TRACE_GLOBAL_STAGES: usize = 6;
 const GEMMA4_Q4_TWO_PASS_ATTENTION_BLOCKS: usize = 4;
 const GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD: usize = 64;
 const GEMMA4_Q4_TWO_PASS_ATTENTION_LEGACY_THRESHOLD: usize = 96;
+const GEMMA4_PREFILL_BATCH_CAPACITY: usize = 128;
 
 fn gemma4_q4_two_pass_attention_threshold(experiment: Option<&str>) -> Option<usize> {
     match experiment {
@@ -185,6 +186,14 @@ impl Gemma4PrefillPlan {
             chunk_size,
             chunks: prompt_tokens.div_ceil(chunk_size),
         })
+    }
+}
+
+fn gemma4_prefill_path(prompt_tokens: usize, stage_tracing: bool) -> &'static str {
+    if prompt_tokens > 1 && !stage_tracing {
+        "resident_layer_major"
+    } else {
+        "resident_chunked_command"
     }
 }
 
@@ -414,6 +423,30 @@ pub struct Gemma4TokenEvent {
     pub latency: Duration,
 }
 
+/// Reusable GPU matrices for layer-major prompt prefill.  Decode deliberately
+/// continues to use the narrow single-token buffers below; prompt execution
+/// owns one row per token and swaps `state`/`next_state` after each layer.
+struct Gemma4PrefillBuffers {
+    state: GpuBuffer,
+    next_state: GpuBuffer,
+    residual: GpuBuffer,
+    norm: GpuBuffer,
+    q: GpuBuffer,
+    q_rot: GpuBuffer,
+    k: GpuBuffer,
+    k_rot: GpuBuffer,
+    v: GpuBuffer,
+    attention: GpuBuffer,
+    work: GpuBuffer,
+    gate: GpuBuffer,
+    up: GpuBuffer,
+    activated: GpuBuffer,
+    product: GpuBuffer,
+    ple_lookup: GpuBuffer,
+    ple_projected: GpuBuffer,
+    ple: GpuBuffer,
+}
+
 pub struct Gemma4E2bExecutor<'a> {
     model: &'a Gemma4E2bModel,
     max_context: usize,
@@ -482,6 +515,7 @@ pub struct Gemma4E2bExecutor<'a> {
     rope_swa_cos: GpuBuffer,
     rope_swa_sin: GpuBuffer,
     rope_freq_factors: Vec<f32>,
+    prefill: Gemma4PrefillBuffers,
     pending_weight_upload_bytes: u64,
 }
 
@@ -581,6 +615,26 @@ impl<'a> Gemma4E2bExecutor<'a> {
             })
             .collect::<Result<Vec<_>>>()?;
         let weight_upload_bytes = model.ensure_resident_weights()?;
+        let prefill = Gemma4PrefillBuffers {
+            state: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * h)?,
+            next_state: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * h)?,
+            residual: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * h)?,
+            norm: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * h)?,
+            q: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * q_width)?,
+            q_rot: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * q_width)?,
+            k: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * head)?,
+            k_rot: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * head)?,
+            v: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * head)?,
+            attention: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * q_width)?,
+            work: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * h)?,
+            gate: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * max_ffn)?,
+            up: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * max_ffn)?,
+            activated: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * max_ffn)?,
+            product: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * max_ffn)?,
+            ple_lookup: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * ple_total)?,
+            ple_projected: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * ple_total)?,
+            ple: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * ple_total)?,
+        };
         Ok(Self {
             model,
             max_context,
@@ -686,6 +740,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
             rope_swa_cos: allocate(head / 2)?,
             rope_swa_sin: allocate(head / 2)?,
             rope_freq_factors,
+            prefill,
             pending_weight_upload_bytes: weight_upload_bytes,
         })
     }
@@ -741,6 +796,29 @@ impl<'a> Gemma4E2bExecutor<'a> {
             .into_iter()
             .flatten()
             .map(|v| v.bytes() as u64)
+            .sum::<u64>()
+            + [
+                &self.prefill.state,
+                &self.prefill.next_state,
+                &self.prefill.residual,
+                &self.prefill.norm,
+                &self.prefill.q,
+                &self.prefill.q_rot,
+                &self.prefill.k,
+                &self.prefill.k_rot,
+                &self.prefill.v,
+                &self.prefill.attention,
+                &self.prefill.work,
+                &self.prefill.gate,
+                &self.prefill.up,
+                &self.prefill.activated,
+                &self.prefill.product,
+                &self.prefill.ple_lookup,
+                &self.prefill.ple_projected,
+                &self.prefill.ple,
+            ]
+            .iter()
+            .map(|buffer| buffer.bytes() as u64)
             .sum::<u64>()
     }
 
@@ -825,6 +903,55 @@ impl<'a> Gemma4E2bExecutor<'a> {
             )?;
         } else {
             command.dispatch_1d_labeled(kernel, profiling_label, buffers, output_width)?;
+        }
+        Ok(())
+    }
+
+    /// Apply one resident weight matrix to every row of a prompt activation
+    /// matrix.  The input/output layout is row-major `[tokens, width]`; model
+    /// weights remain in their original GGUF packing.
+    fn matmul_batch(
+        &self,
+        command: &mut atlas_metal::ResidentCommand<'_>,
+        input: &GpuBuffer,
+        weight: &GpuBuffer,
+        output: &GpuBuffer,
+        input_width: &GpuBuffer,
+        output_width: &GpuBuffer,
+        batch: &GpuBuffer,
+        output_width_value: usize,
+        batch_value: usize,
+        format: GgufTensorType,
+    ) -> Result<()> {
+        let kernel = match format {
+            GgufTensorType::Q4_0 => "matmul_q4_0_batch_16row",
+            GgufTensorType::Q6K => "matmul_q6_k_batch_8row",
+            GgufTensorType::F16 => "matmul_f16_batch",
+            other => anyhow::bail!("unsupported Gemma batched matrix format {other:?}"),
+        };
+        let buffers = &[input, weight, output, input_width, output_width, batch];
+        match format {
+            GgufTensorType::Q4_0 => command.dispatch_threadgroups_1d_labeled(
+                kernel,
+                Some("layer_major_batched_projection"),
+                buffers,
+                batch_value * output_width_value.div_ceil(16),
+                128,
+            )?,
+            GgufTensorType::Q6K => command.dispatch_threadgroups_1d_labeled(
+                kernel,
+                Some("layer_major_batched_projection"),
+                buffers,
+                batch_value * output_width_value.div_ceil(8),
+                128,
+            )?,
+            GgufTensorType::F16 => command.dispatch_1d_labeled(
+                kernel,
+                Some("layer_major_batched_projection"),
+                buffers,
+                batch_value * output_width_value,
+            )?,
+            _ => unreachable!("formats above are exhaustive"),
         }
         Ok(())
     }
@@ -1016,7 +1143,10 @@ impl<'a> Gemma4E2bExecutor<'a> {
         Ok(Gemma4DecodeProfile {
             prompt_tokens: prompt_ids.len(),
             requested_decode_tokens: decode_tokens,
-            prefill_path: "resident_chunked_command",
+            prefill_path: gemma4_prefill_path(
+                prompt_ids.len(),
+                std::env::var_os("ATLAS_GEMMA4_TRACE_STAGES").is_some(),
+            ),
             attention_kernel: gemma4_attention_kernel(self.kv_cache_type),
             kv_cache_type: self.kv_cache_type,
             samples,
@@ -1082,6 +1212,10 @@ impl<'a> Gemma4E2bExecutor<'a> {
         self.position = 0;
         let prefill_started = Instant::now();
         let plan = Gemma4PrefillPlan::new(prompt_ids.len(), self.max_context)?;
+        let prefill_path = gemma4_prefill_path(
+            prompt_ids.len(),
+            std::env::var_os("ATLAS_GEMMA4_TRACE_STAGES").is_some(),
+        );
         let mut selected = 0;
         let chunk_count = plan.chunks;
         for (chunk_index, chunk) in prompt_ids.chunks(plan.chunk_size).enumerate() {
@@ -1161,7 +1295,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 prefill,
                 decode: decode_started.elapsed(),
                 host_wall_time: started.elapsed(),
-                prefill_path: "resident_chunked_command",
+                prefill_path,
                 prefill_chunk_size: plan.chunk_size,
                 prefill_chunks: plan.chunks,
                 attention_kernel: gemma4_attention_kernel(self.kv_cache_type),
@@ -1266,6 +1400,16 @@ impl<'a> Gemma4E2bExecutor<'a> {
             self.position + tokens.len() <= self.max_context,
             "Gemma executor context exhausted"
         );
+        // Stage tracing is deliberately kept on the scalar oracle until the
+        // layer-major trace format is introduced.  Normal Resident prefill
+        // always takes this real matrix path for a multi-token chunk.
+        if gemma4_prefill_path(
+            tokens.len(),
+            std::env::var_os("ATLAS_GEMMA4_TRACE_STAGES").is_some(),
+        ) == "resident_layer_major"
+        {
+            return self.forward_tokens_layer_major(tokens, select_last);
+        }
         // Prompt tokens are known before execution. Keep them and their
         // positions in GPU-visible buffers, then encode the dependent token
         // forwards into one command buffer. Scratch and KV buffers are reused
@@ -1357,6 +1501,623 @@ impl<'a> Gemma4E2bExecutor<'a> {
             .then(|| runtime.read_u32(&self.selected))
             .transpose()
             .map_err(Into::into)
+    }
+
+    fn forward_tokens_layer_major(
+        &mut self,
+        tokens: &[u32],
+        select_last: bool,
+    ) -> Result<Option<u32>> {
+        ensure!(
+            tokens.len() <= GEMMA4_PREFILL_BATCH_CAPACITY,
+            "Gemma layer-major prefill batch exceeds capacity"
+        );
+        let runtime = self.model.runtime();
+        let c = &self.model.config;
+        let batch_value = tokens.len();
+        let batch = runtime.upload_u32(&[u32::try_from(batch_value)?])?;
+        let token_batch = runtime.upload_u32(tokens)?;
+        let positions = (self.position..self.position + batch_value)
+            .map(u32::try_from)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let position_batch = runtime.upload_u32(&positions)?;
+        let rope_pairs = c.key_length.max(c.key_length_swa) / 2;
+        let mut full_cos = vec![0.0; batch_value * rope_pairs];
+        let mut full_sin = vec![0.0; batch_value * rope_pairs];
+        let mut swa_cos = vec![0.0; batch_value * rope_pairs];
+        let mut swa_sin = vec![0.0; batch_value * rope_pairs];
+        for (token, position) in (self.position..self.position + batch_value).enumerate() {
+            for pair in 0..rope_pairs {
+                let full_angle = gemma4_rope_angle(
+                    position,
+                    pair,
+                    c.rope_dimensions,
+                    c.rope_theta,
+                    self.rope_freq_factors[pair],
+                );
+                let swa_angle =
+                    gemma4_rope_angle(position, pair, c.rope_dimensions_swa, c.rope_theta_swa, 1.0);
+                full_cos[token * rope_pairs + pair] = full_angle.cos();
+                full_sin[token * rope_pairs + pair] = full_angle.sin();
+                swa_cos[token * rope_pairs + pair] = swa_angle.cos();
+                swa_sin[token * rope_pairs + pair] = swa_angle.sin();
+            }
+        }
+        let full_cos = runtime.upload_f32(&full_cos)?;
+        let full_sin = runtime.upload_f32(&full_sin)?;
+        let swa_cos = runtime.upload_f32(&swa_cos)?;
+        let swa_sin = runtime.upload_f32(&swa_sin)?;
+        let key_counts = runtime.upload_u32(&gemma4_attention_key_count_table(
+            self.position,
+            batch_value,
+            &c.sliding_pattern,
+            c.sliding_window,
+        )?)?;
+        let h = c.hidden_size;
+        let ple_total = c.layers * c.per_layer_embedding_size;
+        let h_batch = runtime.upload_u32(&[u32::try_from(batch_value * h)?])?;
+        let ple_batch = runtime.upload_u32(&[u32::try_from(batch_value * ple_total)?])?;
+        let mut command = runtime.begin_resident_command_with_exact_timing(false)?;
+        let token_embd = self.weight("token_embd.weight", GgufTensorType::Q6K)?;
+        let per_layer_embd = self.weight("per_layer_token_embd.weight", GgufTensorType::Q6K)?;
+        let per_layer_proj = self.weight("per_layer_model_proj.weight", GgufTensorType::F16)?;
+        let per_layer_norm = self.weight("per_layer_proj_norm.weight", GgufTensorType::F32)?;
+        command.dispatch_1d(
+            "embedding_lookup_q6_k",
+            &[
+                &token_embd,
+                &token_batch,
+                &self.prefill.state,
+                &self.vocab,
+                &self.hidden,
+                &batch,
+            ],
+            batch_value * h,
+        )?;
+        command.dispatch_1d(
+            "scalar_multiply_f32",
+            &[
+                &self.prefill.state,
+                &self.prefill.state,
+                &self.embed_scale,
+                &h_batch,
+            ],
+            batch_value * h,
+        )?;
+        command.dispatch_1d(
+            "embedding_lookup_q6_k",
+            &[
+                &per_layer_embd,
+                &token_batch,
+                &self.prefill.ple_lookup,
+                &self.vocab,
+                &self.ple_total,
+                &batch,
+            ],
+            batch_value * ple_total,
+        )?;
+        command.dispatch_1d(
+            "scalar_multiply_f32",
+            &[
+                &self.prefill.ple_lookup,
+                &self.prefill.ple_lookup,
+                &self.ple_embedding_scale,
+                &ple_batch,
+            ],
+            batch_value * ple_total,
+        )?;
+        self.matmul_batch(
+            &mut command,
+            &self.prefill.state,
+            &per_layer_proj,
+            &self.prefill.ple_projected,
+            &self.hidden,
+            &self.ple_total,
+            &batch,
+            ple_total,
+            batch_value,
+            GgufTensorType::F16,
+        )?;
+        command.dispatch_1d(
+            "scalar_multiply_f32",
+            &[
+                &self.prefill.ple_projected,
+                &self.prefill.ple_projected,
+                &self.ple_projection_scale,
+                &ple_batch,
+            ],
+            batch_value * ple_total,
+        )?;
+        for token in 0..batch_value {
+            let offset = token * ple_total * std::mem::size_of::<f32>();
+            command.dispatch_1d_at(
+                "rms_norm_groups_in_place_stable_f32",
+                &[
+                    (&self.prefill.ple_projected, offset),
+                    (&per_layer_norm, 0),
+                    (&self.ple_width, 0),
+                    (&self.layers, 0),
+                    (&self.epsilon, 0),
+                ],
+                c.layers,
+            )?;
+        }
+        command.dispatch_1d(
+            "vector_add_f32",
+            &[
+                &self.prefill.ple_lookup,
+                &self.prefill.ple_projected,
+                &self.prefill.ple,
+                &ple_batch,
+            ],
+            batch_value * ple_total,
+        )?;
+        command.dispatch_1d(
+            "scalar_multiply_f32",
+            &[
+                &self.prefill.ple,
+                &self.prefill.ple,
+                &self.ple_input_scale,
+                &ple_batch,
+            ],
+            batch_value * ple_total,
+        )?;
+
+        for layer in 0..c.layers {
+            self.encode_prefill_layer_major_layer(
+                &mut command,
+                layer,
+                batch_value,
+                &batch,
+                &position_batch,
+                &full_cos,
+                &full_sin,
+                &swa_cos,
+                &swa_sin,
+                rope_pairs,
+                &key_counts,
+            )?;
+        }
+        self.position += batch_value;
+        if select_last {
+            let state_offset = (batch_value - 1) * h * std::mem::size_of::<f32>();
+            let output_norm = self.weight("output_norm.weight", GgufTensorType::F32)?;
+            command.dispatch_threadgroups_1d_at(
+                "rms_norm_decode_f32",
+                &[
+                    (&self.prefill.state, state_offset),
+                    (&output_norm, 0),
+                    (&self.norm, 0),
+                    (&self.hidden, 0),
+                    (&self.epsilon, 0),
+                ],
+                1,
+                32,
+            )?;
+            self.matvec(
+                &mut command,
+                &self.norm,
+                &token_embd,
+                &self.logits,
+                &self.hidden,
+                &self.vocab,
+                c.vocab_size,
+                GgufTensorType::Q6K,
+            )?;
+            command.dispatch_1d(
+                "softcap_f32",
+                &[&self.logits, &self.final_softcap, &self.vocab],
+                c.vocab_size,
+            )?;
+            command.dispatch_threadgroups_1d(
+                "argmax_f32",
+                &[&self.logits, &self.selected, &self.vocab],
+                1,
+                256,
+            )?;
+        }
+        command.finish()?;
+        select_last
+            .then(|| runtime.read_u32(&self.selected))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_prefill_layer_major_layer(
+        &self,
+        command: &mut atlas_metal::ResidentCommand<'_>,
+        layer: usize,
+        batch_value: usize,
+        batch: &GpuBuffer,
+        positions: &GpuBuffer,
+        full_cos: &GpuBuffer,
+        full_sin: &GpuBuffer,
+        swa_cos: &GpuBuffer,
+        swa_sin: &GpuBuffer,
+        rope_pairs: usize,
+        key_counts: &GpuBuffer,
+    ) -> Result<()> {
+        let runtime = self.model.runtime();
+        let c = &self.model.config;
+        let h = c.hidden_size;
+        let h_batch = runtime.upload_u32(&[u32::try_from(batch_value * h)?])?;
+        let p = format!("blk.{layer}");
+        let sliding = c.sliding_pattern[layer];
+        let head = if sliding {
+            c.key_length_swa
+        } else {
+            c.key_length
+        };
+        let q_width = c.attention_heads * head;
+        let q_width_buffer = if sliding {
+            &self.q_width_swa
+        } else {
+            &self.q_width_full
+        };
+        let head_width = if sliding {
+            &self.head_swa
+        } else {
+            &self.head_full
+        };
+        let source = self.kv_sources[layer];
+        let attn_norm = self.weight(&format!("{p}.attn_norm.weight"), GgufTensorType::F32)?;
+        command.dispatch_1d(
+            "rms_norm_rows_f32",
+            &[
+                &self.prefill.state,
+                &attn_norm,
+                &self.prefill.norm,
+                &self.hidden,
+                batch,
+                &self.epsilon,
+            ],
+            batch_value,
+        )?;
+        let wq = self.weight(&format!("{p}.attn_q.weight"), GgufTensorType::Q4_0)?;
+        self.matmul_batch(
+            command,
+            &self.prefill.norm,
+            &wq,
+            &self.prefill.q,
+            &self.hidden,
+            q_width_buffer,
+            batch,
+            q_width,
+            batch_value,
+            GgufTensorType::Q4_0,
+        )?;
+        let q_norm = self.weight(&format!("{p}.attn_q_norm.weight"), GgufTensorType::F32)?;
+        let (wk, wv, k_norm) = if source == layer {
+            (
+                Some(self.weight(&format!("{p}.attn_k.weight"), GgufTensorType::Q4_0)?),
+                Some(self.weight(&format!("{p}.attn_v.weight"), GgufTensorType::Q4_0)?),
+                Some(self.weight(&format!("{p}.attn_k_norm.weight"), GgufTensorType::F32)?),
+            )
+        } else {
+            (None, None, None)
+        };
+        if source == layer {
+            self.matmul_batch(
+                command,
+                &self.prefill.norm,
+                wk.as_ref().expect("provider K weight"),
+                &self.prefill.k,
+                &self.hidden,
+                head_width,
+                batch,
+                head,
+                batch_value,
+                GgufTensorType::Q4_0,
+            )?;
+            self.matmul_batch(
+                command,
+                &self.prefill.norm,
+                wv.as_ref().expect("provider V weight"),
+                &self.prefill.v,
+                &self.hidden,
+                head_width,
+                batch,
+                head,
+                batch_value,
+                GgufTensorType::Q4_0,
+            )?;
+        }
+        let (cos, sin) = if sliding {
+            (swa_cos, swa_sin)
+        } else {
+            (full_cos, full_sin)
+        };
+        for token in 0..batch_value {
+            let q_offset = token * q_width * std::mem::size_of::<f32>();
+            let k_offset = token * head * std::mem::size_of::<f32>();
+            let rope_offset = token * rope_pairs * std::mem::size_of::<f32>();
+            command.dispatch_threadgroups_1d_at(
+                "gemma4_qk_norm_rope_fused_f32",
+                &[
+                    (&self.prefill.q, q_offset),
+                    (&self.prefill.k, k_offset),
+                    (&q_norm, 0),
+                    (k_norm.as_ref().unwrap_or(&q_norm), 0),
+                    (cos, rope_offset),
+                    (sin, rope_offset),
+                    (&self.prefill.q_rot, q_offset),
+                    (&self.prefill.k_rot, k_offset),
+                    (head_width, 0),
+                    (&self.heads, 0),
+                    (&self.one, 0),
+                    (&self.epsilon, 0),
+                ],
+                c.attention_heads + usize::from(source == layer),
+                1,
+            )?;
+            if source == layer {
+                command.dispatch_1d_at(
+                    "rms_norm_groups_in_place_unweighted_f32",
+                    &[
+                        (&self.prefill.v, k_offset),
+                        (head_width, 0),
+                        (&self.one, 0),
+                        (&self.epsilon, 0),
+                    ],
+                    1,
+                )?;
+                let cache = self.kv[layer].as_ref().expect("KV provider has cache");
+                let append_count = if self.kv_cache_type == Gemma4KvCacheType::F32 {
+                    head
+                } else {
+                    head / 32
+                };
+                command.dispatch_1d_at(
+                    gemma4_kv_append_kernel(self.kv_cache_type),
+                    &[
+                        (&self.prefill.k_rot, k_offset),
+                        (&self.prefill.v, k_offset),
+                        (cache, 0),
+                        (head_width, 0),
+                        (&self.capacity, 0),
+                        (positions, token * std::mem::size_of::<u32>()),
+                    ],
+                    append_count,
+                )?;
+            }
+        }
+        let cache = self.kv[source].as_ref().expect("Gemma KV source has cache");
+        let (attention_kernel, attention_threads) = gemma4_attention_binding(self.kv_cache_type);
+        for token in 0..batch_value {
+            let q_offset = token * q_width * std::mem::size_of::<f32>();
+            let controls_offset = (token * c.layers + layer) * std::mem::size_of::<u32>();
+            command.dispatch_threadgroups_1d_at(
+                attention_kernel,
+                &[
+                    (&self.prefill.q_rot, q_offset),
+                    (cache, 0),
+                    (&self.prefill.attention, q_offset),
+                    (&self.heads, 0),
+                    (&self.kv_heads, 0),
+                    (head_width, 0),
+                    (&self.capacity, 0),
+                    (key_counts, controls_offset),
+                ],
+                c.attention_heads,
+                attention_threads,
+            )?;
+        }
+        let wo = self.weight(&format!("{p}.attn_output.weight"), GgufTensorType::Q4_0)?;
+        self.matmul_batch(
+            command,
+            &self.prefill.attention,
+            &wo,
+            &self.prefill.work,
+            q_width_buffer,
+            &self.hidden,
+            batch,
+            h,
+            batch_value,
+            GgufTensorType::Q4_0,
+        )?;
+        let post_attn = self.weight(
+            &format!("{p}.post_attention_norm.weight"),
+            GgufTensorType::F32,
+        )?;
+        command.dispatch_1d(
+            "rms_norm_rows_f32",
+            &[
+                &self.prefill.work,
+                &post_attn,
+                &self.prefill.work,
+                &self.hidden,
+                batch,
+                &self.epsilon,
+            ],
+            batch_value,
+        )?;
+        command.dispatch_1d(
+            "vector_add_f32",
+            &[
+                &self.prefill.state,
+                &self.prefill.work,
+                &self.prefill.residual,
+                &h_batch,
+            ],
+            batch_value * h,
+        )?;
+        let ffn_norm = self.weight(&format!("{p}.ffn_norm.weight"), GgufTensorType::F32)?;
+        command.dispatch_1d(
+            "rms_norm_rows_f32",
+            &[
+                &self.prefill.residual,
+                &ffn_norm,
+                &self.prefill.norm,
+                &self.hidden,
+                batch,
+                &self.epsilon,
+            ],
+            batch_value,
+        )?;
+        let ffn = c.feed_forward_sizes[layer];
+        let ffn_buffer = &self.ffn_widths[layer];
+        let ffn_batch = runtime.upload_u32(&[u32::try_from(batch_value * ffn)?])?;
+        let gate = self.weight(&format!("{p}.ffn_gate.weight"), GgufTensorType::Q4_0)?;
+        let up = self.weight(&format!("{p}.ffn_up.weight"), GgufTensorType::Q4_0)?;
+        let down = self.weight(&format!("{p}.ffn_down.weight"), GgufTensorType::Q4_0)?;
+        self.matmul_batch(
+            command,
+            &self.prefill.norm,
+            &gate,
+            &self.prefill.gate,
+            &self.hidden,
+            ffn_buffer,
+            batch,
+            ffn,
+            batch_value,
+            GgufTensorType::Q4_0,
+        )?;
+        self.matmul_batch(
+            command,
+            &self.prefill.norm,
+            &up,
+            &self.prefill.up,
+            &self.hidden,
+            ffn_buffer,
+            batch,
+            ffn,
+            batch_value,
+            GgufTensorType::Q4_0,
+        )?;
+        command.dispatch_1d(
+            "gelu_f32",
+            &[&self.prefill.gate, &self.prefill.activated, &ffn_batch],
+            batch_value * ffn,
+        )?;
+        command.dispatch_1d(
+            "vector_multiply_f32",
+            &[
+                &self.prefill.activated,
+                &self.prefill.up,
+                &self.prefill.product,
+                &ffn_batch,
+            ],
+            batch_value * ffn,
+        )?;
+        self.matmul_batch(
+            command,
+            &self.prefill.product,
+            &down,
+            &self.prefill.work,
+            ffn_buffer,
+            &self.hidden,
+            batch,
+            h,
+            batch_value,
+            GgufTensorType::Q4_0,
+        )?;
+        let post_ffn = self.weight(&format!("{p}.post_ffw_norm.weight"), GgufTensorType::F32)?;
+        command.dispatch_1d(
+            "rms_norm_rows_f32",
+            &[
+                &self.prefill.work,
+                &post_ffn,
+                &self.prefill.work,
+                &self.hidden,
+                batch,
+                &self.epsilon,
+            ],
+            batch_value,
+        )?;
+        command.dispatch_1d(
+            "vector_add_f32",
+            &[
+                &self.prefill.residual,
+                &self.prefill.work,
+                &self.prefill.state,
+                &h_batch,
+            ],
+            batch_value * h,
+        )?;
+        let inp_gate = self.weight(&format!("{p}.inp_gate.weight"), GgufTensorType::Q4_0)?;
+        let projection = self.weight(&format!("{p}.proj.weight"), GgufTensorType::Q4_0)?;
+        let post_norm = self.weight(&format!("{p}.post_norm.weight"), GgufTensorType::F32)?;
+        let ple_batch =
+            runtime.upload_u32(&[u32::try_from(batch_value * c.per_layer_embedding_size)?])?;
+        self.matmul_batch(
+            command,
+            &self.prefill.state,
+            &inp_gate,
+            &self.prefill.gate,
+            &self.hidden,
+            &self.ple_width,
+            batch,
+            c.per_layer_embedding_size,
+            batch_value,
+            GgufTensorType::Q4_0,
+        )?;
+        command.dispatch_1d(
+            "gelu_f32",
+            &[&self.prefill.gate, &self.prefill.gate, &ple_batch],
+            batch_value * c.per_layer_embedding_size,
+        )?;
+        let ple_offset = &self.ple_offsets[layer];
+        for token in 0..batch_value {
+            let offset = token * c.per_layer_embedding_size * std::mem::size_of::<f32>();
+            let source_offset =
+                token * c.layers * c.per_layer_embedding_size * std::mem::size_of::<f32>();
+            command.dispatch_1d_at(
+                "vector_multiply_offset_f32",
+                &[
+                    (&self.prefill.gate, offset),
+                    (&self.prefill.ple, source_offset),
+                    (&self.prefill.activated, offset),
+                    (ple_offset, 0),
+                    (&self.ple_width, 0),
+                ],
+                c.per_layer_embedding_size,
+            )?;
+        }
+        self.matmul_batch(
+            command,
+            &self.prefill.activated,
+            &projection,
+            &self.prefill.work,
+            &self.ple_width,
+            &self.hidden,
+            batch,
+            h,
+            batch_value,
+            GgufTensorType::Q4_0,
+        )?;
+        command.dispatch_1d(
+            "rms_norm_rows_f32",
+            &[
+                &self.prefill.work,
+                &post_norm,
+                &self.prefill.work,
+                &self.hidden,
+                batch,
+                &self.epsilon,
+            ],
+            batch_value,
+        )?;
+        command.dispatch_1d(
+            "vector_add_f32",
+            &[
+                &self.prefill.state,
+                &self.prefill.work,
+                &self.prefill.state,
+                &h_batch,
+            ],
+            batch_value * h,
+        )?;
+        let scale = self.weight(
+            &format!("{p}.layer_output_scale.weight"),
+            GgufTensorType::F32,
+        )?;
+        command.dispatch_1d(
+            "scalar_multiply_f32",
+            &[&self.prefill.state, &self.prefill.state, &scale, &h_batch],
+            batch_value * h,
+        )?;
+        Ok(())
     }
 
     fn encode_current_token(
@@ -2430,10 +3191,10 @@ mod tests {
         GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD,
         GEMMA4_Q4_TWO_PASS_ATTENTION_LEGACY_THRESHOLD, Gemma4KvCacheType, Gemma4PrefillPlan,
         gemma4_attention_key_count, gemma4_attention_key_count_table,
-        gemma4_ffn_gate_up_fused_enabled_for, gemma4_kernel_family, gemma4_profile_family,
-        gemma4_q4_two_pass_attention_eligible, gemma4_q4_two_pass_attention_threshold,
-        gemma4_rms_epilogue_fused_enabled_for, gemma4_rope_angle, gemma4_should_finish,
-        gemma4_two_pass_attention_ranges,
+        gemma4_ffn_gate_up_fused_enabled_for, gemma4_kernel_family, gemma4_prefill_path,
+        gemma4_profile_family, gemma4_q4_two_pass_attention_eligible,
+        gemma4_q4_two_pass_attention_threshold, gemma4_rms_epilogue_fused_enabled_for,
+        gemma4_rope_angle, gemma4_should_finish, gemma4_two_pass_attention_ranges,
     };
 
     #[test]
@@ -2444,6 +3205,14 @@ mod tests {
         assert_eq!((long.chunk_size, long.chunks), (128, 3));
         assert!(Gemma4PrefillPlan::new(0, 4096).is_err());
         assert!(Gemma4PrefillPlan::new(4097, 4096).is_err());
+    }
+
+    #[test]
+    fn layer_major_prefill_is_the_normal_multi_token_resident_path() {
+        assert_eq!(gemma4_prefill_path(1, false), "resident_chunked_command");
+        assert_eq!(gemma4_prefill_path(2, false), "resident_layer_major");
+        assert_eq!(gemma4_prefill_path(128, false), "resident_layer_major");
+        assert_eq!(gemma4_prefill_path(128, true), "resident_chunked_command");
     }
 
     #[test]
