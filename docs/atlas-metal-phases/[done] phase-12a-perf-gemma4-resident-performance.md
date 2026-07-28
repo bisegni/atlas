@@ -254,43 +254,56 @@ warm thresholds. The 80-key A/B variant also passed, but the 64-key baseline
 was faster in the comparable five-warm-run chat workload: 55.88 versus 55.30
 prefill tok/s and 43.04 versus 41.20 decode tok/s.
 
+### Layer-major prefill parity acceptance
+
+The layer-major prompt matrix path now uses one 32-lane SIMD RMS reduction per
+prompt row, matching the retained token-major decode-order arithmetic. The
+Apple-Silicon A/B artifact at
+`artifacts/phase-12a-prefill-ab/20260728T155943Z/prefill-ab-summary.json`
+passed exact input and output parity: both paths used prompt-token SHA-256
+`bcf3ea6b3900df226bf8e4cd576cde41e1d41cea209af575c14ad4167aef8a1d`, the fixed
+128-token stream SHA-256
+`f5b35fc20fc09e68c5c9d1d0bce7c96d64973e404810dae64e9d34d485579511`, and first
+EOS position 65.
+
+Warm layer-major prefill reached 106.28 tok/s versus 57.33 tok/s token-major,
+an 85.37% improvement. Decode was effectively unchanged at 43.54 versus 43.62
+tok/s. Both runs used the Resident executor, one prefill command buffer, Q4_0
+KV cache, zero warm weight upload, and 3,409,845,456 Resident bytes.
+
 ## Next implementation strategies
 
 The following work is intentionally deferred to the next Gemma performance
 iteration. Each strategy must be measured on the normal release `chat` path and
 must preserve exact greedy token output before promotion.
 
-1. **Promote and measure layer-major batched prefill.** The executor now stores
-   prompt activations as a `[tokens, hidden]` matrix and dispatches the Q4_0
-   projections as packed matrix-matrix work. Establish exact-token Resident
-   parity and five-warm-run throughput evidence before treating it as accepted.
-2. **Add fully batched causal and sliding-window attention.** Compute queries, keys,
+1. **Add fully batched causal and sliding-window attention.** Compute queries, keys,
    and values for the prompt chunk together, apply the correct full/sliding
    causal mask across chunk boundaries, and write the resulting keys and values
    to the shared KV cache in one batched operation. Fuse score scaling, masking,
    softmax, and value accumulation only when a focused oracle test proves the
    same numerical and token-selection result.
-3. **Use the growing-context profile before decode optimization.** The short
+2. **Use the growing-context profile before decode optimization.** The short
    decode reaches about 40 tok/s while the 103-step workload reaches only
    27.02 tok/s. Run the implemented profile first to determine whether
    attention scans, KV-cache layout, projection traffic, synchronization, or
    token selection is responsible for the decline. Optimize the measured
    dominant stage rather than assuming the Q4_0 projections remain dominant.
-4. **Improve KV-cache access locality.** Evaluate a layout that lets one SIMD
+3. **Improve KV-cache access locality.** Evaluate a layout that lets one SIMD
    group read contiguous key/value elements for the active attention window.
    Preserve shared-KV ownership and bounded sliding-window behavior. Compare
    bytes read and GPU duration at positions 1, 32, 64, and 128.
-5. **Evaluate narrow, correctness-gated fusion.** Candidate fusions include
+4. **Evaluate narrow, correctness-gated fusion.** Candidate fusions include
    RMS normalization plus projection preparation, gate plus up projections,
    and attention output plus residual addition. Keep a fusion only when kernel
    timing improves and the independent exact-token oracle remains unchanged;
    the rejected dual gate/up experiment demonstrates that throughput alone is
    not sufficient.
-6. **Move remaining per-token setup to reusable GPU work.** Generate or update
+5. **Move remaining per-token setup to reusable GPU work.** Generate or update
    RoPE values without allocating host vectors, retain all scalar/control
    buffers, and remove avoidable CPU-to-GPU writes and encoder synchronization.
    Confirm the benefit with host time and GPU time reported separately.
-7. **Tune threadgroup shapes per projection size.** The accepted Q4_0 16-row
+6. **Tune threadgroup shapes per projection size.** The accepted Q4_0 16-row
    and Q6_K 8-row kernels are better than the original kernels, but one shape
    may not be optimal for every attention, feed-forward, and vocabulary
    projection. Select shapes from measured matrix dimensions while keeping a
@@ -470,7 +483,8 @@ second argument defaults to `-` (no extra variable, therefore layer-major).
 Pass `-` for either argument when no override is wanted. The script stores the
 two raw acceptance summaries and one combined
 `artifacts/phase-12a-prefill-ab/<timestamp>/prefill-ab-summary.json`; its
-nonzero exit status means the fixed 128-token stream or EOS position differs.
+nonzero exit status means the fixed prompt tokens, 128-token stream, or EOS
+position differs.
 
 The runner executes the same workload and exact decode profile for `f32`,
 `q8_0`, and `q4_0` KV caches, storing each mode in its own subdirectory plus

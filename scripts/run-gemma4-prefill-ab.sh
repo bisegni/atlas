@@ -84,12 +84,16 @@ jq -n \
             }
           },
           comparison: {
+            same_fixed_prompt_tokens:
+              ($old_fixed.records[0].prompt_token_sha256 == $new_fixed.records[0].prompt_token_sha256),
             same_fixed_token_stream:
               ($old_fixed.records[0].generated_token_sha256 == $new_fixed.records[0].generated_token_sha256),
             same_fixed_first_eos:
               ($old_fixed.records[0].first_eos_position == $new_fixed.records[0].first_eos_position),
             token_major_fixed_sha256: $old_fixed.records[0].generated_token_sha256,
             layer_major_fixed_sha256: $new_fixed.records[0].generated_token_sha256,
+            token_major_fixed_prompt_token_sha256: $old_fixed.records[0].prompt_token_sha256,
+            layer_major_fixed_prompt_token_sha256: $new_fixed.records[0].prompt_token_sha256,
             token_major_fixed_first_eos: $old_fixed.records[0].first_eos_position,
             layer_major_fixed_first_eos: $new_fixed.records[0].first_eos_position,
             token_major_prefill_tok_s: $old_chat.warm_summary.prefill_tok_s.median,
@@ -103,7 +107,7 @@ jq -n \
           }
         }
       | .comparison.exact_stream_parity_pass =
-          (.comparison.same_fixed_token_stream and .comparison.same_fixed_first_eos)
+          (.comparison.same_fixed_prompt_tokens and .comparison.same_fixed_token_stream and .comparison.same_fixed_first_eos)
       | .pass =
           ($baseline_exit == 0 and $candidate_exit == 0 and .comparison.exact_stream_parity_pass)
     ' | tee "$summary"

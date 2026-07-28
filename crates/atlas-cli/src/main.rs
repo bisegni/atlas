@@ -491,13 +491,8 @@ fn benchmark(args: &[String]) -> Result<()> {
         &CHAT_INTERRUPTED,
         |_| Ok(()),
     )?;
-    let token_digest = {
-        let mut digest = Sha256::new();
-        for token in &generation.generation.generated_token_ids {
-            digest.update(token.to_le_bytes());
-        }
-        format!("{:x}", digest.finalize())
-    };
+    let prompt_token_digest = token_ids_sha256(&generation.generation.prompt_token_ids);
+    let token_digest = token_ids_sha256(&generation.generation.generated_token_ids);
     let record = json!({
         "event": "gemma4_fixed_workload_benchmark",
         "diagnostic": true,
@@ -505,6 +500,7 @@ fn benchmark(args: &[String]) -> Result<()> {
         "executor": "resident",
         "format": "gguf-gemma4-q4_0",
         "prompt_template": "gemma4_chat",
+        "prompt_token_sha256": prompt_token_digest,
         "kv_cache_type": generation.metrics.kv_cache_type.as_str(),
         "prompt_tokens": generation.generation.prompt_token_ids.len(),
         "fixed_decode_tokens": decode_tokens,
@@ -543,6 +539,14 @@ fn benchmark(args: &[String]) -> Result<()> {
     println!("{record}");
     eprintln!("Gemma fixed-workload benchmark: {GEMMA_FIXED_BENCHMARK_LOG}");
     Ok(())
+}
+
+fn token_ids_sha256(tokens: &[u32]) -> String {
+    let mut digest = Sha256::new();
+    for token in tokens {
+        digest.update(token.to_le_bytes());
+    }
+    format!("{:x}", digest.finalize())
 }
 
 fn parse_benchmark_args(args: &[String]) -> Result<(String, String, usize, Gemma4KvCacheType)> {
@@ -886,7 +890,9 @@ fn metal_info() -> Result<()> {
 
 #[cfg(test)]
 mod kv_cache_cli_tests {
-    use super::{Gemma4KvCacheType, ThoughtFilter, parse_benchmark_args, parse_chat_args};
+    use super::{
+        Gemma4KvCacheType, ThoughtFilter, parse_benchmark_args, parse_chat_args, token_ids_sha256,
+    };
 
     #[test]
     fn chat_accepts_explicit_kv_cache_precision() {
@@ -930,5 +936,11 @@ mod kv_cache_cli_tests {
         let (visible, thoughts) = filter.finish();
         assert_eq!(visible, "Hello");
         assert!(thoughts.is_empty());
+    }
+
+    #[test]
+    fn fixed_benchmark_prompt_identity_is_token_sensitive() {
+        assert_eq!(token_ids_sha256(&[1, 2, 3]), token_ids_sha256(&[1, 2, 3]));
+        assert_ne!(token_ids_sha256(&[1, 2, 3]), token_ids_sha256(&[1, 2, 4]));
     }
 }

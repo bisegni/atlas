@@ -96,41 +96,23 @@ kernel void rms_norm_f32(
     for (uint column = 0; column < hidden; ++column) { output[row * hidden + column] = input[row * hidden + column] * inverse_rms * weight[column]; }
 }
 
-// Batched row normalization for prefill.  Unlike the decode kernel, every
-// dispatch row is an independent prompt activation, so one grid thread owns a
-// complete row and preserves the scalar reduction order used by the existing
-// grouped kernels.
-kernel void rms_norm_rows_f32(
+// Batched prefill counterpart to rms_norm_decode_f32.  Each prompt row owns
+// one SIMD group, preserving the known-good decode reduction and per-lane
+// arithmetic order while still normalizing all rows in one dispatch.
+kernel void rms_norm_decode_batch_f32(
     device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]],
-    device float *output [[buffer(2)]], constant uint &width [[buffer(3)]],
-    constant uint &rows [[buffer(4)]], constant float &epsilon [[buffer(5)]],
-    uint row [[thread_position_in_grid]]) {
-    if (row >= rows) return;
-    uint base = row * width;
+    device float *output [[buffer(2)]], constant uint &hidden [[buffer(3)]],
+    constant float &epsilon [[buffer(4)]], uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    uint base = row * hidden;
     float squared_sum = 0.0f;
-    for (uint column = 0; column < width; ++column) {
+    for (uint column = lane; column < hidden; column += 32) {
         float value = input[base + column];
         squared_sum += value * value;
     }
-    float inverse_rms = rsqrt(squared_sum / float(width) + epsilon);
-    for (uint column = 0; column < width; ++column)
+    float inverse_rms = rsqrt(simd_sum(squared_sum) / float(hidden) + epsilon);
+    for (uint column = lane; column < hidden; column += 32)
         output[base + column] = input[base + column] * inverse_rms * weight[column];
-}
-
-kernel void rms_norm_rows_unweighted_f32(
-    device const float *input [[buffer(0)]], device float *output [[buffer(1)]],
-    constant uint &width [[buffer(2)]], constant uint &rows [[buffer(3)]],
-    constant float &epsilon [[buffer(4)]], uint row [[thread_position_in_grid]]) {
-    if (row >= rows) return;
-    uint base = row * width;
-    float squared_sum = 0.0f;
-    for (uint column = 0; column < width; ++column) {
-        float value = input[base + column];
-        squared_sum += value * value;
-    }
-    float inverse_rms = rsqrt(squared_sum / float(width) + epsilon);
-    for (uint column = 0; column < width; ++column)
-        output[base + column] = input[base + column] * inverse_rms;
 }
 
 // Decode normalizes one hidden-state row at a time.  A single scalar thread

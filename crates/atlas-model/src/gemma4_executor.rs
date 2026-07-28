@@ -966,6 +966,25 @@ impl<'a> Gemma4E2bExecutor<'a> {
         Ok(())
     }
 
+    fn rms_norm_batch_decode_order(
+        &self,
+        command: &mut atlas_metal::ResidentCommand<'_>,
+        input: &GpuBuffer,
+        weight: &GpuBuffer,
+        output: &GpuBuffer,
+        rows: usize,
+    ) -> Result<()> {
+        command
+            .dispatch_threadgroups_1d_labeled(
+                "rms_norm_decode_batch_f32",
+                Some("layer_major_rms_norm"),
+                &[input, weight, output, &self.hidden, &self.epsilon],
+                rows,
+                32,
+            )
+            .map_err(Into::into)
+    }
+
     fn matmul_q4_0_qkv(
         &self,
         command: &mut atlas_metal::ResidentCommand<'_>,
@@ -1775,16 +1794,11 @@ impl<'a> Gemma4E2bExecutor<'a> {
         };
         let source = self.kv_sources[layer];
         let attn_norm = self.weight(&format!("{p}.attn_norm.weight"), GgufTensorType::F32)?;
-        command.dispatch_1d(
-            "rms_norm_rows_f32",
-            &[
-                &self.prefill.state,
-                &attn_norm,
-                &self.prefill.norm,
-                &self.hidden,
-                batch,
-                &self.epsilon,
-            ],
+        self.rms_norm_batch_decode_order(
+            command,
+            &self.prefill.state,
+            &attn_norm,
+            &self.prefill.norm,
             batch_value,
         )?;
         let wq = self.weight(&format!("{p}.attn_q.weight"), GgufTensorType::Q4_0)?;
@@ -1933,16 +1947,11 @@ impl<'a> Gemma4E2bExecutor<'a> {
             &format!("{p}.post_attention_norm.weight"),
             GgufTensorType::F32,
         )?;
-        command.dispatch_1d(
-            "rms_norm_rows_f32",
-            &[
-                &self.prefill.work,
-                &post_attn,
-                &self.prefill.work,
-                &self.hidden,
-                batch,
-                &self.epsilon,
-            ],
+        self.rms_norm_batch_decode_order(
+            command,
+            &self.prefill.work,
+            &post_attn,
+            &self.prefill.work,
             batch_value,
         )?;
         command.dispatch_1d(
@@ -1956,16 +1965,11 @@ impl<'a> Gemma4E2bExecutor<'a> {
             batch_value * h,
         )?;
         let ffn_norm = self.weight(&format!("{p}.ffn_norm.weight"), GgufTensorType::F32)?;
-        command.dispatch_1d(
-            "rms_norm_rows_f32",
-            &[
-                &self.prefill.residual,
-                &ffn_norm,
-                &self.prefill.norm,
-                &self.hidden,
-                batch,
-                &self.epsilon,
-            ],
+        self.rms_norm_batch_decode_order(
+            command,
+            &self.prefill.residual,
+            &ffn_norm,
+            &self.prefill.norm,
             batch_value,
         )?;
         let ffn = c.feed_forward_sizes[layer];
@@ -2026,16 +2030,11 @@ impl<'a> Gemma4E2bExecutor<'a> {
             GgufTensorType::Q4_0,
         )?;
         let post_ffn = self.weight(&format!("{p}.post_ffw_norm.weight"), GgufTensorType::F32)?;
-        command.dispatch_1d(
-            "rms_norm_rows_f32",
-            &[
-                &self.prefill.work,
-                &post_ffn,
-                &self.prefill.work,
-                &self.hidden,
-                batch,
-                &self.epsilon,
-            ],
+        self.rms_norm_batch_decode_order(
+            command,
+            &self.prefill.work,
+            &post_ffn,
+            &self.prefill.work,
             batch_value,
         )?;
         command.dispatch_1d(
@@ -2099,16 +2098,11 @@ impl<'a> Gemma4E2bExecutor<'a> {
             batch_value,
             GgufTensorType::Q4_0,
         )?;
-        command.dispatch_1d(
-            "rms_norm_rows_f32",
-            &[
-                &self.prefill.work,
-                &post_norm,
-                &self.prefill.work,
-                &self.hidden,
-                batch,
-                &self.epsilon,
-            ],
+        self.rms_norm_batch_decode_order(
+            command,
+            &self.prefill.work,
+            &post_norm,
+            &self.prefill.work,
             batch_value,
         )?;
         command.dispatch_1d(
