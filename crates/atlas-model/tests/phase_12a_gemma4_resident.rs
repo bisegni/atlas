@@ -167,3 +167,37 @@ fn fixed_benchmark_continues_after_eos_without_changing_canonical_prefix() {
     assert_eq!(second.first_eos_position, first.first_eos_position);
     assert_eq!(second.metrics.weight_upload_bytes, 0);
 }
+
+#[test]
+#[ignore = "requires local Metal and the Gemma 4 E2B Q4 GGUF fixture"]
+fn fixed_benchmark_window_excludes_warmup_from_decode_measurement() {
+    let canonical = canonical();
+    let prompt = canonical["prompt"].as_str().expect("canonical prompt");
+    let model = Gemma4E2bModel::load_gguf(fixture_path()).expect("load Gemma E2B GGUF");
+    let cancelled = AtomicBool::new(false);
+    let mut no_events = |_| Ok(());
+    let mut executor = Gemma4E2bExecutor::new(&model, 4096).expect("create Resident executor");
+
+    let first = executor
+        .generate_greedy_fixed_benchmark_window_stream(prompt, 32, 16, &cancelled, &mut no_events)
+        .expect("run fixed benchmark window");
+    assert_eq!(first.finish_reason, Gemma4FinishReason::MaxTokens);
+    assert_eq!(first.generation.generated_token_ids.len(), 48);
+    assert_eq!(first.metrics.decode_command_buffers, 16);
+    assert!(
+        first
+            .first_eos_position
+            .is_none_or(|position| (1..=48).contains(&position))
+    );
+
+    executor.reset();
+    let second = executor
+        .generate_greedy_fixed_benchmark_window_stream(prompt, 32, 16, &cancelled, &mut no_events)
+        .expect("repeat fixed benchmark window");
+    assert_eq!(
+        second.generation.generated_token_ids,
+        first.generation.generated_token_ids
+    );
+    assert_eq!(second.metrics.decode_command_buffers, 16);
+    assert_eq!(second.metrics.weight_upload_bytes, 0);
+}

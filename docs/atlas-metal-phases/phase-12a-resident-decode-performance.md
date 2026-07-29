@@ -2,16 +2,21 @@
 
 ## Outcome
 
-Atlas materially improves GPU-resident decode throughput for the larger
-SmolLM2 fixture on Apple Silicon without weakening quantized quality,
-residency, or normal generation semantics.
+Atlas identifies and improves the measured GPU-resident Gemma 4 E2B Q4_0
+decode bottleneck on Apple Silicon without weakening token parity, residency,
+or normal generation semantics. The current work starts with growing-context
+instrumentation before promoting an attention-kernel change.
 
 ## Baseline
 
-The reproducible runtime workload is normal one-shot resident chat:
+The normal user-facing workload remains one-shot resident chat. Diagnostic
+profiling and fixed decode windows are separate so they cannot contaminate
+normal chat metrics:
 
 ```zsh
-cargo run -p atlas-cli -- chat --model larger-q8 --prompt 'Atlas resident inference performance check: explain why GPU-resident decode matters in one sentence.' --max-tokens 32
+cargo run --release -p atlas-cli -- profile --model gemma4-e2b-q4_0 --kv-cache-type q4_0 --decode-tokens 1024 --max-context 2048
+
+cargo run --release -p atlas-cli -- benchmark --model gemma4-e2b-q4_0 --kv-cache-type q4_0 --prompt 'Explain Resident decode.' --warmup-decode-tokens 1024 --decode-tokens 512 --max-context 2048
 ```
 
 Every completed chat turn appends one JSON object to
@@ -22,10 +27,29 @@ upload/readback bytes, and resident bytes.
 
 ## Work
 
-- Keep performance measurement in normal resident `chat`; there are no
-  benchmark, diagnose, golden-suite, or profiling CLI modes. Q8 parity and
-  golden checks remain Rust fixture acceptance coverage rather than public
-  runtime commands.
+- Keep performance measurement in normal resident `chat`. The diagnostic-only
+  `profile` and fixed-window `benchmark` commands are permitted solely to
+  identify long-context decode bottlenecks; Q8 parity and golden checks remain
+  Rust fixture acceptance coverage rather than public runtime commands.
+- Profile the same Resident Q4_0 decode path at 128, 256, 512, 1K, 2K, and 4K
+  generated-token ordinals. Compare attention candidates using a deterministic
+  warm-up window followed by a separately timed decode window, exact full and
+  measured token hashes, first-EOS parity, stable KV residency, and no
+  short-context throughput regression. Run
+  `scripts/run-gemma4-decode-attention-ab.sh` to compare the production
+  64-key four-way context split with an experiment-only one-SIMD Q4 scan. It
+  preserves the production kernel's four interleaved partial dot products and
+  their reduction order, but removes the per-key threadgroup barriers from the
+  first pass. The cross-head shared-KV experiment is retained only as rejected
+  evidence: its synchronization cost cut long-context throughput roughly in
+  half despite exact output parity. The rejected context eight-way split
+  changed the reduction order and therefore token selection; it is not
+  selectable or promotable.
+- The diagnostic profile labels the two-pass attention scan and final combine
+  independently as `gemma_attention_split_scan` and
+  `gemma_attention_split_combine`. Choose the next implementation experiment
+  from the larger measured component; those labels do not alter production
+  dispatches or generation semantics.
 - Remove the measured dominant host/command-buffer costs without adding a CPU
   fallback: retain resident weights, KV, activations, and token selection;
   preserve the single decode command-buffer boundary and token-only default
@@ -38,6 +62,30 @@ upload/readback bytes, and resident bytes.
   language-model-head, and remaining projection families. Split normalization
   and positional work into RMS normalization, fused Q/K norm+RoPE, RoPE
   rotation, and RoPE layout conversion before selecting the next kernel target.
+
+The tied vocabulary projection is Q6_K even in the pinned Q4_0 fixture.
+`ATLAS_GEMMA4_Q6_LM_HEAD_EXPERIMENT=cacheopt` is an opt-in decode candidate
+that preserves the eight-row, 128-thread layout and accumulation order while
+reusing a Q6_K block scale and its 32-value group scale within each lane. It
+must retain exact output and improve the fixed Resident A/B result before it
+can become the production selection.
+
+`ATLAS_GEMMA4_WEIGHT_FORMAT=all_q4` is a separate, unpromoted Resident
+candidate. At executor setup it deterministically re-quantizes the fixture's
+Q6_K `token_embd.weight` and `per_layer_token_embd.weight` tables to Q4_0,
+uploads those derived buffers instead of their Q6_K GPU source buffers, and
+uses `embedding_lookup_q4_0` plus `matvec_q4_0_16row` for both prefill and
+decode. It rejects `ATLAS_GEMMA4_Q6_LM_HEAD_EXPERIMENT` rather than silently
+mixing experiments. Benchmark records expose `weight_format`,
+`embedding_kernel`, and `output_projection_kernel`; an all-Q4 run must report
+no Q6 vocabulary projection.
+
+Use `scripts/run-gemma4-decode-attention-ab.sh - ATLAS_GEMMA4_WEIGHT_FORMAT=all_q4`
+for the fixed five-window Resident A/B artifact. Promotion requires exact
+prompt/full/measured stream SHA and EOS parity, stable Q4 KV and Resident
+accounting, all-Q4 kernel selection, at least 3% sustained long-context decode
+improvement, and no short-context regression. Until then, mixed Q4/Q6 remains
+the production default.
   The default FFN gate/up path combines the two same-input Q4 projections into
   one Metal dispatch. Set
   `ATLAS_GEMMA4_FFN_GATE_UP_EXPERIMENT=baseline` to recover the separate
@@ -77,16 +125,15 @@ upload/readback bytes, and resident bytes.
 
 ## Exit gate
 
-On the same M2 Max, fixture revision, prompt, warm-up policy, and 128-token
-workload as Phase 12, Q4_0 reaches at least 30 tok/s with
-`ExecutorMode::Resident`, 128 generated tokens, and resident bytes no greater
-than the Phase-12 1,366,335,800-byte baseline. Q8_0 must not regress below its
-Phase-12 13.42 tok/s baseline or exceed 2,221,973,816 resident bytes.
+On the same Apple-Silicon hardware, pinned Gemma fixture, prompt, Q4_0 KV
+cache, and context capacity, the candidate must retain exact full and
+measurement-window generated-token hashes plus the same first EOS position as
+the production attention path. Both modes must report `ExecutorMode::Resident`,
+stable KV/resident bytes, and a positive long-context median decode-throughput
+change without a short-context regression.
 
-Record the chat command, hardware/OS, model and resident bytes, actual
-generated-token count, readback/command-buffer metrics, and throughput from
-`artifacts/chat-performance.jsonl`. The required runtime evidence is a
-Resident record with non-zero resident bytes and generated tokens; no fixed
-token count is forced when EOS is reached. Use the same command with
-`larger-q4` for a like-for-like comparison. Q8 parity remains covered by the
-fixture-backed Rust acceptance tests.
+Record `scripts/run-gemma4-decode-attention-ab.sh` output under
+`artifacts/phase-12a-decode-attention-ab/`, along with the fixture checksum,
+hardware/OS, profile samples, context window, upload/readback/command-buffer
+metrics, and the combined A/B summary. No attention experiment becomes the
+default until this artifact passes.

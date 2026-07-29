@@ -11,7 +11,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use atlas_core::GgufTensorType;
+use atlas_core::{GgufTensorType, dequantize_block, quantize_q4_0};
 use atlas_metal::GpuBuffer;
 
 use crate::{Gemma4E2bModel, Generation, LayerTrace, gemma4_shared_kv_sources};
@@ -21,7 +21,96 @@ const GEMMA4_TRACE_GLOBAL_STAGES: usize = 6;
 const GEMMA4_Q4_TWO_PASS_ATTENTION_BLOCKS: usize = 4;
 const GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD: usize = 64;
 const GEMMA4_Q4_TWO_PASS_ATTENTION_LEGACY_THRESHOLD: usize = 96;
+const GEMMA4_Q4_SHARED_KV_QUERY_HEADS: usize = 8;
+const GEMMA4_Q4_SHARED_KV_HEAD_DIM: usize = 512;
 const GEMMA4_PREFILL_BATCH_CAPACITY: usize = 128;
+const GEMMA4_DECODE_PROFILE_TARGETS: [usize; 9] = [1, 32, 64, 128, 256, 512, 1024, 2048, 4096];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gemma4WeightFormat {
+    MixedQ4Q6,
+    AllQ4,
+}
+
+impl Gemma4WeightFormat {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MixedQ4Q6 => "mixed_q4_q6",
+            Self::AllQ4 => "all_q4",
+        }
+    }
+
+    const fn vocabulary_format(self) -> GgufTensorType {
+        match self {
+            Self::MixedQ4Q6 => GgufTensorType::Q6K,
+            Self::AllQ4 => GgufTensorType::Q4_0,
+        }
+    }
+
+    const fn embedding_kernel(self) -> &'static str {
+        match self {
+            Self::MixedQ4Q6 => "embedding_lookup_q6_k",
+            Self::AllQ4 => "embedding_lookup_q4_0",
+        }
+    }
+}
+
+fn gemma4_weight_format() -> Result<Gemma4WeightFormat> {
+    match std::env::var("ATLAS_GEMMA4_WEIGHT_FORMAT").as_deref() {
+        Err(_) | Ok("mixed") | Ok("mixed_q4_q6") => Ok(Gemma4WeightFormat::MixedQ4Q6),
+        Ok("all_q4") => {
+            ensure!(
+                std::env::var_os("ATLAS_GEMMA4_Q6_LM_HEAD_EXPERIMENT").is_none(),
+                "ATLAS_GEMMA4_WEIGHT_FORMAT=all_q4 cannot be combined with ATLAS_GEMMA4_Q6_LM_HEAD_EXPERIMENT"
+            );
+            Ok(Gemma4WeightFormat::AllQ4)
+        }
+        Ok(value) => anyhow::bail!(
+            "unsupported ATLAS_GEMMA4_WEIGHT_FORMAT `{value}`; expected mixed_q4_q6 or all_q4"
+        ),
+    }
+}
+
+/// Convert row-major GGML Q6_K data to deterministic row-major Q4_0 blocks.
+/// The Q6 source is the oracle: no model tensor is mutated or rewritten.
+fn gemma4_q6_k_to_q4_0(source: &[u8], row_width: usize) -> Result<Vec<u8>> {
+    ensure!(
+        row_width > 0 && row_width.is_multiple_of(256),
+        "Gemma Q6_K vocabulary row width must be a positive multiple of 256"
+    );
+    ensure!(
+        source
+            .len()
+            .is_multiple_of(GgufTensorType::Q6K.block_bytes()),
+        "Gemma Q6_K vocabulary source is not block aligned"
+    );
+    let source_blocks_per_row = row_width / 256;
+    ensure!(
+        source.len() / GgufTensorType::Q6K.block_bytes() % source_blocks_per_row == 0,
+        "Gemma Q6_K vocabulary source does not contain whole rows"
+    );
+    let mut values = vec![0.0f32; 256];
+    let mut output = Vec::with_capacity(source.len() / GgufTensorType::Q6K.block_bytes() * 8 * 18);
+    for block in source.chunks_exact(GgufTensorType::Q6K.block_bytes()) {
+        dequantize_block(GgufTensorType::Q6K, block, &mut values)
+            .context("dequantize Gemma Q6_K vocabulary block")?;
+        ensure!(
+            values.iter().all(|value| value.is_finite()),
+            "Gemma Q6_K vocabulary block dequantized to a non-finite value"
+        );
+        output.extend_from_slice(
+            &quantize_q4_0(&values).context("quantize Gemma Q4_0 vocabulary block")?,
+        );
+    }
+    Ok(output)
+}
+
+fn gemma4_decode_profile_targets(decode_tokens: usize) -> Vec<usize> {
+    GEMMA4_DECODE_PROFILE_TARGETS
+        .into_iter()
+        .filter(|target| *target <= decode_tokens)
+        .collect()
+}
 
 fn gemma4_q4_two_pass_attention_threshold(experiment: Option<&str>) -> Option<usize> {
     match experiment {
@@ -32,7 +121,26 @@ fn gemma4_q4_two_pass_attention_threshold(experiment: Option<&str>) -> Option<us
         // Keep the original experiment spelling stable for existing scripts.
         Some("2pass") | Some("2pass96") => Some(GEMMA4_Q4_TWO_PASS_ATTENTION_LEGACY_THRESHOLD),
         Some("2pass80") => Some(80),
+        Some("2pass_cache") => Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD),
+        Some("2pass_gqa") => Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD),
+        Some("2pass_simd") => Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD),
         _ => None,
+    }
+}
+
+fn gemma4_q4_shared_kv_scan_supported(attention_heads: usize, head_dim: usize) -> bool {
+    attention_heads == GEMMA4_Q4_SHARED_KV_QUERY_HEADS && head_dim == GEMMA4_Q4_SHARED_KV_HEAD_DIM
+}
+
+fn gemma4_q4_two_pass_attention_first_pass_pipeline(
+    experiment: Option<&str>,
+    shared_kv_scan_supported: bool,
+) -> &'static str {
+    match (experiment, shared_kv_scan_supported) {
+        (Some("2pass_gqa"), true) => "attention_decode_fused_gemma4_simd_q4_0_2pass_1_gqa",
+        (Some("2pass_simd"), _) => "attention_decode_fused_gemma4_simd_q4_0_2pass_1_simd",
+        (Some("2pass_cache"), _) => "attention_decode_fused_gemma4_simd_q4_0_2pass_1_cacheopt",
+        _ => "attention_decode_fused_gemma4_simd_q4_0_2pass_1",
     }
 }
 
@@ -159,6 +267,10 @@ pub struct Gemma4Metrics {
     pub prefill_chunk_size: usize,
     pub prefill_chunks: usize,
     pub attention_kernel: &'static str,
+    pub weight_format: Gemma4WeightFormat,
+    pub embedding_kernel: &'static str,
+    pub output_projection_kernel: &'static str,
+    pub q6_projection_kernel: &'static str,
     pub kv_cache_type: Gemma4KvCacheType,
     pub kv_cache_bytes: u64,
 }
@@ -259,7 +371,7 @@ fn gemma4_kernel_family(kernel: &str) -> &'static str {
         "q4_qkv_projection"
     } else if kernel == "matmul_q4_0_gate_up_16row" {
         "q4_ffn_gate_up_projection"
-    } else if kernel == "matvec_q6_k_8row" {
+    } else if matches!(kernel, "matvec_q6_k_8row" | "matvec_q6_k_8row_cacheopt") {
         "q6_lm_head_projection"
     } else if kernel.starts_with("matmul_q4_0_batch") || kernel.starts_with("matmul_q6_k_batch") {
         "batched_projection"
@@ -349,13 +461,28 @@ fn gemma4_attention_binding(cache_type: Gemma4KvCacheType) -> (&'static str, usi
     }
 }
 
-fn gemma4_attention_kernel(cache_type: Gemma4KvCacheType) -> &'static str {
+fn gemma4_attention_kernel(
+    cache_type: Gemma4KvCacheType,
+    attention_heads: usize,
+    full_head_dim: usize,
+) -> &'static str {
     if cache_type == Gemma4KvCacheType::Q4_0 {
-        return match gemma4_q4_two_pass_attention_threshold(
-            std::env::var("ATLAS_GEMMA4_Q4_ATTENTION_EXPERIMENT")
-                .ok()
-                .as_deref(),
-        ) {
+        let experiment = std::env::var("ATLAS_GEMMA4_Q4_ATTENTION_EXPERIMENT");
+        let experiment = experiment.ok();
+        let experiment = experiment.as_deref();
+        return match gemma4_q4_two_pass_attention_threshold(experiment) {
+            Some(_)
+                if matches!(experiment, Some("2pass_gqa"))
+                    && gemma4_q4_shared_kv_scan_supported(attention_heads, full_head_dim) =>
+            {
+                "attention_decode_fused_gemma4_simd_q4_0_2pass_gqa"
+            }
+            Some(_) if matches!(experiment, Some("2pass_cache")) => {
+                "attention_decode_fused_gemma4_simd_q4_0_2pass_cache"
+            }
+            Some(_) if matches!(experiment, Some("2pass_simd")) => {
+                "attention_decode_fused_gemma4_simd_q4_0_2pass_simd"
+            }
             Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD) => {
                 "attention_decode_fused_gemma4_simd_q4_0_2pass_64"
             }
@@ -375,6 +502,13 @@ fn gemma4_qkv_fused_enabled() -> bool {
         std::env::var("ATLAS_GEMMA4_QKV_EXPERIMENT").as_deref(),
         Ok("baseline") | Ok("off") | Ok("0")
     )
+}
+
+fn gemma4_q6_projection_kernel() -> &'static str {
+    match std::env::var("ATLAS_GEMMA4_Q6_LM_HEAD_EXPERIMENT").as_deref() {
+        Ok("cacheopt") => "matvec_q6_k_8row_cacheopt",
+        _ => "matvec_q6_k_8row",
+    }
 }
 
 fn gemma4_qk_norm_rope_fused_enabled() -> bool {
@@ -464,6 +598,10 @@ pub struct Gemma4E2bExecutor<'a> {
     kv_sources: Vec<usize>,
     kv: Vec<Option<GpuBuffer>>,
     kv_cache_type: Gemma4KvCacheType,
+    weight_format: Gemma4WeightFormat,
+    token_embedding: GpuBuffer,
+    per_layer_embedding: GpuBuffer,
+    derived_vocabulary_bytes: u64,
     token: GpuBuffer,
     position_buffer: GpuBuffer,
     selected: GpuBuffer,
@@ -624,7 +762,38 @@ impl<'a> Gemma4E2bExecutor<'a> {
                     .transpose()
             })
             .collect::<Result<Vec<_>>>()?;
-        let weight_upload_bytes = model.ensure_resident_weights()?;
+        let weight_format = gemma4_weight_format()?;
+        let mut weight_upload_bytes =
+            model.ensure_resident_weights(weight_format == Gemma4WeightFormat::AllQ4)?;
+        let (token_embedding, per_layer_embedding, derived_vocabulary_bytes) = match weight_format {
+            Gemma4WeightFormat::MixedQ4Q6 => (
+                model.resident_weight("token_embd.weight")?,
+                model.resident_weight("per_layer_token_embd.weight")?,
+                0,
+            ),
+            Gemma4WeightFormat::AllQ4 => {
+                let derive = |name: &str| -> Result<GpuBuffer> {
+                    let tensor = model
+                        .gguf()
+                        .tensors
+                        .iter()
+                        .find(|tensor| tensor.name == name)
+                        .with_context(|| format!("Gemma all-Q4 source tensor missing `{name}`"))?;
+                    ensure!(
+                        tensor.tensor_type == GgufTensorType::Q6K,
+                        "Gemma all-Q4 source tensor `{name}` must be Q6_K"
+                    );
+                    let row_width = tensor.dims.first().copied().unwrap_or_default();
+                    let packed = gemma4_q6_k_to_q4_0(model.gguf().tensor_data(tensor)?, row_width)?;
+                    runtime.upload_bytes(&packed).map_err(Into::into)
+                };
+                let token = derive("token_embd.weight")?;
+                let per_layer = derive("per_layer_token_embd.weight")?;
+                let bytes = (token.bytes() + per_layer.bytes()) as u64;
+                weight_upload_bytes = weight_upload_bytes.saturating_add(bytes);
+                (token, per_layer, bytes)
+            }
+        };
         let prefill = Gemma4PrefillBuffers {
             state: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * h)?,
             next_state: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * h)?,
@@ -652,6 +821,10 @@ impl<'a> Gemma4E2bExecutor<'a> {
             kv_sources,
             kv,
             kv_cache_type,
+            weight_format,
+            token_embedding,
+            per_layer_embedding,
+            derived_vocabulary_bytes,
             token: runtime.allocate(4)?,
             position_buffer: runtime.allocate(4)?,
             selected: runtime.allocate(4)?,
@@ -757,6 +930,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
 
     pub fn resident_bytes(&self) -> u64 {
         self.model.resident_weight_bytes()
+            + self.derived_vocabulary_bytes
             + self
                 .kv
                 .iter()
@@ -890,7 +1064,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
     ) -> Result<()> {
         let kernel = match format {
             GgufTensorType::Q4_0 => "matvec_q4_0_16row",
-            GgufTensorType::Q6K => "matvec_q6_k_8row",
+            GgufTensorType::Q6K => gemma4_q6_projection_kernel(),
             GgufTensorType::F16 => "matvec_f16",
             other => anyhow::bail!("unsupported Gemma matvec format {other:?}"),
         };
@@ -1117,7 +1291,10 @@ impl<'a> Gemma4E2bExecutor<'a> {
         let mut selected = self
             .forward_tokens(&prompt_ids, true)?
             .context("Gemma prefill did not select a first decode token")?;
-        let targets = [1usize, 32, 64, 128];
+        // Keep the short-context observations for continuity, then sample the
+        // same Resident decode path as the KV cache grows.  The profiler is
+        // deliberately diagnostic-only and never changes normal chat timing.
+        let targets = gemma4_decode_profile_targets(decode_tokens);
         let runtime = self.model.runtime();
         let readback_before = runtime.readback_bytes();
         let mut samples = Vec::with_capacity(targets.len());
@@ -1177,7 +1354,11 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 std::env::var_os("ATLAS_GEMMA4_TRACE_STAGES").is_some(),
                 gemma4_token_major_prefill_requested(),
             ),
-            attention_kernel: gemma4_attention_kernel(self.kv_cache_type),
+            attention_kernel: gemma4_attention_kernel(
+                self.kv_cache_type,
+                self.model.config.attention_heads,
+                self.model.config.key_length,
+            ),
             kv_cache_type: self.kv_cache_type,
             samples,
         })
@@ -1190,7 +1371,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
         cancelled: &AtomicBool,
         emit: impl FnMut(Gemma4TokenEvent) -> Result<()>,
     ) -> Result<Gemma4Generation> {
-        self.generate_greedy_stream_inner(prompt, max_new_tokens, cancelled, false, false, emit)
+        self.generate_greedy_stream_inner(prompt, max_new_tokens, cancelled, false, false, 0, emit)
     }
 
     pub fn generate_greedy_chat_stream(
@@ -1200,7 +1381,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
         cancelled: &AtomicBool,
         emit: impl FnMut(Gemma4TokenEvent) -> Result<()>,
     ) -> Result<Gemma4Generation> {
-        self.generate_greedy_stream_inner(prompt, max_new_tokens, cancelled, true, false, emit)
+        self.generate_greedy_stream_inner(prompt, max_new_tokens, cancelled, true, false, 0, emit)
     }
 
     /// Generate a fixed number of selections for performance measurement.
@@ -1216,7 +1397,45 @@ impl<'a> Gemma4E2bExecutor<'a> {
         cancelled: &AtomicBool,
         emit: impl FnMut(Gemma4TokenEvent) -> Result<()>,
     ) -> Result<Gemma4Generation> {
-        self.generate_greedy_stream_inner(prompt, decode_tokens, cancelled, false, true, emit)
+        self.generate_greedy_fixed_benchmark_window_stream(
+            prompt,
+            0,
+            decode_tokens,
+            cancelled,
+            emit,
+        )
+    }
+
+    /// Run a fixed Resident decode window after deterministic warm-up tokens.
+    ///
+    /// The warm-up selections grow the same KV cache used by normal generation,
+    /// but are excluded from `metrics.decode` and `decode_command_buffers`.
+    /// This makes long-context throughput comparable without changing the
+    /// user-facing chat path.
+    pub fn generate_greedy_fixed_benchmark_window_stream(
+        &mut self,
+        prompt: &str,
+        warmup_decode_tokens: usize,
+        measured_decode_tokens: usize,
+        cancelled: &AtomicBool,
+        emit: impl FnMut(Gemma4TokenEvent) -> Result<()>,
+    ) -> Result<Gemma4Generation> {
+        ensure!(
+            measured_decode_tokens > 0,
+            "Gemma benchmark measurement window must be positive"
+        );
+        let total_decode_tokens = warmup_decode_tokens
+            .checked_add(measured_decode_tokens)
+            .context("Gemma benchmark decode window overflows")?;
+        self.generate_greedy_stream_inner(
+            prompt,
+            total_decode_tokens,
+            cancelled,
+            false,
+            true,
+            warmup_decode_tokens,
+            emit,
+        )
     }
 
     fn generate_greedy_stream_inner(
@@ -1226,6 +1445,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
         cancelled: &AtomicBool,
         stop_on_end_turn: bool,
         continue_after_eos: bool,
+        decode_window_start: usize,
         mut emit: impl FnMut(Gemma4TokenEvent) -> Result<()>,
     ) -> Result<Gemma4Generation> {
         ensure!(max_new_tokens > 0, "max_new_tokens must be positive");
@@ -1256,7 +1476,8 @@ impl<'a> Gemma4E2bExecutor<'a> {
         }
         let prefill = prefill_started.elapsed();
         let prefill_commands = runtime.command_buffer_count() - command_before;
-        let decode_started = Instant::now();
+        let mut decode_started = (decode_window_start == 0).then(Instant::now);
+        let mut decode_command_before = runtime.command_buffer_count();
         let mut generated = Vec::new();
         let mut finish_reason = Gemma4FinishReason::MaxTokens;
         let mut first_eos_position = None;
@@ -1294,6 +1515,10 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 break;
             }
             if index + 1 < max_new_tokens {
+                if index + 1 == decode_window_start {
+                    decode_started = Some(Instant::now());
+                    decode_command_before = runtime.command_buffer_count();
+                }
                 let token_started = Instant::now();
                 selected = self.forward_token(selected)?;
                 token_latency = token_started.elapsed();
@@ -1320,16 +1545,30 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 readback_bytes: runtime.readback_bytes() - readback_before,
                 command_buffers: runtime.command_buffer_count() - command_before,
                 prefill_command_buffers: prefill_commands,
-                decode_command_buffers: runtime.command_buffer_count()
-                    - command_before
-                    - prefill_commands,
+                decode_command_buffers: runtime.command_buffer_count() - decode_command_before,
                 prefill,
-                decode: decode_started.elapsed(),
+                decode: decode_started
+                    .expect("decode window starts before the first decode dispatch")
+                    .elapsed(),
                 host_wall_time: started.elapsed(),
                 prefill_path,
                 prefill_chunk_size: plan.chunk_size,
                 prefill_chunks: plan.chunks,
-                attention_kernel: gemma4_attention_kernel(self.kv_cache_type),
+                attention_kernel: gemma4_attention_kernel(
+                    self.kv_cache_type,
+                    self.model.config.attention_heads,
+                    self.model.config.key_length,
+                ),
+                weight_format: self.weight_format,
+                embedding_kernel: self.weight_format.embedding_kernel(),
+                output_projection_kernel: match self.weight_format {
+                    Gemma4WeightFormat::MixedQ4Q6 => gemma4_q6_projection_kernel(),
+                    Gemma4WeightFormat::AllQ4 => "matvec_q4_0_16row",
+                },
+                q6_projection_kernel: match self.weight_format {
+                    Gemma4WeightFormat::MixedQ4Q6 => gemma4_q6_projection_kernel(),
+                    Gemma4WeightFormat::AllQ4 => "none",
+                },
                 kv_cache_type: self.kv_cache_type,
                 kv_cache_bytes: self.kv_cache_bytes(),
             },
@@ -1590,14 +1829,12 @@ impl<'a> Gemma4E2bExecutor<'a> {
         let h_batch = runtime.upload_u32(&[u32::try_from(batch_value * h)?])?;
         let ple_batch = runtime.upload_u32(&[u32::try_from(batch_value * ple_total)?])?;
         let mut command = runtime.begin_resident_command_with_exact_timing(false)?;
-        let token_embd = self.weight("token_embd.weight", GgufTensorType::Q6K)?;
-        let per_layer_embd = self.weight("per_layer_token_embd.weight", GgufTensorType::Q6K)?;
         let per_layer_proj = self.weight("per_layer_model_proj.weight", GgufTensorType::F16)?;
         let per_layer_norm = self.weight("per_layer_proj_norm.weight", GgufTensorType::F32)?;
         command.dispatch_1d(
-            "embedding_lookup_q6_k",
+            self.weight_format.embedding_kernel(),
             &[
-                &token_embd,
+                &self.token_embedding,
                 &token_batch,
                 &self.prefill.state,
                 &self.vocab,
@@ -1617,9 +1854,9 @@ impl<'a> Gemma4E2bExecutor<'a> {
             batch_value * h,
         )?;
         command.dispatch_1d(
-            "embedding_lookup_q6_k",
+            self.weight_format.embedding_kernel(),
             &[
-                &per_layer_embd,
+                &self.per_layer_embedding,
                 &token_batch,
                 &self.prefill.ple_lookup,
                 &self.vocab,
@@ -1729,12 +1966,12 @@ impl<'a> Gemma4E2bExecutor<'a> {
             self.matvec(
                 &mut command,
                 &self.norm,
-                &token_embd,
+                &self.token_embedding,
                 &self.logits,
                 &self.hidden,
                 &self.vocab,
                 c.vocab_size,
-                GgufTensorType::Q6K,
+                self.weight_format.vocabulary_format(),
             )?;
             command.dispatch_1d(
                 "softcap_f32",
@@ -2153,14 +2390,12 @@ impl<'a> Gemma4E2bExecutor<'a> {
         if trace_stages {
             runtime.write_u32(&self.validity, &[u32::MAX])?;
         }
-        let token_embd = self.weight("token_embd.weight", GgufTensorType::Q6K)?;
-        let per_layer_embd = self.weight("per_layer_token_embd.weight", GgufTensorType::Q6K)?;
         let per_layer_proj = self.weight("per_layer_model_proj.weight", GgufTensorType::F16)?;
         let per_layer_norm = self.weight("per_layer_proj_norm.weight", GgufTensorType::F32)?;
         command.dispatch_1d(
-            "embedding_lookup_q6_k",
+            self.weight_format.embedding_kernel(),
             &[
-                &token_embd,
+                &self.token_embedding,
                 &self.token,
                 &self.state,
                 &self.vocab,
@@ -2189,9 +2424,9 @@ impl<'a> Gemma4E2bExecutor<'a> {
         }
         let ple_total_buffer = &self.ple_total;
         command.dispatch_1d(
-            "embedding_lookup_q6_k",
+            self.weight_format.embedding_kernel(),
             &[
-                &per_layer_embd,
+                &self.per_layer_embedding,
                 &self.token,
                 &self.ple_lookup,
                 &self.vocab,
@@ -2577,8 +2812,20 @@ impl<'a> Gemma4E2bExecutor<'a> {
             let (attention_kernel, attention_threads) =
                 gemma4_attention_binding(self.kv_cache_type);
             if gemma4_q4_two_pass_attention_enabled(self.kv_cache_type, attention_key_count) {
-                command.dispatch_threadgroups_1d_at(
-                    "attention_decode_fused_gemma4_simd_q4_0_2pass_1",
+                let attention_experiment =
+                    std::env::var("ATLAS_GEMMA4_Q4_ATTENTION_EXPERIMENT").ok();
+                let shared_kv_scan = matches!(attention_experiment.as_deref(), Some("2pass_gqa"))
+                    && gemma4_q4_shared_kv_scan_supported(c.attention_heads, head);
+                let attention_first_pass = gemma4_q4_two_pass_attention_first_pass_pipeline(
+                    attention_experiment.as_deref(),
+                    shared_kv_scan,
+                );
+                // These labels split the two resident attention passes in
+                // diagnostics only; both retain the production pipeline,
+                // buffers, dispatch geometry, and reduction order.
+                command.dispatch_threadgroups_1d_at_labeled(
+                    attention_first_pass,
+                    Some("gemma_attention_split_scan"),
                     &[
                         (&self.q_rot, 0),
                         (cache, 0),
@@ -2592,11 +2839,20 @@ impl<'a> Gemma4E2bExecutor<'a> {
                         (key_counts, key_count_offset),
                         (&self.attention_two_pass_blocks, 0),
                     ],
-                    c.attention_heads * GEMMA4_Q4_TWO_PASS_ATTENTION_BLOCKS,
-                    128,
+                    if shared_kv_scan {
+                        GEMMA4_Q4_TWO_PASS_ATTENTION_BLOCKS
+                    } else {
+                        c.attention_heads * GEMMA4_Q4_TWO_PASS_ATTENTION_BLOCKS
+                    },
+                    if matches!(attention_experiment.as_deref(), Some("2pass_simd")) {
+                        32
+                    } else {
+                        128
+                    },
                 )?;
-                command.dispatch_threadgroups_1d(
+                command.dispatch_threadgroups_1d_labeled(
                     "attention_decode_fused_gemma4_simd_q4_0_2pass_2",
+                    Some("gemma_attention_split_combine"),
                     &[
                         &self.attention_partials,
                         &self.attention_maxima,
@@ -3082,12 +3338,12 @@ impl<'a> Gemma4E2bExecutor<'a> {
         self.matvec(
             &mut command,
             &self.norm,
-            &token_embd,
+            &self.token_embedding,
             &self.logits,
             &self.hidden,
             &self.vocab,
             c.vocab_size,
-            GgufTensorType::Q6K,
+            self.weight_format.vocabulary_format(),
         )?;
         command.dispatch_1d(
             "softcap_f32",
@@ -3195,14 +3451,18 @@ impl<'a> Gemma4E2bExecutor<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
+        GEMMA4_Q4_SHARED_KV_HEAD_DIM, GEMMA4_Q4_SHARED_KV_QUERY_HEADS,
         GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD,
         GEMMA4_Q4_TWO_PASS_ATTENTION_LEGACY_THRESHOLD, Gemma4KvCacheType, Gemma4PrefillPlan,
-        gemma4_attention_key_count, gemma4_attention_key_count_table,
-        gemma4_ffn_gate_up_fused_enabled_for, gemma4_kernel_family, gemma4_prefill_path,
-        gemma4_profile_family, gemma4_q4_two_pass_attention_eligible,
-        gemma4_q4_two_pass_attention_threshold, gemma4_rms_epilogue_fused_enabled_for,
-        gemma4_rope_angle, gemma4_should_finish, gemma4_two_pass_attention_ranges,
+        Gemma4WeightFormat, gemma4_attention_key_count, gemma4_attention_key_count_table,
+        gemma4_decode_profile_targets, gemma4_ffn_gate_up_fused_enabled_for, gemma4_kernel_family,
+        gemma4_prefill_path, gemma4_profile_family, gemma4_q4_shared_kv_scan_supported,
+        gemma4_q4_two_pass_attention_eligible, gemma4_q4_two_pass_attention_first_pass_pipeline,
+        gemma4_q4_two_pass_attention_threshold, gemma4_q6_k_to_q4_0,
+        gemma4_rms_epilogue_fused_enabled_for, gemma4_rope_angle, gemma4_should_finish,
+        gemma4_two_pass_attention_ranges,
     };
+    use atlas_core::{GgufTensorType, dequantize_block};
 
     #[test]
     fn prefill_plan_batches_short_prompts_and_bounds_long_prompts() {
@@ -3328,6 +3588,50 @@ mod tests {
             Some(80)
         );
         assert_eq!(
+            gemma4_q4_two_pass_attention_threshold(Some("2pass_cache")),
+            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
+        );
+        assert_eq!(
+            gemma4_q4_two_pass_attention_threshold(Some("2pass_gqa")),
+            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
+        );
+        assert_eq!(
+            gemma4_q4_two_pass_attention_threshold(Some("2pass_simd")),
+            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
+        );
+        assert_eq!(
+            gemma4_q4_two_pass_attention_first_pass_pipeline(Some("2pass_cache"), false),
+            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_cacheopt"
+        );
+        assert_eq!(
+            gemma4_q4_two_pass_attention_first_pass_pipeline(Some("2pass_gqa"), true),
+            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_gqa"
+        );
+        assert_eq!(
+            gemma4_q4_two_pass_attention_first_pass_pipeline(Some("2pass_gqa"), false),
+            "attention_decode_fused_gemma4_simd_q4_0_2pass_1"
+        );
+        assert_eq!(
+            gemma4_q4_two_pass_attention_first_pass_pipeline(Some("2pass_simd"), false),
+            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_simd"
+        );
+        assert_eq!(
+            gemma4_q4_two_pass_attention_first_pass_pipeline(None, false),
+            "attention_decode_fused_gemma4_simd_q4_0_2pass_1"
+        );
+        assert!(gemma4_q4_shared_kv_scan_supported(
+            GEMMA4_Q4_SHARED_KV_QUERY_HEADS,
+            GEMMA4_Q4_SHARED_KV_HEAD_DIM,
+        ));
+        assert!(!gemma4_q4_shared_kv_scan_supported(
+            GEMMA4_Q4_SHARED_KV_QUERY_HEADS + 1,
+            GEMMA4_Q4_SHARED_KV_HEAD_DIM,
+        ));
+        assert!(!gemma4_q4_shared_kv_scan_supported(
+            GEMMA4_Q4_SHARED_KV_QUERY_HEADS,
+            GEMMA4_Q4_SHARED_KV_HEAD_DIM / 2,
+        ));
+        assert_eq!(
             gemma4_q4_two_pass_attention_threshold(Some("2pass64")),
             Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
         );
@@ -3395,6 +3699,10 @@ mod tests {
             "q6_lm_head_projection"
         );
         assert_eq!(
+            gemma4_kernel_family("matvec_q6_k_8row_cacheopt"),
+            "q6_lm_head_projection"
+        );
+        assert_eq!(
             gemma4_kernel_family("matmul_q4_0_batch_16row"),
             "batched_projection"
         );
@@ -3425,6 +3733,65 @@ mod tests {
     }
 
     #[test]
+    fn all_q4_vocabulary_conversion_preserves_packed_layout_and_bounded_oracle_error() {
+        // A Q6_K block with every quantized value at -32, unit group scales,
+        // and a unit super-block scale is easy to audit byte-for-byte.
+        let mut q6 = vec![0u8; GgufTensorType::Q6K.block_bytes()];
+        q6[192..208].fill(1);
+        q6[208..210].copy_from_slice(&0x3c00u16.to_le_bytes());
+        let q4 = gemma4_q6_k_to_q4_0(&q6, 256).expect("convert one Q6_K row");
+        assert_eq!(q4.len(), 8 * GgufTensorType::Q4_0.block_bytes());
+        for block in q4.chunks_exact(GgufTensorType::Q4_0.block_bytes()) {
+            assert_eq!(&block[..2], &0x4400u16.to_le_bytes());
+            assert!(
+                atlas_core::f16_bits_to_f32(u16::from_le_bytes(block[..2].try_into().unwrap()))
+                    .is_finite()
+            );
+            assert!(block[2..].iter().all(|byte| *byte == 0));
+        }
+        let mut q6_values = vec![0.0; 256];
+        dequantize_block(GgufTensorType::Q6K, &q6, &mut q6_values).unwrap();
+        let mut q4_values = Vec::with_capacity(256);
+        for block in q4.chunks_exact(GgufTensorType::Q4_0.block_bytes()) {
+            let mut values = vec![0.0; 32];
+            dequantize_block(GgufTensorType::Q4_0, block, &mut values).unwrap();
+            q4_values.extend(values);
+        }
+        let max_error = q6_values
+            .iter()
+            .zip(&q4_values)
+            .map(|(oracle, actual)| (oracle - actual).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_error <= 4.0,
+            "Q4 conversion error {max_error} exceeds one scale"
+        );
+    }
+
+    #[test]
+    fn all_q4_routes_embedding_and_tied_projection_without_q6_dispatch() {
+        let format = Gemma4WeightFormat::AllQ4;
+        assert_eq!(format.as_str(), "all_q4");
+        assert_eq!(format.embedding_kernel(), "embedding_lookup_q4_0");
+        assert_eq!(format.vocabulary_format(), GgufTensorType::Q4_0);
+        assert_ne!(format.embedding_kernel(), "embedding_lookup_q6_k");
+        assert_ne!(format.vocabulary_format(), GgufTensorType::Q6K);
+    }
+
+    #[test]
+    fn decode_profile_samples_long_context_horizons() {
+        assert_eq!(gemma4_decode_profile_targets(128), vec![1, 32, 64, 128]);
+        assert_eq!(
+            gemma4_decode_profile_targets(1024),
+            vec![1, 32, 64, 128, 256, 512, 1024]
+        );
+        assert_eq!(
+            gemma4_decode_profile_targets(4096),
+            vec![1, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+        );
+    }
+
+    #[test]
     fn gemma4_ffn_gate_up_fusion_defaults_on_with_an_explicit_baseline_escape_hatch() {
         assert!(gemma4_ffn_gate_up_fused_enabled_for(None));
         assert!(gemma4_ffn_gate_up_fused_enabled_for(Some("fused")));
@@ -3447,6 +3814,8 @@ mod tests {
             "ffn_down_projection",
             "ple_projection",
             "post_attention_norm_residual",
+            "gemma_attention_split_scan",
+            "gemma_attention_split_combine",
         ] {
             assert_eq!(
                 gemma4_profile_family(Some(label), "rms_norm_decode_f32"),

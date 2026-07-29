@@ -668,13 +668,30 @@ impl Gemma4E2bModel {
     /// Upload every checked Gemma tensor once. The returned count deliberately
     /// excludes already-resident weights so request telemetry distinguishes a
     /// cold model upload from a warm executor allocation.
-    pub(crate) fn ensure_resident_weights(&self) -> Result<u64> {
+    /// Upload Gemma tensors needed by the selected Resident weight path.
+    ///
+    /// The all-Q4 experiment derives its two vocabulary tables on the host,
+    /// so keeping their Q6_K source copies out of GPU memory is deliberate.
+    pub(crate) fn ensure_resident_weights(&self, skip_q6_vocabulary: bool) -> Result<u64> {
         let mut resident = self
             .resident_weights
             .lock()
             .expect("Gemma resident weight lock");
         let mut uploaded = 0u64;
         for tensor in &self.gguf.tensors {
+            if skip_q6_vocabulary
+                && matches!(
+                    tensor.name.as_str(),
+                    "token_embd.weight" | "per_layer_token_embd.weight"
+                )
+            {
+                ensure!(
+                    tensor.tensor_type == GgufTensorType::Q6K,
+                    "Gemma all-Q4 vocabulary source `{}` must be Q6_K",
+                    tensor.name
+                );
+                continue;
+            }
             if resident.buffers.contains_key(&tensor.name) {
                 continue;
             }

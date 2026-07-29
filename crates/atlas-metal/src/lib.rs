@@ -197,6 +197,25 @@ mod macos {
             threadgroups: usize,
             threads_per_threadgroup: usize,
         ) -> Result<(), MetalError> {
+            self.dispatch_threadgroups_1d_at_labeled(
+                kernel,
+                None,
+                buffers,
+                threadgroups,
+                threads_per_threadgroup,
+            )
+        }
+
+        /// As [`Self::dispatch_threadgroups_1d_at`], with a semantic
+        /// diagnostic label distinct from the Metal pipeline name.
+        pub fn dispatch_threadgroups_1d_at_labeled(
+            &mut self,
+            kernel: &'static str,
+            profiling_label: Option<&'static str>,
+            buffers: &[(&GpuBuffer, usize)],
+            threadgroups: usize,
+            threads_per_threadgroup: usize,
+        ) -> Result<(), MetalError> {
             let encode_started = Instant::now();
             if self.encoder.is_none() {
                 self.encoder = Some(
@@ -236,7 +255,7 @@ mod macos {
             );
             self.complete_profiled_dispatch(
                 kernel,
-                None,
+                profiling_label,
                 0,
                 threadgroups,
                 threads_per_threadgroup,
@@ -625,6 +644,7 @@ mod macos {
                 "embedding_lookup_q6_k",
                 "matvec_q6_k",
                 "matvec_q6_k_8row",
+                "matvec_q6_k_8row_cacheopt",
                 "matmul_q6_k_batch_8row",
                 "matvec_f16",
                 "gelu_f32",
@@ -662,6 +682,9 @@ mod macos {
                 "attention_decode_fused_gemma4_simd_q8_0",
                 "attention_decode_fused_gemma4_simd_q4_0",
                 "attention_decode_fused_gemma4_simd_q4_0_2pass_1",
+                "attention_decode_fused_gemma4_simd_q4_0_2pass_1_cacheopt",
+                "attention_decode_fused_gemma4_simd_q4_0_2pass_1_gqa",
+                "attention_decode_fused_gemma4_simd_q4_0_2pass_1_simd",
                 "attention_decode_fused_gemma4_simd_q4_0_2pass_2",
                 "attention_decode_fused_gemma4_simd_q4_0_32",
                 "attention_decode_fused_gemma4_simd_q4_0_64",
