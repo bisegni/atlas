@@ -1,4 +1,4 @@
-# Gemma Q4 Resident RMS epilogue A/B
+# Gemma Q4 Resident RMS rollback A/B
 
 Run these commands from the Atlas repository root on the Apple-Silicon host
 that has Metal access and the verified fixture at:
@@ -8,20 +8,17 @@ that has Metal access and the verified fixture at:
 ```zsh
 cargo run --release -p atlas-cli -- model verify --model gemma4-e2b-q4_0
 
-ATLAS_GEMMA4_RMS_EPILOGUE_EXPERIMENT=baseline ./scripts/run-gemma4-performance-acceptance.sh
-
-ATLAS_GEMMA4_RMS_EPILOGUE_EXPERIMENT=fused ./scripts/run-gemma4-performance-acceptance.sh
+bash scripts/run-gemma4-rms-norm-ab.sh --screen
 ```
 
-The runner writes one timestamped directory per run under
-`artifacts/phase-12a-perf/`. Paste both of these files back after the commands
-finish:
+The screen writes one timestamped directory under
+`artifacts/phase-12a-rms-norm-ab/`. Paste this file back after it finishes:
 
 ```text
-artifacts/phase-12a-perf/<baseline-timestamp>/acceptance-summary.json
-artifacts/phase-12a-perf/<fused-timestamp>/acceptance-summary.json
+artifacts/phase-12a-rms-norm-ab/<timestamp>/rms-norm-ab-summary.json
 ```
 
-Also paste the corresponding `q4_0/benchmark-summary.json` files if either
-run fails. They contain the fixed-128 SHA, EOS position, Q4 KV residency, and
-per-run decode throughput needed to decide whether the fusion can be promoted.
+The default is the vectorized RMS kernel. This runner compares it with the
+scalar diagnostic oracle selected by `ATLAS_GEMMA4_RMS_NORM_EXPERIMENT=baseline`.
+Use it only to guard or investigate a future regression; it is no longer a
+promotion gate.

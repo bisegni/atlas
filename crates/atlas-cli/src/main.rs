@@ -350,7 +350,7 @@ fn emit_metrics(
         generation.metrics.decode_command_buffers as usize,
         generation.metrics.decode,
     );
-    let record = json!({"event":"generation_metrics","model_id":record.id,"executor":"resident","format":"gguf-gemma4-q4_0","weight_format":generation.metrics.weight_format.as_str(),"embedding_kernel":generation.metrics.embedding_kernel,"output_projection_kernel":generation.metrics.output_projection_kernel,"prompt_tokens":generation.generation.prompt_token_ids.len(),"generated_tokens":generation.generation.generated_token_ids.len(),"finish_reason":finish_reason,"max_new_tokens":max_tokens,"token_limit_source":if context_limit { "context" } else { "explicit" },"visible_chars":visible.chars().count(),"prefill_tok_s":prefill,"decode_tok_s":decode,"resident_bytes":generation.metrics.resident_bytes,"kv_cache_type":generation.metrics.kv_cache_type.as_str(),"kv_cache_bytes":generation.metrics.kv_cache_bytes,"weight_upload_bytes":generation.metrics.weight_upload_bytes,"readback_bytes":generation.metrics.readback_bytes,"command_buffers":generation.metrics.command_buffers,"prefill_command_buffers":generation.metrics.prefill_command_buffers,"decode_command_buffers":generation.metrics.decode_command_buffers,"prefill_path":generation.metrics.prefill_path,"prefill_chunk_size":generation.metrics.prefill_chunk_size,"prefill_chunks":generation.metrics.prefill_chunks,"attention_kernel":generation.metrics.attention_kernel,"timing":{"prefill_ms":generation.metrics.prefill.as_secs_f64()*1000.0,"decode_ms":generation.metrics.decode.as_secs_f64()*1000.0,"host_ms":generation.metrics.host_wall_time.as_secs_f64()*1000.0}});
+    let record = json!({"event":"generation_metrics","model_id":record.id,"executor":"resident","format":"gguf-gemma4-q4_0","weight_format":generation.metrics.weight_format.as_str(),"embedding_kernel":generation.metrics.embedding_kernel,"output_projection_kernel":generation.metrics.output_projection_kernel,"rms_norm_kernel":generation.metrics.rms_norm_kernel,"prompt_tokens":generation.generation.prompt_token_ids.len(),"generated_tokens":generation.generation.generated_token_ids.len(),"finish_reason":finish_reason,"max_new_tokens":max_tokens,"token_limit_source":if context_limit { "context" } else { "explicit" },"visible_chars":visible.chars().count(),"prefill_tok_s":prefill,"decode_tok_s":decode,"resident_bytes":generation.metrics.resident_bytes,"kv_cache_type":generation.metrics.kv_cache_type.as_str(),"kv_cache_bytes":generation.metrics.kv_cache_bytes,"weight_upload_bytes":generation.metrics.weight_upload_bytes,"readback_bytes":generation.metrics.readback_bytes,"command_buffers":generation.metrics.command_buffers,"prefill_command_buffers":generation.metrics.prefill_command_buffers,"decode_command_buffers":generation.metrics.decode_command_buffers,"prefill_path":generation.metrics.prefill_path,"prefill_chunk_size":generation.metrics.prefill_chunk_size,"prefill_chunks":generation.metrics.prefill_chunks,"attention_kernel":generation.metrics.attention_kernel,"timing":{"prefill_ms":generation.metrics.prefill.as_secs_f64()*1000.0,"decode_ms":generation.metrics.decode.as_secs_f64()*1000.0,"host_ms":generation.metrics.host_wall_time.as_secs_f64()*1000.0}});
     eprintln!("{record}");
     append_jsonl(&record)?;
     eprintln!("chat performance log: {CHAT_PERFORMANCE_LOG}");
@@ -426,7 +426,7 @@ fn generate(args: &[String]) -> Result<()> {
     );
     println!(
         "{}",
-        json!({"event":"generation_metrics","model_id":selection.id,"executor":"resident","format":"gguf-gemma4-q4_0","weight_format":result.metrics.weight_format.as_str(),"embedding_kernel":result.metrics.embedding_kernel,"output_projection_kernel":result.metrics.output_projection_kernel,"finish_reason":match result.finish_reason { Gemma4FinishReason::Eos => "eos", Gemma4FinishReason::MaxTokens => "max_tokens", Gemma4FinishReason::Cancelled => "cancelled" },"resident_bytes":result.metrics.resident_bytes,"kv_cache_type":result.metrics.kv_cache_type.as_str(),"kv_cache_bytes":result.metrics.kv_cache_bytes,"weight_upload_bytes":result.metrics.weight_upload_bytes,"readback_bytes":result.metrics.readback_bytes,"command_buffers":result.metrics.command_buffers})
+        json!({"event":"generation_metrics","model_id":selection.id,"executor":"resident","format":"gguf-gemma4-q4_0","weight_format":result.metrics.weight_format.as_str(),"embedding_kernel":result.metrics.embedding_kernel,"output_projection_kernel":result.metrics.output_projection_kernel,"rms_norm_kernel":result.metrics.rms_norm_kernel,"finish_reason":match result.finish_reason { Gemma4FinishReason::Eos => "eos", Gemma4FinishReason::MaxTokens => "max_tokens", Gemma4FinishReason::Cancelled => "cancelled" },"resident_bytes":result.metrics.resident_bytes,"kv_cache_type":result.metrics.kv_cache_type.as_str(),"kv_cache_bytes":result.metrics.kv_cache_bytes,"weight_upload_bytes":result.metrics.weight_upload_bytes,"readback_bytes":result.metrics.readback_bytes,"command_buffers":result.metrics.command_buffers})
     );
     Ok(())
 }
@@ -515,6 +515,7 @@ fn benchmark(args: &[String]) -> Result<()> {
         "weight_format": generation.metrics.weight_format.as_str(),
         "embedding_kernel": generation.metrics.embedding_kernel,
         "output_projection_kernel": generation.metrics.output_projection_kernel,
+        "rms_norm_kernel": generation.metrics.rms_norm_kernel,
         "prompt_template": "gemma4_chat",
         "prompt_token_sha256": prompt_token_digest,
         "kv_cache_type": generation.metrics.kv_cache_type.as_str(),
@@ -543,6 +544,7 @@ fn benchmark(args: &[String]) -> Result<()> {
             "attention": generation.metrics.attention_kernel,
             "q4_projection": "matvec_q4_0_16row",
             "q6_projection": generation.metrics.q6_projection_kernel,
+            "rms_norm": generation.metrics.rms_norm_kernel,
             "embedding": generation.metrics.embedding_kernel,
             "output_projection": generation.metrics.output_projection_kernel,
             "kv_append": match generation.metrics.kv_cache_type {

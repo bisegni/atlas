@@ -133,6 +133,30 @@ kernel void rms_norm_decode_f32(
     }
 }
 
+// Gemma's decode hidden width is 2304, so each of the 32 lanes can process
+// eighteen aligned float4 values. This is the production Resident decode
+// path: it retains the one-SIMD-group reduction while reducing scalar
+// load/store instructions.
+kernel void rms_norm_decode_f32_vec4(
+    device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &hidden [[buffer(3)]],
+    constant float &epsilon [[buffer(4)]], uint lane [[thread_index_in_threadgroup]]) {
+    float squared_sum = 0.0f;
+    uint vector_tiles = hidden / 128;
+    for (uint tile = 0; tile < vector_tiles; ++tile) {
+        uint offset = tile * 128 + lane * 4;
+        float4 x = *(device const float4 *)(input + offset);
+        squared_sum += x.x * x.x + x.y * x.y + x.z * x.z + x.w * x.w;
+    }
+    float inverse_rms = rsqrt(simd_sum(squared_sum) / float(hidden) + epsilon);
+    for (uint tile = 0; tile < vector_tiles; ++tile) {
+        uint offset = tile * 128 + lane * 4;
+        float4 x = *(device const float4 *)(input + offset);
+        float4 w = *(device const float4 *)(weight + offset);
+        *(device float4 *)(output + offset) = x * inverse_rms * w;
+    }
+}
+
 // Experimental Gemma decode epilogue.  This retains the 32-lane reduction
 // and explicit intermediate arithmetic of rms_norm_decode_f32, then writes
 // the following residual in the same dispatch.  It is intentionally opt-in:
@@ -519,50 +543,6 @@ kernel void matvec_q6_k_8row(
             device const uchar *base = weights + (row * blocks + block) * 210;
             for (uint index = column; index < 256; index += 16)
                 sum += input[block * 256 + index] * q6_k_value(base, index);
-        }
-    }
-    sum += simd_shuffle_xor(sum, 8);
-    sum += simd_shuffle_xor(sum, 4);
-    sum += simd_shuffle_xor(sum, 2);
-    sum += simd_shuffle_xor(sum, 1);
-    if (column == 0 && row < output_width) output[row] = sum;
-}
-
-// Layout-preserving Q6_K variant for the tied language-model head. A lane
-// consumes two values from each 32-value quantization group, so retain the
-// existing accumulation order while loading the group and block scales once.
-kernel void matvec_q6_k_8row_cacheopt(
-    device const float *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
-    device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
-    constant uint &output_width [[buffer(4)]], uint group [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]]) {
-    uint simdgroup = tid / 32;
-    uint lane = tid % 32;
-    uint row_in_simd = lane / 16;
-    uint column = lane % 16;
-    uint row = group * 8 + simdgroup * 2 + row_in_simd;
-    float sum = 0.0f;
-    if (row < output_width) {
-        uint blocks = input_width / 256;
-        for (uint block = 0; block < blocks; ++block) {
-            device const uchar *base = weights + (row * blocks + block) * 210;
-            float block_scale = float(*(device const half *)(base + 208));
-            for (uint chunk = 0; chunk < 2; ++chunk) {
-                for (uint stream = 0; stream < 4; ++stream) {
-                    int8_t group_scale = *(device const int8_t *)(base + 192 + chunk * 8 + stream);
-                    uint first = stream * 32 + column;
-                    uint second = first + 16;
-                    uchar first_high_byte = base[128 + chunk * 64 + first / 2];
-                    uchar second_high_byte = base[128 + chunk * 64 + second / 2];
-                    uint first_high = (first & 1) == 0 ? first_high_byte & 3 : first_high_byte >> 2;
-                    uint second_high = (second & 1) == 0 ? second_high_byte & 3 : second_high_byte >> 2;
-                    int first_quantized = int((first_high << 4) | base[chunk * 128 + first]) - 32;
-                    int second_quantized = int((second_high << 4) | base[chunk * 128 + second]) - 32;
-                    uint input_base = block * 256 + chunk * 128;
-                    sum += input[input_base + first] * float(first_quantized * group_scale) * block_scale;
-                    sum += input[input_base + second] * float(second_quantized * group_scale) * block_scale;
-                }
-            }
         }
     }
     sum += simd_shuffle_xor(sum, 8);

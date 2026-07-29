@@ -29,6 +29,8 @@ const GEMMA4_DECODE_PROFILE_TARGETS: [usize; 9] = [1, 32, 64, 128, 256, 512, 102
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gemma4WeightFormat {
     MixedQ4Q6,
+    Q4Embeddings,
+    Q4LmHead,
     AllQ4,
 }
 
@@ -36,37 +38,59 @@ impl Gemma4WeightFormat {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::MixedQ4Q6 => "mixed_q4_q6",
+            Self::Q4Embeddings => "q4_embeddings",
+            Self::Q4LmHead => "q4_lm_head",
             Self::AllQ4 => "all_q4",
         }
     }
 
-    const fn vocabulary_format(self) -> GgufTensorType {
+    const fn embedding_format(self) -> GgufTensorType {
         match self {
-            Self::MixedQ4Q6 => GgufTensorType::Q6K,
-            Self::AllQ4 => GgufTensorType::Q4_0,
+            Self::Q4Embeddings | Self::AllQ4 => GgufTensorType::Q4_0,
+            Self::MixedQ4Q6 | Self::Q4LmHead => GgufTensorType::Q6K,
         }
     }
 
-    const fn embedding_kernel(self) -> &'static str {
+    const fn output_format(self) -> GgufTensorType {
         match self {
-            Self::MixedQ4Q6 => "embedding_lookup_q6_k",
-            Self::AllQ4 => "embedding_lookup_q4_0",
+            Self::Q4LmHead | Self::AllQ4 => GgufTensorType::Q4_0,
+            Self::MixedQ4Q6 | Self::Q4Embeddings => GgufTensorType::Q6K,
         }
+    }
+
+    fn embedding_kernel(self) -> &'static str {
+        match self.embedding_format() {
+            GgufTensorType::Q4_0 => "embedding_lookup_q4_0",
+            GgufTensorType::Q6K => "embedding_lookup_q6_k",
+            _ => unreachable!("unsupported Gemma vocabulary embedding format"),
+        }
+    }
+
+    fn output_projection_kernel(self) -> &'static str {
+        match self.output_format() {
+            GgufTensorType::Q4_0 => "matvec_q4_0_16row",
+            GgufTensorType::Q6K => "matvec_q6_k_8row",
+            _ => unreachable!("unsupported Gemma vocabulary output format"),
+        }
+    }
+
+    const fn derives_embeddings(self) -> bool {
+        matches!(self, Self::Q4Embeddings | Self::AllQ4)
+    }
+
+    const fn derives_output_projection(self) -> bool {
+        matches!(self, Self::Q4LmHead | Self::AllQ4)
     }
 }
 
 fn gemma4_weight_format() -> Result<Gemma4WeightFormat> {
     match std::env::var("ATLAS_GEMMA4_WEIGHT_FORMAT").as_deref() {
         Err(_) | Ok("mixed") | Ok("mixed_q4_q6") => Ok(Gemma4WeightFormat::MixedQ4Q6),
-        Ok("all_q4") => {
-            ensure!(
-                std::env::var_os("ATLAS_GEMMA4_Q6_LM_HEAD_EXPERIMENT").is_none(),
-                "ATLAS_GEMMA4_WEIGHT_FORMAT=all_q4 cannot be combined with ATLAS_GEMMA4_Q6_LM_HEAD_EXPERIMENT"
-            );
-            Ok(Gemma4WeightFormat::AllQ4)
-        }
+        Ok("q4_embeddings") => Ok(Gemma4WeightFormat::Q4Embeddings),
+        Ok("q4_lm_head") => Ok(Gemma4WeightFormat::Q4LmHead),
+        Ok("all_q4") => Ok(Gemma4WeightFormat::AllQ4),
         Ok(value) => anyhow::bail!(
-            "unsupported ATLAS_GEMMA4_WEIGHT_FORMAT `{value}`; expected mixed_q4_q6 or all_q4"
+            "unsupported ATLAS_GEMMA4_WEIGHT_FORMAT `{value}`; expected mixed_q4_q6, q4_embeddings, q4_lm_head, or all_q4"
         ),
     }
 }
@@ -271,6 +295,7 @@ pub struct Gemma4Metrics {
     pub embedding_kernel: &'static str,
     pub output_projection_kernel: &'static str,
     pub q6_projection_kernel: &'static str,
+    pub rms_norm_kernel: &'static str,
     pub kv_cache_type: Gemma4KvCacheType,
     pub kv_cache_bytes: u64,
 }
@@ -371,7 +396,7 @@ fn gemma4_kernel_family(kernel: &str) -> &'static str {
         "q4_qkv_projection"
     } else if kernel == "matmul_q4_0_gate_up_16row" {
         "q4_ffn_gate_up_projection"
-    } else if matches!(kernel, "matvec_q6_k_8row" | "matvec_q6_k_8row_cacheopt") {
+    } else if kernel == "matvec_q6_k_8row" {
         "q6_lm_head_projection"
     } else if kernel.starts_with("matmul_q4_0_batch") || kernel.starts_with("matmul_q6_k_batch") {
         "batched_projection"
@@ -505,10 +530,7 @@ fn gemma4_qkv_fused_enabled() -> bool {
 }
 
 fn gemma4_q6_projection_kernel() -> &'static str {
-    match std::env::var("ATLAS_GEMMA4_Q6_LM_HEAD_EXPERIMENT").as_deref() {
-        Ok("cacheopt") => "matvec_q6_k_8row_cacheopt",
-        _ => "matvec_q6_k_8row",
-    }
+    "matvec_q6_k_8row"
 }
 
 fn gemma4_qk_norm_rope_fused_enabled() -> bool {
@@ -540,6 +562,28 @@ fn gemma4_rms_epilogue_fused_enabled_for(experiment: Option<&str>) -> bool {
 fn gemma4_rms_epilogue_fused_enabled() -> bool {
     gemma4_rms_epilogue_fused_enabled_for(
         std::env::var("ATLAS_GEMMA4_RMS_EPILOGUE_EXPERIMENT")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn gemma4_rms_norm_decode_kernel_for(hidden_size: usize, experiment: Option<&str>) -> &'static str {
+    if matches!(
+        experiment,
+        Some("baseline") | Some("scalar") | Some("off") | Some("0")
+    ) {
+        "rms_norm_decode_f32"
+    } else if hidden_size % 128 == 0 {
+        "rms_norm_decode_f32_vec4"
+    } else {
+        "rms_norm_decode_f32"
+    }
+}
+
+fn gemma4_rms_norm_decode_kernel(hidden_size: usize) -> &'static str {
+    gemma4_rms_norm_decode_kernel_for(
+        hidden_size,
+        std::env::var("ATLAS_GEMMA4_RMS_NORM_EXPERIMENT")
             .ok()
             .as_deref(),
     )
@@ -601,6 +645,7 @@ pub struct Gemma4E2bExecutor<'a> {
     weight_format: Gemma4WeightFormat,
     token_embedding: GpuBuffer,
     per_layer_embedding: GpuBuffer,
+    output_projection: GpuBuffer,
     derived_vocabulary_bytes: u64,
     token: GpuBuffer,
     position_buffer: GpuBuffer,
@@ -765,35 +810,45 @@ impl<'a> Gemma4E2bExecutor<'a> {
         let weight_format = gemma4_weight_format()?;
         let mut weight_upload_bytes =
             model.ensure_resident_weights(weight_format == Gemma4WeightFormat::AllQ4)?;
-        let (token_embedding, per_layer_embedding, derived_vocabulary_bytes) = match weight_format {
-            Gemma4WeightFormat::MixedQ4Q6 => (
-                model.resident_weight("token_embd.weight")?,
-                model.resident_weight("per_layer_token_embd.weight")?,
-                0,
-            ),
-            Gemma4WeightFormat::AllQ4 => {
-                let derive = |name: &str| -> Result<GpuBuffer> {
-                    let tensor = model
-                        .gguf()
-                        .tensors
-                        .iter()
-                        .find(|tensor| tensor.name == name)
-                        .with_context(|| format!("Gemma all-Q4 source tensor missing `{name}`"))?;
-                    ensure!(
-                        tensor.tensor_type == GgufTensorType::Q6K,
-                        "Gemma all-Q4 source tensor `{name}` must be Q6_K"
-                    );
-                    let row_width = tensor.dims.first().copied().unwrap_or_default();
-                    let packed = gemma4_q6_k_to_q4_0(model.gguf().tensor_data(tensor)?, row_width)?;
-                    runtime.upload_bytes(&packed).map_err(Into::into)
-                };
-                let token = derive("token_embd.weight")?;
-                let per_layer = derive("per_layer_token_embd.weight")?;
-                let bytes = (token.bytes() + per_layer.bytes()) as u64;
-                weight_upload_bytes = weight_upload_bytes.saturating_add(bytes);
-                (token, per_layer, bytes)
-            }
+        let derive = |name: &str| -> Result<GpuBuffer> {
+            let tensor = model
+                .gguf()
+                .tensors
+                .iter()
+                .find(|tensor| tensor.name == name)
+                .with_context(|| format!("Gemma Q4 vocabulary source tensor missing `{name}`"))?;
+            ensure!(
+                tensor.tensor_type == GgufTensorType::Q6K,
+                "Gemma Q4 vocabulary source tensor `{name}` must be Q6_K"
+            );
+            let row_width = tensor.dims.first().copied().unwrap_or_default();
+            let packed = gemma4_q6_k_to_q4_0(model.gguf().tensor_data(tensor)?, row_width)?;
+            runtime.upload_bytes(&packed).map_err(Into::into)
         };
+        let token_embedding = if weight_format.derives_embeddings() {
+            derive("token_embd.weight")?
+        } else {
+            model.resident_weight("token_embd.weight")?
+        };
+        let per_layer_embedding = if weight_format.derives_embeddings() {
+            derive("per_layer_token_embd.weight")?
+        } else {
+            model.resident_weight("per_layer_token_embd.weight")?
+        };
+        let output_projection = if weight_format.derives_output_projection() {
+            if weight_format == Gemma4WeightFormat::AllQ4 {
+                token_embedding.clone()
+            } else {
+                derive("token_embd.weight")?
+            }
+        } else {
+            model.resident_weight("token_embd.weight")?
+        };
+        let derived_vocabulary_bytes = (usize::from(weight_format.derives_embeddings())
+            * (token_embedding.bytes() + per_layer_embedding.bytes())
+            + usize::from(weight_format == Gemma4WeightFormat::Q4LmHead)
+                * output_projection.bytes()) as u64;
+        weight_upload_bytes = weight_upload_bytes.saturating_add(derived_vocabulary_bytes);
         let prefill = Gemma4PrefillBuffers {
             state: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * h)?,
             next_state: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * h)?,
@@ -824,6 +879,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
             weight_format,
             token_embedding,
             per_layer_embedding,
+            output_projection,
             derived_vocabulary_bytes,
             token: runtime.allocate(4)?,
             position_buffer: runtime.allocate(4)?,
@@ -1088,6 +1144,30 @@ impl<'a> Gemma4E2bExecutor<'a> {
         } else {
             command.dispatch_1d_labeled(kernel, profiling_label, buffers, output_width)?;
         }
+        Ok(())
+    }
+
+    fn rms_norm_decode_labeled(
+        &self,
+        command: &mut atlas_metal::ResidentCommand<'_>,
+        profiling_label: Option<&'static str>,
+        input: &GpuBuffer,
+        weight: &GpuBuffer,
+        output: &GpuBuffer,
+        force_baseline: bool,
+    ) -> Result<()> {
+        let kernel = if force_baseline {
+            "rms_norm_decode_f32"
+        } else {
+            gemma4_rms_norm_decode_kernel(self.model.config.hidden_size)
+        };
+        command.dispatch_threadgroups_1d_labeled(
+            kernel,
+            profiling_label,
+            &[input, weight, output, &self.hidden, &self.epsilon],
+            1,
+            32,
+        )?;
         Ok(())
     }
 
@@ -1561,14 +1641,17 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 ),
                 weight_format: self.weight_format,
                 embedding_kernel: self.weight_format.embedding_kernel(),
-                output_projection_kernel: match self.weight_format {
-                    Gemma4WeightFormat::MixedQ4Q6 => gemma4_q6_projection_kernel(),
-                    Gemma4WeightFormat::AllQ4 => "matvec_q4_0_16row",
+                output_projection_kernel: match self.weight_format.output_format() {
+                    GgufTensorType::Q6K => gemma4_q6_projection_kernel(),
+                    GgufTensorType::Q4_0 => self.weight_format.output_projection_kernel(),
+                    _ => unreachable!("unsupported Gemma vocabulary output format"),
                 },
-                q6_projection_kernel: match self.weight_format {
-                    Gemma4WeightFormat::MixedQ4Q6 => gemma4_q6_projection_kernel(),
-                    Gemma4WeightFormat::AllQ4 => "none",
+                q6_projection_kernel: match self.weight_format.output_format() {
+                    GgufTensorType::Q6K => gemma4_q6_projection_kernel(),
+                    GgufTensorType::Q4_0 => "none",
+                    _ => unreachable!("unsupported Gemma vocabulary output format"),
                 },
+                rms_norm_kernel: gemma4_rms_norm_decode_kernel(self.model.config.hidden_size),
                 kv_cache_type: self.kv_cache_type,
                 kv_cache_bytes: self.kv_cache_bytes(),
             },
@@ -1834,7 +1917,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
         command.dispatch_1d(
             self.weight_format.embedding_kernel(),
             &[
-                &self.token_embedding,
+                &self.output_projection,
                 &token_batch,
                 &self.prefill.state,
                 &self.vocab,
@@ -1971,7 +2054,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 &self.hidden,
                 &self.vocab,
                 c.vocab_size,
-                self.weight_format.vocabulary_format(),
+                self.weight_format.output_format(),
             )?;
             command.dispatch_1d(
                 "softcap_f32",
@@ -2621,18 +2704,13 @@ impl<'a> Gemma4E2bExecutor<'a> {
             let attn_norm = self.weight(&format!("{p}.attn_norm.weight"), GgufTensorType::F32)?;
             let wq = self.weight(&format!("{p}.attn_q.weight"), GgufTensorType::Q4_0)?;
             let q_norm = self.weight(&format!("{p}.attn_q_norm.weight"), GgufTensorType::F32)?;
-            command.dispatch_threadgroups_1d_labeled(
-                "rms_norm_decode_f32",
+            self.rms_norm_decode_labeled(
+                &mut command,
                 Some("attention_input_norm"),
-                &[
-                    &self.state,
-                    &attn_norm,
-                    &self.norm,
-                    &self.hidden,
-                    &self.epsilon,
-                ],
-                1,
-                32,
+                &self.state,
+                &attn_norm,
+                &self.norm,
+                trace_stages,
             )?;
             let fused_qkv = source == layer && gemma4_qkv_fused_enabled();
             let fused_qk_norm_rope = gemma4_qk_norm_rope_fused_enabled();
@@ -2929,18 +3007,13 @@ impl<'a> Gemma4E2bExecutor<'a> {
                     32,
                 )?;
             } else {
-                command.dispatch_threadgroups_1d_labeled(
-                    "rms_norm_decode_f32",
+                self.rms_norm_decode_labeled(
+                    &mut command,
                     Some("post_attention_norm"),
-                    &[
-                        &self.work,
-                        &post_attn,
-                        &self.work,
-                        &self.hidden,
-                        &self.epsilon,
-                    ],
-                    1,
-                    32,
+                    &self.work,
+                    &post_attn,
+                    &self.work,
+                    trace_stages,
                 )?;
                 command.dispatch_1d(
                     "vector_add_f32",
@@ -2963,18 +3036,13 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 )?;
             }
             let ffn_norm = self.weight(&format!("{p}.ffn_norm.weight"), GgufTensorType::F32)?;
-            command.dispatch_threadgroups_1d_labeled(
-                "rms_norm_decode_f32",
+            self.rms_norm_decode_labeled(
+                &mut command,
                 Some("ffn_input_norm"),
-                &[
-                    &self.residual,
-                    &ffn_norm,
-                    &self.norm,
-                    &self.hidden,
-                    &self.epsilon,
-                ],
-                1,
-                32,
+                &self.residual,
+                &ffn_norm,
+                &self.norm,
+                trace_stages,
             )?;
             let ffn = c.feed_forward_sizes[layer];
             let ffn_buffer = &self.ffn_widths[layer];
@@ -3142,18 +3210,13 @@ impl<'a> Gemma4E2bExecutor<'a> {
             )?;
             let post_ffn =
                 self.weight(&format!("{p}.post_ffw_norm.weight"), GgufTensorType::F32)?;
-            command.dispatch_threadgroups_1d_labeled(
-                "rms_norm_decode_f32",
+            self.rms_norm_decode_labeled(
+                &mut command,
                 Some("post_ffn_norm"),
-                &[
-                    &self.work,
-                    &post_ffn,
-                    &self.work,
-                    &self.hidden,
-                    &self.epsilon,
-                ],
-                1,
-                32,
+                &self.work,
+                &post_ffn,
+                &self.work,
+                trace_stages,
             )?;
             if trace_stages {
                 let slot =
@@ -3262,18 +3325,13 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 h,
                 GgufTensorType::Q4_0,
             )?;
-            command.dispatch_threadgroups_1d_labeled(
-                "rms_norm_decode_f32",
+            self.rms_norm_decode_labeled(
+                &mut command,
                 Some("ple_norm"),
-                &[
-                    &self.work,
-                    &post_norm,
-                    &self.work,
-                    &self.hidden,
-                    &self.epsilon,
-                ],
-                1,
-                32,
+                &self.work,
+                &post_norm,
+                &self.work,
+                trace_stages,
             )?;
             if trace_stages {
                 let slot =
@@ -3322,28 +3380,23 @@ impl<'a> Gemma4E2bExecutor<'a> {
             return Ok(());
         }
         let output_norm = self.weight("output_norm.weight", GgufTensorType::F32)?;
-        command.dispatch_threadgroups_1d_labeled(
-            "rms_norm_decode_f32",
+        self.rms_norm_decode_labeled(
+            &mut command,
             Some("final_output_norm"),
-            &[
-                &self.state,
-                &output_norm,
-                &self.norm,
-                &self.hidden,
-                &self.epsilon,
-            ],
-            1,
-            32,
+            &self.state,
+            &output_norm,
+            &self.norm,
+            trace_stages,
         )?;
         self.matvec(
             &mut command,
             &self.norm,
-            &self.token_embedding,
+            &self.output_projection,
             &self.logits,
             &self.hidden,
             &self.vocab,
             c.vocab_size,
-            self.weight_format.vocabulary_format(),
+            self.weight_format.output_format(),
         )?;
         command.dispatch_1d(
             "softcap_f32",
@@ -3459,8 +3512,8 @@ mod tests {
         gemma4_prefill_path, gemma4_profile_family, gemma4_q4_shared_kv_scan_supported,
         gemma4_q4_two_pass_attention_eligible, gemma4_q4_two_pass_attention_first_pass_pipeline,
         gemma4_q4_two_pass_attention_threshold, gemma4_q6_k_to_q4_0,
-        gemma4_rms_epilogue_fused_enabled_for, gemma4_rope_angle, gemma4_should_finish,
-        gemma4_two_pass_attention_ranges,
+        gemma4_rms_epilogue_fused_enabled_for, gemma4_rms_norm_decode_kernel_for,
+        gemma4_rope_angle, gemma4_should_finish, gemma4_two_pass_attention_ranges,
     };
     use atlas_core::{GgufTensorType, dequantize_block};
 
@@ -3699,10 +3752,6 @@ mod tests {
             "q6_lm_head_projection"
         );
         assert_eq!(
-            gemma4_kernel_family("matvec_q6_k_8row_cacheopt"),
-            "q6_lm_head_projection"
-        );
-        assert_eq!(
             gemma4_kernel_family("matmul_q4_0_batch_16row"),
             "batched_projection"
         );
@@ -3730,6 +3779,26 @@ mod tests {
         );
         assert_eq!(gemma4_kernel_family("argmax_f32"), "argmax");
         assert_eq!(gemma4_kernel_family("embedding_lookup_q6_k"), "other");
+    }
+
+    #[test]
+    fn vectorized_rms_norm_is_default_with_a_scalar_diagnostic_escape_hatch() {
+        assert_eq!(
+            gemma4_rms_norm_decode_kernel_for(2304, None),
+            "rms_norm_decode_f32_vec4"
+        );
+        assert_eq!(
+            gemma4_rms_norm_decode_kernel_for(2304, Some("baseline")),
+            "rms_norm_decode_f32"
+        );
+        assert_eq!(
+            gemma4_rms_norm_decode_kernel_for(2304, Some("scalar")),
+            "rms_norm_decode_f32"
+        );
+        assert_eq!(
+            gemma4_rms_norm_decode_kernel_for(2305, None),
+            "rms_norm_decode_f32"
+        );
     }
 
     #[test]
@@ -3769,13 +3838,28 @@ mod tests {
     }
 
     #[test]
-    fn all_q4_routes_embedding_and_tied_projection_without_q6_dispatch() {
-        let format = Gemma4WeightFormat::AllQ4;
-        assert_eq!(format.as_str(), "all_q4");
-        assert_eq!(format.embedding_kernel(), "embedding_lookup_q4_0");
-        assert_eq!(format.vocabulary_format(), GgufTensorType::Q4_0);
-        assert_ne!(format.embedding_kernel(), "embedding_lookup_q6_k");
-        assert_ne!(format.vocabulary_format(), GgufTensorType::Q6K);
+    fn split_q4_routes_embedding_and_tied_projection_independently() {
+        let cases = [
+            (
+                Gemma4WeightFormat::Q4Embeddings,
+                "embedding_lookup_q4_0",
+                GgufTensorType::Q6K,
+            ),
+            (
+                Gemma4WeightFormat::Q4LmHead,
+                "embedding_lookup_q6_k",
+                GgufTensorType::Q4_0,
+            ),
+            (
+                Gemma4WeightFormat::AllQ4,
+                "embedding_lookup_q4_0",
+                GgufTensorType::Q4_0,
+            ),
+        ];
+        for (format, embedding_kernel, output_format) in cases {
+            assert_eq!(format.embedding_kernel(), embedding_kernel);
+            assert_eq!(format.output_format(), output_format);
+        }
     }
 
     #[test]

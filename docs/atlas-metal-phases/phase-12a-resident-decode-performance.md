@@ -63,20 +63,23 @@ upload/readback bytes, and resident bytes.
   and positional work into RMS normalization, fused Q/K norm+RoPE, RoPE
   rotation, and RoPE layout conversion before selecting the next kernel target.
 
-The tied vocabulary projection is Q6_K even in the pinned Q4_0 fixture.
-`ATLAS_GEMMA4_Q6_LM_HEAD_EXPERIMENT=cacheopt` is an opt-in decode candidate
-that preserves the eight-row, 128-thread layout and accumulation order while
-reusing a Q6_K block scale and its 32-value group scale within each lane. It
-must retain exact output and improve the fixed Resident A/B result before it
-can become the production selection.
+The tied vocabulary projection remains on the canonical Q6_K eight-row kernel.
+The rejected Q6 LM-head variants are not selectable. The production Resident
+RMS path is `rms_norm_decode_f32_vec4`: it vectorizes the 2304-wide
+single-token normalization loads and stores while retaining one 32-lane
+reduction and the same resident buffers. The five-window Apple-Silicon gate at
+`artifacts/phase-12a-rms-norm-ab/20260729T185547Z/rms-norm-ab-summary.json`
+passed exact SHA/EOS parity and stable Q4 KV/Resident accounting, with +8.84%
+long-context decode (28.88 to 31.44 tok/s) and +14.02% short-context decode
+(42.48 to 48.43 tok/s). Set `ATLAS_GEMMA4_RMS_NORM_EXPERIMENT=baseline` only
+to select the scalar RMS diagnostic oracle.
 
 `ATLAS_GEMMA4_WEIGHT_FORMAT=all_q4` is a separate, unpromoted Resident
 candidate. At executor setup it deterministically re-quantizes the fixture's
 Q6_K `token_embd.weight` and `per_layer_token_embd.weight` tables to Q4_0,
 uploads those derived buffers instead of their Q6_K GPU source buffers, and
 uses `embedding_lookup_q4_0` plus `matvec_q4_0_16row` for both prefill and
-decode. It rejects `ATLAS_GEMMA4_Q6_LM_HEAD_EXPERIMENT` rather than silently
-mixing experiments. Benchmark records expose `weight_format`,
+decode. Benchmark records expose `weight_format`,
 `embedding_kernel`, and `output_projection_kernel`; an all-Q4 run must report
 no Q6 vocabulary projection.
 
@@ -86,6 +89,12 @@ prompt/full/measured stream SHA and EOS parity, stable Q4 KV and Resident
 accounting, all-Q4 kernel selection, at least 3% sustained long-context decode
 improvement, and no short-context regression. Until then, mixed Q4/Q6 remains
 the production default.
+
+When the all-Q4 candidate fails exact parity, run the short diagnostic
+`bash scripts/run-gemma4-q4-vocabulary-diagnosis.sh`. It compares
+`q4_embeddings` and `q4_lm_head` against the mixed Resident oracle in two
+64-token windows. This localizes the failing vocabulary boundary; it is not a
+performance or promotion gate.
   The default FFN gate/up path combines the two same-input Q4 projections into
   one Metal dispatch. Set
   `ATLAS_GEMMA4_FFN_GATE_UP_EXPERIMENT=baseline` to recover the separate
