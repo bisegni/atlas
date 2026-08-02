@@ -14,7 +14,11 @@ use anyhow::{Context, Result, ensure};
 use atlas_core::{GgufTensorType, dequantize_block, quantize_q4_0};
 use atlas_metal::GpuBuffer;
 
-use crate::{Gemma4E2bModel, Generation, LayerTrace, gemma4_shared_kv_sources};
+use crate::{
+    Gemma4E2bModel, Generation, LayerTrace, gemma4_ffn_down_interleaved_enabled,
+    gemma4_ffn_down_interleaved_enabled_for, gemma4_shared_kv_sources,
+    quantization_plan::QuantizationPlan,
+};
 
 const GEMMA4_TRACE_STAGES_PER_LAYER: usize = 13;
 const GEMMA4_TRACE_GLOBAL_STAGES: usize = 6;
@@ -68,8 +72,8 @@ impl Gemma4WeightFormat {
 
     fn output_projection_kernel(self) -> &'static str {
         match self.output_format() {
-            GgufTensorType::Q4_0 => "matvec_q4_0_16row",
-            GgufTensorType::Q6K => "matvec_q6_k_8row",
+            GgufTensorType::Q4_0 => gemma4_q4_projection_kernel(),
+            GgufTensorType::Q6K => gemma4_q6_projection_kernel(),
             _ => unreachable!("unsupported Gemma vocabulary output format"),
         }
     }
@@ -83,6 +87,50 @@ impl Gemma4WeightFormat {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Gemma4SelectedGroupFormat {
+    pub group: &'static str,
+    pub source_format: GgufTensorType,
+    pub selected_format: GgufTensorType,
+    pub selected_kernel: &'static str,
+    pub rejection_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Gemma4SelectedFormatMap {
+    formats: BTreeMap<&'static str, Gemma4SelectedGroupFormat>,
+}
+
+impl Gemma4SelectedFormatMap {
+    fn insert(&mut self, format: Gemma4SelectedGroupFormat) {
+        self.formats.insert(format.group, format);
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Gemma4SelectedGroupFormat> {
+        self.formats.values()
+    }
+
+    fn selected_format(&self, group: &str) -> Option<GgufTensorType> {
+        self.formats.get(group).map(|entry| entry.selected_format)
+    }
+
+    fn rejection_reasons(&self) -> Vec<String> {
+        self.formats
+            .values()
+            .filter_map(|entry| entry.rejection_reason.clone())
+            .collect()
+    }
+}
+
+const GEMMA4_SELECTED_GROUP_VOCAB_EMBEDDINGS: &str = "vocabulary_embeddings";
+const GEMMA4_SELECTED_GROUP_VOCAB_OUTPUT: &str = "vocabulary_output_projection";
+const GEMMA4_SELECTED_GROUP_QKV: &str = "qkv_projection";
+const GEMMA4_SELECTED_GROUP_GATE_UP: &str = "gate_up_projection";
+const GEMMA4_SELECTED_GROUP_ATTN_OUTPUT: &str = "attention_output_projection";
+const GEMMA4_SELECTED_GROUP_FFN_DOWN: &str = "ffn_down_projection";
+const GEMMA4_SELECTED_GROUP_PLE_PROJECTION: &str = "ple_projection";
+const GEMMA4_SELECTED_GROUP_PER_LAYER_PROJ: &str = "per_layer_model_projection";
+
 fn gemma4_weight_format() -> Result<Gemma4WeightFormat> {
     match std::env::var("ATLAS_GEMMA4_WEIGHT_FORMAT").as_deref() {
         Err(_) | Ok("mixed") | Ok("mixed_q4_q6") => Ok(Gemma4WeightFormat::MixedQ4Q6),
@@ -93,6 +141,101 @@ fn gemma4_weight_format() -> Result<Gemma4WeightFormat> {
             "unsupported ATLAS_GEMMA4_WEIGHT_FORMAT `{value}`; expected mixed_q4_q6, q4_embeddings, q4_lm_head, or all_q4"
         ),
     }
+}
+
+pub(crate) fn gemma4_weight_format_with_plan(
+    plan: Option<&QuantizationPlan>,
+) -> Result<Gemma4WeightFormat> {
+    if std::env::var_os("ATLAS_GEMMA4_WEIGHT_FORMAT").is_some() {
+        return gemma4_weight_format();
+    }
+    let Some(plan) = plan else {
+        return gemma4_weight_format();
+    };
+    let token = plan.selected_format("token_embd.weight");
+    let per_layer = plan.selected_format("per_layer_token_embd.weight");
+    match (token, per_layer) {
+        (Some(GgufTensorType::Q4_0), Some(GgufTensorType::Q4_0)) => Ok(Gemma4WeightFormat::AllQ4),
+        (Some(GgufTensorType::Q6K), Some(GgufTensorType::Q6K)) => Ok(Gemma4WeightFormat::MixedQ4Q6),
+        (None, None) => gemma4_weight_format(),
+        (Some(left), Some(right)) => anyhow::bail!(
+            "quantization plan selects incompatible Gemma vocabulary formats: token_embd={left:?}, per_layer_token_embd={right:?}"
+        ),
+        _ => anyhow::bail!("quantization plan must select both Gemma vocabulary tensors together"),
+    }
+}
+
+pub(crate) fn gemma4_selected_group_formats(
+    weight_format: Gemma4WeightFormat,
+) -> Gemma4SelectedFormatMap {
+    let mut formats = Gemma4SelectedFormatMap::default();
+    let vocabulary_embedding_format = weight_format.embedding_format();
+    let vocabulary_output_format = weight_format.output_format();
+    formats.insert(Gemma4SelectedGroupFormat {
+        group: GEMMA4_SELECTED_GROUP_VOCAB_EMBEDDINGS,
+        source_format: GgufTensorType::Q6K,
+        selected_format: vocabulary_embedding_format,
+        selected_kernel: match vocabulary_embedding_format {
+            GgufTensorType::Q4_0 => "embedding_lookup_q4_0",
+            GgufTensorType::Q6K => "embedding_lookup_q6_k",
+            _ => "embedding_lookup_q6_k",
+        },
+        rejection_reason: None,
+    });
+    formats.insert(Gemma4SelectedGroupFormat {
+        group: GEMMA4_SELECTED_GROUP_VOCAB_OUTPUT,
+        source_format: GgufTensorType::Q6K,
+        selected_format: vocabulary_output_format,
+        selected_kernel: match vocabulary_output_format {
+            GgufTensorType::Q4_0 => gemma4_q4_projection_kernel(),
+            GgufTensorType::Q6K => gemma4_q6_projection_kernel(),
+            _ => gemma4_q6_projection_kernel(),
+        },
+        rejection_reason: None,
+    });
+    formats.insert(Gemma4SelectedGroupFormat {
+        group: GEMMA4_SELECTED_GROUP_QKV,
+        source_format: GgufTensorType::Q4_0,
+        selected_format: GgufTensorType::Q4_0,
+        selected_kernel: gemma4_q4_qkv_projection_kernel(),
+        rejection_reason: None,
+    });
+    formats.insert(Gemma4SelectedGroupFormat {
+        group: GEMMA4_SELECTED_GROUP_GATE_UP,
+        source_format: GgufTensorType::Q4_0,
+        selected_format: GgufTensorType::Q4_0,
+        selected_kernel: gemma4_q4_gate_up_projection_kernel(),
+        rejection_reason: None,
+    });
+    formats.insert(Gemma4SelectedGroupFormat {
+        group: GEMMA4_SELECTED_GROUP_ATTN_OUTPUT,
+        source_format: GgufTensorType::Q4_0,
+        selected_format: GgufTensorType::Q4_0,
+        selected_kernel: gemma4_q4_projection_kernel(),
+        rejection_reason: None,
+    });
+    formats.insert(Gemma4SelectedGroupFormat {
+        group: GEMMA4_SELECTED_GROUP_FFN_DOWN,
+        source_format: GgufTensorType::Q4_0,
+        selected_format: GgufTensorType::Q4_0,
+        selected_kernel: gemma4_ffn_down_projection_kernel(),
+        rejection_reason: None,
+    });
+    formats.insert(Gemma4SelectedGroupFormat {
+        group: GEMMA4_SELECTED_GROUP_PLE_PROJECTION,
+        source_format: GgufTensorType::Q4_0,
+        selected_format: GgufTensorType::Q4_0,
+        selected_kernel: gemma4_q4_projection_kernel(),
+        rejection_reason: None,
+    });
+    formats.insert(Gemma4SelectedGroupFormat {
+        group: GEMMA4_SELECTED_GROUP_PER_LAYER_PROJ,
+        source_format: GgufTensorType::F16,
+        selected_format: GgufTensorType::F16,
+        selected_kernel: "matmul_f16_batch",
+        rejection_reason: None,
+    });
+    formats
 }
 
 /// Convert row-major GGML Q6_K data to deterministic row-major Q4_0 blocks.
@@ -138,16 +281,24 @@ fn gemma4_decode_profile_targets(decode_tokens: usize) -> Vec<usize> {
 
 fn gemma4_q4_two_pass_attention_threshold(experiment: Option<&str>) -> Option<usize> {
     match experiment {
-        // The accepted production baseline is selected with no environment override.
-        None | Some("default") | Some("2pass64") => {
+        // The promoted production path and its scalar diagnostic oracle have
+        // the same split threshold; only their first-pass pipelines differ.
+        None | Some("default") | Some("baseline") | Some("2pass64") => {
             Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
         }
         // Keep the original experiment spelling stable for existing scripts.
         Some("2pass") | Some("2pass96") => Some(GEMMA4_Q4_TWO_PASS_ATTENTION_LEGACY_THRESHOLD),
         Some("2pass80") => Some(80),
         Some("2pass_cache") => Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD),
+        Some("2pass_cache_no_value_barrier") => {
+            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
+        }
+        Some("2pass_unroll2_no_value_barrier") => {
+            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
+        }
         Some("2pass_gqa") => Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD),
         Some("2pass_simd") => Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD),
+        Some("2pass_no_value_barrier") => Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD),
         _ => None,
     }
 }
@@ -161,10 +312,23 @@ fn gemma4_q4_two_pass_attention_first_pass_pipeline(
     shared_kv_scan_supported: bool,
 ) -> &'static str {
     match (experiment, shared_kv_scan_supported) {
+        (Some("baseline") | Some("2pass64"), _) => {
+            "attention_decode_fused_gemma4_simd_q4_0_2pass_1"
+        }
         (Some("2pass_gqa"), true) => "attention_decode_fused_gemma4_simd_q4_0_2pass_1_gqa",
+        (Some("2pass_gqa"), false) => "attention_decode_fused_gemma4_simd_q4_0_2pass_1",
         (Some("2pass_simd"), _) => "attention_decode_fused_gemma4_simd_q4_0_2pass_1_simd",
         (Some("2pass_cache"), _) => "attention_decode_fused_gemma4_simd_q4_0_2pass_1_cacheopt",
-        _ => "attention_decode_fused_gemma4_simd_q4_0_2pass_1",
+        (Some("2pass_cache_no_value_barrier"), _) => {
+            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_cacheopt_no_value_barrier"
+        }
+        (Some("2pass_unroll2_no_value_barrier"), _) => {
+            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_unroll2_no_value_barrier"
+        }
+        (Some("2pass_no_value_barrier"), _) => {
+            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_no_value_barrier"
+        }
+        _ => "attention_decode_fused_gemma4_simd_q4_0_2pass_1_no_value_barrier",
     }
 }
 
@@ -290,14 +454,23 @@ pub struct Gemma4Metrics {
     pub prefill_path: &'static str,
     pub prefill_chunk_size: usize,
     pub prefill_chunks: usize,
+    pub quantization_preflight_state: &'static str,
+    pub selected_group_formats: Vec<Gemma4SelectedGroupFormat>,
+    pub quantization_rejections: Vec<String>,
     pub attention_kernel: &'static str,
     pub weight_format: Gemma4WeightFormat,
     pub embedding_kernel: &'static str,
     pub output_projection_kernel: &'static str,
     pub q6_projection_kernel: &'static str,
+    pub q4_projection_kernel: &'static str,
+    pub q4_qkv_projection_kernel: &'static str,
+    pub q4_gate_up_projection_kernel: &'static str,
+    pub q4_batch_projection_kernel: &'static str,
+    pub ffn_down_projection_kernel: &'static str,
     pub rms_norm_kernel: &'static str,
     pub kv_cache_type: Gemma4KvCacheType,
     pub kv_cache_bytes: u64,
+    pub quantization_plan_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -392,11 +565,17 @@ pub struct Gemma4DecodeProfile {
 }
 
 fn gemma4_kernel_family(kernel: &str) -> &'static str {
-    if kernel == "matmul_q4_0_qkv_16row" {
+    if matches!(
+        kernel,
+        "matmul_q4_0_qkv_16row" | "matmul_q4_0_qkv_16row_simdgroup_tiled"
+    ) {
         "q4_qkv_projection"
-    } else if kernel == "matmul_q4_0_gate_up_16row" {
+    } else if matches!(
+        kernel,
+        "matmul_q4_0_gate_up_16row" | "matmul_q4_0_gate_up_16row_simdgroup_tiled"
+    ) {
         "q4_ffn_gate_up_projection"
-    } else if kernel == "matvec_q6_k_8row" {
+    } else if matches!(kernel, "matvec_q6_k_8row" | "matvec_q6_k_8row_cacheopt") {
         "q6_lm_head_projection"
     } else if kernel.starts_with("matmul_q4_0_batch") || kernel.starts_with("matmul_q6_k_batch") {
         "batched_projection"
@@ -505,8 +684,20 @@ fn gemma4_attention_kernel(
             Some(_) if matches!(experiment, Some("2pass_cache")) => {
                 "attention_decode_fused_gemma4_simd_q4_0_2pass_cache"
             }
+            Some(_) if matches!(experiment, Some("2pass_cache_no_value_barrier")) => {
+                "attention_decode_fused_gemma4_simd_q4_0_2pass_cache_no_value_barrier"
+            }
+            Some(_) if matches!(experiment, Some("2pass_unroll2_no_value_barrier")) => {
+                "attention_decode_fused_gemma4_simd_q4_0_2pass_unroll2_no_value_barrier"
+            }
             Some(_) if matches!(experiment, Some("2pass_simd")) => {
                 "attention_decode_fused_gemma4_simd_q4_0_2pass_simd"
+            }
+            Some(_)
+                if experiment.is_none()
+                    || matches!(experiment, Some("default") | Some("2pass_no_value_barrier")) =>
+            {
+                "attention_decode_fused_gemma4_simd_q4_0_2pass_no_value_barrier"
             }
             Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD) => {
                 "attention_decode_fused_gemma4_simd_q4_0_2pass_64"
@@ -529,8 +720,113 @@ fn gemma4_qkv_fused_enabled() -> bool {
     )
 }
 
+fn gemma4_q6_projection_kernel_for(experiment: Option<&str>) -> &'static str {
+    match experiment {
+        Some("cacheopt") => "matvec_q6_k_8row_cacheopt",
+        _ => "matvec_q6_k_8row",
+    }
+}
+
 fn gemma4_q6_projection_kernel() -> &'static str {
-    "matvec_q6_k_8row"
+    gemma4_q6_projection_kernel_for(
+        std::env::var("ATLAS_GEMMA4_Q6_LM_HEAD_EXPERIMENT")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn gemma4_q4_projection_kernel_for(experiment: Option<&str>) -> &'static str {
+    match experiment {
+        Some("simdgroup_tiled") => "matvec_q4_0_16row_simdgroup_tiled",
+        Some("shared_input") | Some("on") | Some("1") => "matvec_q4_0_16row_shared_input",
+        _ => "matvec_q4_0_16row",
+    }
+}
+
+fn gemma4_q4_simdgroup_tiled_enabled_for(experiment: Option<&str>) -> bool {
+    matches!(experiment, Some("simdgroup_tiled"))
+}
+
+fn gemma4_q4_simdgroup_tiled_enabled() -> bool {
+    gemma4_q4_simdgroup_tiled_enabled_for(
+        std::env::var("ATLAS_GEMMA4_Q4_MATVEC_EXPERIMENT")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn gemma4_q4_qkv_projection_kernel_for(experiment: Option<&str>) -> &'static str {
+    if gemma4_q4_simdgroup_tiled_enabled_for(experiment) {
+        "matmul_q4_0_qkv_16row_simdgroup_tiled"
+    } else {
+        "matmul_q4_0_qkv_16row"
+    }
+}
+
+pub(crate) fn gemma4_q4_qkv_projection_kernel() -> &'static str {
+    gemma4_q4_qkv_projection_kernel_for(
+        std::env::var("ATLAS_GEMMA4_Q4_MATVEC_EXPERIMENT")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn gemma4_q4_gate_up_projection_kernel_for(experiment: Option<&str>) -> &'static str {
+    if gemma4_q4_simdgroup_tiled_enabled_for(experiment) {
+        "matmul_q4_0_gate_up_16row_simdgroup_tiled"
+    } else {
+        "matmul_q4_0_gate_up_16row"
+    }
+}
+
+pub(crate) fn gemma4_q4_gate_up_projection_kernel() -> &'static str {
+    gemma4_q4_gate_up_projection_kernel_for(
+        std::env::var("ATLAS_GEMMA4_Q4_MATVEC_EXPERIMENT")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn gemma4_q4_batch_projection_kernel_for(experiment: Option<&str>) -> &'static str {
+    if gemma4_q4_simdgroup_tiled_enabled_for(experiment) {
+        "matmul_q4_0_batch_16row_simdgroup_tiled"
+    } else {
+        "matmul_q4_0_batch_16row"
+    }
+}
+
+fn gemma4_q4_batch_projection_kernel() -> &'static str {
+    gemma4_q4_batch_projection_kernel_for(
+        std::env::var("ATLAS_GEMMA4_Q4_MATVEC_EXPERIMENT")
+            .ok()
+            .as_deref(),
+    )
+}
+
+pub(crate) fn gemma4_q4_projection_kernel() -> &'static str {
+    gemma4_q4_projection_kernel_for(
+        std::env::var("ATLAS_GEMMA4_Q4_MATVEC_EXPERIMENT")
+            .ok()
+            .as_deref(),
+    )
+}
+
+pub(crate) fn gemma4_ffn_down_projection_kernel() -> &'static str {
+    gemma4_ffn_down_projection_kernel_for(
+        std::env::var("ATLAS_GEMMA4_FFN_DOWN_EXPERIMENT")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn gemma4_ffn_down_projection_kernel_for(experiment: Option<&str>) -> &'static str {
+    if gemma4_ffn_down_interleaved_enabled_for(experiment) {
+        "matvec_q4_0_16row_ffn_down_interleaved"
+    } else if gemma4_q4_simdgroup_tiled_enabled() {
+        "matvec_q4_0_16row_simdgroup_tiled"
+    } else {
+        "matvec_q4_0_16row"
+    }
 }
 
 fn gemma4_qk_norm_rope_fused_enabled() -> bool {
@@ -643,6 +939,7 @@ pub struct Gemma4E2bExecutor<'a> {
     kv: Vec<Option<GpuBuffer>>,
     kv_cache_type: Gemma4KvCacheType,
     weight_format: Gemma4WeightFormat,
+    quantization_plan_path: Option<String>,
     token_embedding: GpuBuffer,
     per_layer_embedding: GpuBuffer,
     output_projection: GpuBuffer,
@@ -710,6 +1007,9 @@ pub struct Gemma4E2bExecutor<'a> {
     rope_freq_factors: Vec<f32>,
     prefill: Gemma4PrefillBuffers,
     pending_weight_upload_bytes: u64,
+    selected_group_formats: Gemma4SelectedFormatMap,
+    quantization_preflight_state: &'static str,
+    quantization_rejections: Vec<String>,
 }
 
 impl<'a> Gemma4E2bExecutor<'a> {
@@ -721,6 +1021,15 @@ impl<'a> Gemma4E2bExecutor<'a> {
         model: &'a Gemma4E2bModel,
         max_context: usize,
         kv_cache_type: Gemma4KvCacheType,
+    ) -> Result<Self> {
+        Self::new_with_kv_cache_from_selection(model, max_context, kv_cache_type, None)
+    }
+
+    pub(crate) fn new_with_kv_cache_from_selection(
+        model: &'a Gemma4E2bModel,
+        max_context: usize,
+        kv_cache_type: Gemma4KvCacheType,
+        selection: Option<(Gemma4SelectedFormatMap, Option<String>, &'static str)>,
     ) -> Result<Self> {
         ensure!(
             max_context > 0,
@@ -807,7 +1116,94 @@ impl<'a> Gemma4E2bExecutor<'a> {
                     .transpose()
             })
             .collect::<Result<Vec<_>>>()?;
-        let weight_format = gemma4_weight_format()?;
+        let (quantization_plan_path, quantization_preflight_state, selected_group_formats) =
+            if let Some((
+                selected_group_formats,
+                quantization_plan_path,
+                quantization_preflight_state,
+            )) = selection
+            {
+                (
+                    quantization_plan_path,
+                    quantization_preflight_state,
+                    selected_group_formats,
+                )
+            } else if std::env::var_os(
+                crate::gemma4_quantization_preflight::ATLAS_GEMMA4_WEIGHT_FORMAT,
+            )
+            .is_some()
+            {
+                let weight_format =
+                    crate::gemma4_quantization_preflight::parse_weight_format_override(
+                        std::env::var(
+                            crate::gemma4_quantization_preflight::ATLAS_GEMMA4_WEIGHT_FORMAT,
+                        )
+                        .ok()
+                        .as_deref(),
+                    )?
+                    .unwrap_or(Gemma4WeightFormat::MixedQ4Q6);
+                (
+                    None,
+                    "explicit",
+                    gemma4_selected_group_formats(weight_format),
+                )
+            } else if crate::gemma4_quantization_preflight::parse_preflight_policy(
+                std::env::var(
+                    crate::gemma4_quantization_preflight::ATLAS_GEMMA4_QUANTIZATION_PREFLIGHT,
+                )
+                .ok()
+                .as_deref(),
+            )?
+                == crate::gemma4_quantization_preflight::Gemma4QuantizationPreflightPolicy::Disabled
+            {
+                (
+                    None,
+                    "disabled",
+                    gemma4_selected_group_formats(Gemma4WeightFormat::MixedQ4Q6),
+                )
+            } else {
+                let hardware_identity = {
+                    let info = model.runtime().device_info();
+                    format!("{}#{}", info.name, info.registry_id)
+                };
+                let quantization_plan =
+                    model.quantization_plan_with_identity(Some(&hardware_identity))?;
+                let weight_format = gemma4_weight_format_with_plan(quantization_plan.as_ref())?;
+                let quantization_plan_path = quantization_plan.map(|_| {
+                    crate::quantization_plan::default_sidecar_path(model.model_path())
+                        .display()
+                        .to_string()
+                });
+                let quantization_preflight_state = if quantization_plan_path.is_some() {
+                    "ready"
+                } else {
+                    "disabled"
+                };
+                (
+                    quantization_plan_path,
+                    quantization_preflight_state,
+                    gemma4_selected_group_formats(weight_format),
+                )
+            };
+        let weight_format =
+            match selected_group_formats.selected_format(GEMMA4_SELECTED_GROUP_VOCAB_EMBEDDINGS) {
+                Some(GgufTensorType::Q4_0) => match selected_group_formats
+                    .selected_format(GEMMA4_SELECTED_GROUP_VOCAB_OUTPUT)
+                {
+                    Some(GgufTensorType::Q4_0) => Gemma4WeightFormat::AllQ4,
+                    Some(GgufTensorType::Q6K) => Gemma4WeightFormat::Q4Embeddings,
+                    _ => Gemma4WeightFormat::AllQ4,
+                },
+                Some(GgufTensorType::Q6K) => match selected_group_formats
+                    .selected_format(GEMMA4_SELECTED_GROUP_VOCAB_OUTPUT)
+                {
+                    Some(GgufTensorType::Q4_0) => Gemma4WeightFormat::Q4LmHead,
+                    Some(GgufTensorType::Q6K) => Gemma4WeightFormat::MixedQ4Q6,
+                    _ => Gemma4WeightFormat::MixedQ4Q6,
+                },
+                _ => gemma4_weight_format()?,
+            };
+        let quantization_rejections = selected_group_formats.rejection_reasons();
         let mut weight_upload_bytes =
             model.ensure_resident_weights(weight_format == Gemma4WeightFormat::AllQ4)?;
         let derive = |name: &str| -> Result<GpuBuffer> {
@@ -877,6 +1273,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
             kv,
             kv_cache_type,
             weight_format,
+            quantization_plan_path,
             token_embedding,
             per_layer_embedding,
             output_projection,
@@ -981,6 +1378,9 @@ impl<'a> Gemma4E2bExecutor<'a> {
             rope_freq_factors,
             prefill,
             pending_weight_upload_bytes: weight_upload_bytes,
+            selected_group_formats,
+            quantization_preflight_state,
+            quantization_rejections,
         })
     }
 
@@ -1119,7 +1519,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
         format: GgufTensorType,
     ) -> Result<()> {
         let kernel = match format {
-            GgufTensorType::Q4_0 => "matvec_q4_0_16row",
+            GgufTensorType::Q4_0 => gemma4_q4_projection_kernel(),
             GgufTensorType::Q6K => gemma4_q6_projection_kernel(),
             GgufTensorType::F16 => "matvec_f16",
             other => anyhow::bail!("unsupported Gemma matvec format {other:?}"),
@@ -1144,6 +1544,26 @@ impl<'a> Gemma4E2bExecutor<'a> {
         } else {
             command.dispatch_1d_labeled(kernel, profiling_label, buffers, output_width)?;
         }
+        Ok(())
+    }
+
+    fn matvec_ffn_down(
+        &self,
+        command: &mut atlas_metal::ResidentCommand<'_>,
+        input: &GpuBuffer,
+        weight: &GpuBuffer,
+        output: &GpuBuffer,
+        input_width: &GpuBuffer,
+        output_width: &GpuBuffer,
+        output_width_value: usize,
+    ) -> Result<()> {
+        command.dispatch_threadgroups_1d_labeled(
+            gemma4_ffn_down_projection_kernel(),
+            Some("ffn_down_projection"),
+            &[input, weight, output, input_width, output_width],
+            output_width_value.div_ceil(16),
+            128,
+        )?;
         Ok(())
     }
 
@@ -1188,7 +1608,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
         format: GgufTensorType,
     ) -> Result<()> {
         let kernel = match format {
-            GgufTensorType::Q4_0 => "matmul_q4_0_batch_16row",
+            GgufTensorType::Q4_0 => gemma4_q4_batch_projection_kernel(),
             GgufTensorType::Q6K => "matmul_q6_k_batch_8row",
             GgufTensorType::F16 => "matmul_f16_batch",
             other => anyhow::bail!("unsupported Gemma batched matrix format {other:?}"),
@@ -1217,6 +1637,33 @@ impl<'a> Gemma4E2bExecutor<'a> {
             )?,
             _ => unreachable!("formats above are exhaustive"),
         }
+        Ok(())
+    }
+
+    fn matmul_ffn_down_batch(
+        &self,
+        command: &mut atlas_metal::ResidentCommand<'_>,
+        input: &GpuBuffer,
+        weight: &GpuBuffer,
+        output: &GpuBuffer,
+        input_width: &GpuBuffer,
+        output_width: &GpuBuffer,
+        batch: &GpuBuffer,
+        output_width_value: usize,
+        batch_value: usize,
+    ) -> Result<()> {
+        let kernel = if gemma4_ffn_down_interleaved_enabled() {
+            "matmul_q4_0_batch_16row_ffn_down_interleaved"
+        } else {
+            gemma4_q4_batch_projection_kernel()
+        };
+        command.dispatch_threadgroups_1d_labeled(
+            kernel,
+            Some("layer_major_batched_ffn_down_projection"),
+            &[input, weight, output, input_width, output_width, batch],
+            batch_value * output_width_value.div_ceil(16),
+            128,
+        )?;
         Ok(())
     }
 
@@ -1267,7 +1714,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
             kv_width,
         ];
         command.dispatch_threadgroups_1d(
-            "matmul_q4_0_qkv_16row",
+            gemma4_q4_qkv_projection_kernel(),
             buffers,
             q_width_value.div_ceil(16) + 2 * kv_width_value.div_ceil(16),
             128,
@@ -1287,7 +1734,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
         output_width_value: usize,
     ) -> Result<()> {
         command.dispatch_threadgroups_1d(
-            "matmul_q4_0_gate_up_16row",
+            gemma4_q4_gate_up_projection_kernel(),
             &[
                 input,
                 gate_weight,
@@ -1634,6 +2081,9 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 prefill_path,
                 prefill_chunk_size: plan.chunk_size,
                 prefill_chunks: plan.chunks,
+                quantization_preflight_state: self.quantization_preflight_state,
+                selected_group_formats: self.selected_group_formats.iter().cloned().collect(),
+                quantization_rejections: self.quantization_rejections.clone(),
                 attention_kernel: gemma4_attention_kernel(
                     self.kv_cache_type,
                     self.model.config.attention_heads,
@@ -1651,9 +2101,15 @@ impl<'a> Gemma4E2bExecutor<'a> {
                     GgufTensorType::Q4_0 => "none",
                     _ => unreachable!("unsupported Gemma vocabulary output format"),
                 },
+                q4_projection_kernel: gemma4_q4_projection_kernel(),
+                q4_qkv_projection_kernel: gemma4_q4_qkv_projection_kernel(),
+                q4_gate_up_projection_kernel: gemma4_q4_gate_up_projection_kernel(),
+                q4_batch_projection_kernel: gemma4_q4_batch_projection_kernel(),
+                ffn_down_projection_kernel: gemma4_ffn_down_projection_kernel(),
                 rms_norm_kernel: gemma4_rms_norm_decode_kernel(self.model.config.hidden_size),
                 kv_cache_type: self.kv_cache_type,
                 kv_cache_bytes: self.kv_cache_bytes(),
+                quantization_plan_path: self.quantization_plan_path.clone(),
             },
             finish_reason,
             first_eos_position,
@@ -2337,7 +2793,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
             ],
             batch_value * ffn,
         )?;
-        self.matmul_batch(
+        self.matmul_ffn_down_batch(
             command,
             &self.prefill.product,
             &down,
@@ -2347,7 +2803,6 @@ impl<'a> Gemma4E2bExecutor<'a> {
             batch,
             h,
             batch_value,
-            GgufTensorType::Q4_0,
         )?;
         let post_ffn = self.weight(&format!("{p}.post_ffw_norm.weight"), GgufTensorType::F32)?;
         self.rms_norm_batch_decode_order(
@@ -3197,16 +3652,14 @@ impl<'a> Gemma4E2bExecutor<'a> {
                     1,
                 )?;
             }
-            self.matvec_labeled(
+            self.matvec_ffn_down(
                 &mut command,
-                Some("ffn_down_projection"),
                 &self.product,
                 &down,
                 &self.work,
                 ffn_buffer,
                 &self.hidden,
                 h,
-                GgufTensorType::Q4_0,
             )?;
             let post_ffn =
                 self.weight(&format!("{p}.post_ffw_norm.weight"), GgufTensorType::F32)?;
@@ -3503,17 +3956,25 @@ impl<'a> Gemma4E2bExecutor<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+
     use super::{
         GEMMA4_Q4_SHARED_KV_HEAD_DIM, GEMMA4_Q4_SHARED_KV_QUERY_HEADS,
         GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD,
-        GEMMA4_Q4_TWO_PASS_ATTENTION_LEGACY_THRESHOLD, Gemma4KvCacheType, Gemma4PrefillPlan,
-        Gemma4WeightFormat, gemma4_attention_key_count, gemma4_attention_key_count_table,
-        gemma4_decode_profile_targets, gemma4_ffn_gate_up_fused_enabled_for, gemma4_kernel_family,
-        gemma4_prefill_path, gemma4_profile_family, gemma4_q4_shared_kv_scan_supported,
+        GEMMA4_Q4_TWO_PASS_ATTENTION_LEGACY_THRESHOLD, GEMMA4_SELECTED_GROUP_QKV,
+        GEMMA4_SELECTED_GROUP_VOCAB_EMBEDDINGS, GEMMA4_SELECTED_GROUP_VOCAB_OUTPUT,
+        Gemma4KvCacheType, Gemma4PrefillPlan, Gemma4WeightFormat, QuantizationPlan,
+        gemma4_attention_key_count, gemma4_attention_key_count_table,
+        gemma4_decode_profile_targets, gemma4_ffn_down_projection_kernel_for,
+        gemma4_ffn_gate_up_fused_enabled_for, gemma4_kernel_family, gemma4_prefill_path,
+        gemma4_profile_family, gemma4_q4_batch_projection_kernel_for,
+        gemma4_q4_gate_up_projection_kernel_for, gemma4_q4_projection_kernel_for,
+        gemma4_q4_qkv_projection_kernel_for, gemma4_q4_shared_kv_scan_supported,
         gemma4_q4_two_pass_attention_eligible, gemma4_q4_two_pass_attention_first_pass_pipeline,
         gemma4_q4_two_pass_attention_threshold, gemma4_q6_k_to_q4_0,
-        gemma4_rms_epilogue_fused_enabled_for, gemma4_rms_norm_decode_kernel_for,
-        gemma4_rope_angle, gemma4_should_finish, gemma4_two_pass_attention_ranges,
+        gemma4_q6_projection_kernel_for, gemma4_rms_epilogue_fused_enabled_for,
+        gemma4_rms_norm_decode_kernel_for, gemma4_rope_angle, gemma4_selected_group_formats,
+        gemma4_should_finish, gemma4_two_pass_attention_ranges, gemma4_weight_format_with_plan,
     };
     use atlas_core::{GgufTensorType, dequantize_block};
 
@@ -3629,6 +4090,14 @@ mod tests {
             Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
         );
         assert_eq!(
+            gemma4_q4_two_pass_attention_threshold(Some("baseline")),
+            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
+        );
+        assert_eq!(
+            gemma4_q4_two_pass_attention_threshold(Some("2pass_no_value_barrier")),
+            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
+        );
+        assert_eq!(
             gemma4_q4_two_pass_attention_threshold(Some("2pass")),
             Some(GEMMA4_Q4_TWO_PASS_ATTENTION_LEGACY_THRESHOLD)
         );
@@ -3645,6 +4114,14 @@ mod tests {
             Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
         );
         assert_eq!(
+            gemma4_q4_two_pass_attention_threshold(Some("2pass_cache_no_value_barrier")),
+            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
+        );
+        assert_eq!(
+            gemma4_q4_two_pass_attention_threshold(Some("2pass_unroll2_no_value_barrier")),
+            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
+        );
+        assert_eq!(
             gemma4_q4_two_pass_attention_threshold(Some("2pass_gqa")),
             Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
         );
@@ -3655,6 +4132,28 @@ mod tests {
         assert_eq!(
             gemma4_q4_two_pass_attention_first_pass_pipeline(Some("2pass_cache"), false),
             "attention_decode_fused_gemma4_simd_q4_0_2pass_1_cacheopt"
+        );
+        assert_eq!(
+            gemma4_q4_two_pass_attention_first_pass_pipeline(
+                Some("2pass_cache_no_value_barrier"),
+                false
+            ),
+            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_cacheopt_no_value_barrier"
+        );
+        assert_eq!(
+            gemma4_q4_two_pass_attention_first_pass_pipeline(
+                Some("2pass_unroll2_no_value_barrier"),
+                false
+            ),
+            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_unroll2_no_value_barrier"
+        );
+        assert_eq!(
+            gemma4_q4_two_pass_attention_first_pass_pipeline(Some("2pass_no_value_barrier"), false),
+            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_no_value_barrier"
+        );
+        assert_eq!(
+            gemma4_q4_two_pass_attention_first_pass_pipeline(Some("2pass64"), false),
+            "attention_decode_fused_gemma4_simd_q4_0_2pass_1"
         );
         assert_eq!(
             gemma4_q4_two_pass_attention_first_pass_pipeline(Some("2pass_gqa"), true),
@@ -3670,7 +4169,7 @@ mod tests {
         );
         assert_eq!(
             gemma4_q4_two_pass_attention_first_pass_pipeline(None, false),
-            "attention_decode_fused_gemma4_simd_q4_0_2pass_1"
+            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_no_value_barrier"
         );
         assert!(gemma4_q4_shared_kv_scan_supported(
             GEMMA4_Q4_SHARED_KV_QUERY_HEADS,
@@ -3694,7 +4193,7 @@ mod tests {
         );
         assert_eq!(
             gemma4_q4_two_pass_attention_threshold(Some("baseline")),
-            None
+            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
         );
         assert!(!gemma4_q4_two_pass_attention_eligible(
             Gemma4KvCacheType::Q4_0,
@@ -3802,6 +4301,193 @@ mod tests {
     }
 
     #[test]
+    fn q4_projection_experiments_are_opt_in_with_a_baseline_escape_hatch() {
+        assert_eq!(gemma4_q4_projection_kernel_for(None), "matvec_q4_0_16row");
+        assert_eq!(
+            gemma4_q4_projection_kernel_for(Some("baseline")),
+            "matvec_q4_0_16row"
+        );
+        assert_eq!(
+            gemma4_q4_projection_kernel_for(Some("shared_input")),
+            "matvec_q4_0_16row_shared_input"
+        );
+        assert_eq!(
+            gemma4_q4_projection_kernel_for(Some("simdgroup_tiled")),
+            "matvec_q4_0_16row_simdgroup_tiled"
+        );
+        assert_eq!(
+            gemma4_q4_qkv_projection_kernel_for(Some("simdgroup_tiled")),
+            "matmul_q4_0_qkv_16row_simdgroup_tiled"
+        );
+        assert_eq!(
+            gemma4_q4_gate_up_projection_kernel_for(Some("simdgroup_tiled")),
+            "matmul_q4_0_gate_up_16row_simdgroup_tiled"
+        );
+        assert_eq!(
+            gemma4_q4_batch_projection_kernel_for(Some("simdgroup_tiled")),
+            "matmul_q4_0_batch_16row_simdgroup_tiled"
+        );
+    }
+
+    #[test]
+    fn ready_plan_selects_vocabulary_format_as_a_pair() {
+        let mut plan = QuantizationPlan::new("gemma", "sha");
+        plan.state = "ready".into();
+        plan.hardware_identity = "Apple GPU 42".into();
+        plan.profiler_configuration = crate::quantization_plan::QuantizationPlanProfilerConfig {
+            mode: "auto".into(),
+            prompt_sha256: "prompt-sha".into(),
+            decode_tokens: 32,
+            runs: 2,
+        };
+        plan.tensors.insert(
+            "token_embd.weight".into(),
+            crate::quantization_plan::QuantizationPlanTensor {
+                group_members: vec![
+                    "token_embd.weight".into(),
+                    "per_layer_token_embd.weight".into(),
+                ],
+                source_format: GgufTensorType::Q6K,
+                selected_format: GgufTensorType::Q4_0,
+                selected_kernel: "embedding_lookup_q4_0".into(),
+                max_abs_logit_delta: 0.0,
+                median_gpu_ns: 1,
+                baseline_gpu_ns: 1,
+                resident_bytes: 1,
+                upload_bytes: 1,
+                parity_digest: "digest".into(),
+                parity: true,
+                rejection_reason: None,
+            },
+        );
+        plan.tensors.insert(
+            "per_layer_token_embd.weight".into(),
+            crate::quantization_plan::QuantizationPlanTensor {
+                group_members: vec![
+                    "token_embd.weight".into(),
+                    "per_layer_token_embd.weight".into(),
+                ],
+                source_format: GgufTensorType::Q6K,
+                selected_format: GgufTensorType::Q4_0,
+                selected_kernel: "embedding_lookup_q4_0".into(),
+                max_abs_logit_delta: 0.0,
+                median_gpu_ns: 1,
+                baseline_gpu_ns: 1,
+                resident_bytes: 1,
+                upload_bytes: 1,
+                parity_digest: "digest".into(),
+                parity: true,
+                rejection_reason: None,
+            },
+        );
+        assert_eq!(
+            gemma4_weight_format_with_plan(Some(&plan)).unwrap(),
+            Gemma4WeightFormat::AllQ4
+        );
+    }
+
+    #[test]
+    fn explicit_weight_format_override_bypasses_invalid_cached_plan() {
+        struct EnvVarGuard {
+            key: &'static str,
+            previous: Option<OsString>,
+        }
+
+        impl EnvVarGuard {
+            fn set(key: &'static str, value: &str) -> Self {
+                let previous = std::env::var_os(key);
+                unsafe { std::env::set_var(key, value) };
+                Self { key, previous }
+            }
+        }
+
+        impl Drop for EnvVarGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.previous {
+                        Some(value) => std::env::set_var(self.key, value),
+                        None => std::env::remove_var(self.key),
+                    }
+                }
+            }
+        }
+
+        let _guard = EnvVarGuard::set("ATLAS_GEMMA4_WEIGHT_FORMAT", "all_q4");
+        let mut plan = QuantizationPlan::new("gemma", "model-sha");
+        plan.state = crate::quantization_plan::QUANTIZATION_PLAN_STATE_READY.into();
+        plan.tensors.insert(
+            "token_embd.weight".into(),
+            crate::quantization_plan::QuantizationPlanTensor {
+                group_members: vec![
+                    "token_embd.weight".into(),
+                    "per_layer_token_embd.weight".into(),
+                ],
+                source_format: GgufTensorType::Q6K,
+                selected_format: GgufTensorType::Q6K,
+                selected_kernel: "embedding_lookup_q6_k".into(),
+                max_abs_logit_delta: 0.0,
+                median_gpu_ns: 1,
+                baseline_gpu_ns: 1,
+                resident_bytes: 1,
+                upload_bytes: 1,
+                parity_digest: "digest".into(),
+                parity: true,
+                rejection_reason: None,
+            },
+        );
+        plan.tensors.insert(
+            "per_layer_token_embd.weight".into(),
+            crate::quantization_plan::QuantizationPlanTensor {
+                group_members: vec![
+                    "token_embd.weight".into(),
+                    "per_layer_token_embd.weight".into(),
+                ],
+                source_format: GgufTensorType::Q6K,
+                selected_format: GgufTensorType::Q4_0,
+                selected_kernel: "embedding_lookup_q4_0".into(),
+                max_abs_logit_delta: 0.0,
+                median_gpu_ns: 1,
+                baseline_gpu_ns: 1,
+                resident_bytes: 1,
+                upload_bytes: 1,
+                parity_digest: "digest".into(),
+                parity: true,
+                rejection_reason: None,
+            },
+        );
+
+        assert_eq!(
+            gemma4_weight_format_with_plan(Some(&plan)).unwrap(),
+            Gemma4WeightFormat::AllQ4
+        );
+    }
+
+    #[test]
+    fn q6_lm_head_cacheopt_is_opt_in() {
+        assert_eq!(gemma4_q6_projection_kernel_for(None), "matvec_q6_k_8row");
+        assert_eq!(
+            gemma4_q6_projection_kernel_for(Some("cacheopt")),
+            "matvec_q6_k_8row_cacheopt"
+        );
+    }
+
+    #[test]
+    fn ffn_down_interleaved_projection_is_opt_in() {
+        assert_eq!(
+            gemma4_ffn_down_projection_kernel_for(None),
+            "matvec_q4_0_16row"
+        );
+        assert_eq!(
+            gemma4_ffn_down_projection_kernel_for(Some("baseline")),
+            "matvec_q4_0_16row"
+        );
+        assert_eq!(
+            gemma4_ffn_down_projection_kernel_for(Some("interleaved16")),
+            "matvec_q4_0_16row_ffn_down_interleaved"
+        );
+    }
+
+    #[test]
     fn all_q4_vocabulary_conversion_preserves_packed_layout_and_bounded_oracle_error() {
         // A Q6_K block with every quantized value at -32, unit group scales,
         // and a unit super-block scale is easy to audit byte-for-byte.
@@ -3860,6 +4546,34 @@ mod tests {
             assert_eq!(format.embedding_kernel(), embedding_kernel);
             assert_eq!(format.output_format(), output_format);
         }
+    }
+
+    #[test]
+    fn selected_group_formats_keep_unsupported_groups_on_their_source_path() {
+        let mixed = gemma4_selected_group_formats(Gemma4WeightFormat::MixedQ4Q6);
+        assert_eq!(
+            mixed.selected_format(GEMMA4_SELECTED_GROUP_VOCAB_EMBEDDINGS),
+            Some(GgufTensorType::Q6K)
+        );
+        assert_eq!(
+            mixed.selected_format(GEMMA4_SELECTED_GROUP_VOCAB_OUTPUT),
+            Some(GgufTensorType::Q6K)
+        );
+        assert_eq!(
+            mixed.selected_format(GEMMA4_SELECTED_GROUP_QKV),
+            Some(GgufTensorType::Q4_0)
+        );
+
+        let all_q4 = gemma4_selected_group_formats(Gemma4WeightFormat::AllQ4);
+        assert_eq!(
+            all_q4.selected_format(GEMMA4_SELECTED_GROUP_VOCAB_EMBEDDINGS),
+            Some(GgufTensorType::Q4_0)
+        );
+        assert_eq!(
+            all_q4.selected_format(GEMMA4_SELECTED_GROUP_VOCAB_OUTPUT),
+            Some(GgufTensorType::Q4_0)
+        );
+        assert!(all_q4.rejection_reasons().is_empty());
     }
 
     #[test]

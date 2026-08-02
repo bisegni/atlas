@@ -299,6 +299,120 @@ kernel void matvec_q4_0_16row(
     if (column == 0 && row < output_width) output[row] = sum;
 }
 
+// FFN-down-only companion for the resident [16-row tile][block][row] Q4_0
+// layout. It retains the proven 128-thread arithmetic and reduction order.
+kernel void matvec_q4_0_16row_ffn_down_interleaved(
+    device const float *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
+    constant uint &output_width [[buffer(4)]], uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint simdgroup = tid / 32;
+    uint lane = tid % 32;
+    uint row_in_simd = lane / 8;
+    uint column = lane % 8;
+    uint row = group * 16 + simdgroup * 4 + row_in_simd;
+    float sum = 0.0f;
+    if (row < output_width) {
+        uint blocks = input_width / 32;
+        uint tile_rows = min(16u, output_width - group * 16);
+        uint tile_base = group * 16 * blocks * 18;
+        for (uint block = 0; block < blocks; ++block) {
+            device const uchar *base = weights + tile_base
+                + (block * tile_rows + simdgroup * 4 + row_in_simd) * 18;
+            float scale = float(*(device const half *)base);
+            uchar packed0 = base[2 + column];
+            uchar packed1 = base[2 + column + 8];
+            sum += input[block * 32 + column] * float(int(packed0 & 15) - 8) * scale;
+            sum += input[block * 32 + column + 8] * float(int(packed1 & 15) - 8) * scale;
+            sum += input[block * 32 + column + 16] * float(int(packed0 >> 4) - 8) * scale;
+            sum += input[block * 32 + column + 24] * float(int(packed1 >> 4) - 8) * scale;
+        }
+    }
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (column == 0 && row < output_width) output[row] = sum;
+}
+
+// Same 16-row Q4_0 tile as matvec_q4_0_16row, but each SIMD group loads a
+// 32-value activation block once.  The four rows in the group then obtain the
+// values needed by their eight-lane partial reductions through SIMD shuffles.
+// This preserves the packed-weight layout and per-lane accumulation order.
+kernel void matvec_q4_0_16row_shared_input(
+    device const float *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
+    constant uint &output_width [[buffer(4)]], uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint simdgroup = tid / 32;
+    uint lane = tid % 32;
+    uint row_in_simd = lane / 8;
+    uint column = lane % 8;
+    uint row = group * 16 + simdgroup * 4 + row_in_simd;
+    float sum = 0.0f;
+    if (row < output_width) {
+        uint blocks = input_width / 32;
+        for (uint block = 0; block < blocks; ++block) {
+            uint input_base = block * 32;
+            float input_lane = input[input_base + lane];
+            float input0 = simd_shuffle(input_lane, ushort(column));
+            float input8 = simd_shuffle(input_lane, ushort(column + 8));
+            float input16 = simd_shuffle(input_lane, ushort(column + 16));
+            float input24 = simd_shuffle(input_lane, ushort(column + 24));
+            device const uchar *base = weights + (row * blocks + block) * 18;
+            float scale = float(*(device const half *)base);
+            uchar packed0 = base[2 + column];
+            uchar packed1 = base[2 + column + 8];
+            sum += input0 * float(int(packed0 & 15) - 8) * scale;
+            sum += input8 * float(int(packed1 & 15) - 8) * scale;
+            sum += input16 * float(int(packed0 >> 4) - 8) * scale;
+            sum += input24 * float(int(packed1 >> 4) - 8) * scale;
+        }
+    }
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (column == 0 && row < output_width) output[row] = sum;
+}
+
+// Whole-path SIMD-group candidate for Resident decode.  Each 32-wide input
+// block is loaded once per SIMD-group and broadcast to the four rows that the
+// group owns.  It retains the baseline's F32 products, per-lane order, and
+// eight-lane reduction, so it is safe to use in exact-token A/Bs.
+kernel void matvec_q4_0_16row_simdgroup_tiled(
+    device const float *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
+    constant uint &output_width [[buffer(4)]], uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint simdgroup = tid / 32;
+    uint lane = tid % 32;
+    uint row_in_simd = lane / 8;
+    uint column = lane % 8;
+    uint row = group * 16 + simdgroup * 4 + row_in_simd;
+    float sum = 0.0f;
+    if (row < output_width) {
+        uint blocks = input_width / 32;
+        for (uint block = 0; block < blocks; ++block) {
+            float input_lane = input[block * 32 + lane];
+            float input0 = simd_shuffle(input_lane, ushort(column));
+            float input8 = simd_shuffle(input_lane, ushort(column + 8));
+            float input16 = simd_shuffle(input_lane, ushort(column + 16));
+            float input24 = simd_shuffle(input_lane, ushort(column + 24));
+            device const uchar *base = weights + (row * blocks + block) * 18;
+            float scale = float(*(device const half *)base);
+            uchar packed0 = base[2 + column];
+            uchar packed1 = base[2 + column + 8];
+            sum += input0 * float(int(packed0 & 15) - 8) * scale;
+            sum += input8 * float(int(packed1 & 15) - 8) * scale;
+            sum += input16 * float(int(packed0 >> 4) - 8) * scale;
+            sum += input24 * float(int(packed1 >> 4) - 8) * scale;
+        }
+    }
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (column == 0 && row < output_width) output[row] = sum;
+}
+
 // Fused Q/K/V projection dispatch for Gemma provider layers.  The dispatch
 // keeps the established 16-row Q4 tile and accumulation order, but maps the
 // group range across the Q, K, and V matrices so one command encoder launch
@@ -341,6 +455,64 @@ kernel void matmul_q4_0_qkv_16row(
             sum += input[block * 32 + column + 8] * float(int(packed1 & 15) - 8) * scale;
             sum += input[block * 32 + column + 16] * float(int(packed0 >> 4) - 8) * scale;
             sum += input[block * 32 + column + 24] * float(int(packed1 >> 4) - 8) * scale;
+        }
+    }
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (column == 0 && row < output_width) {
+        if (projection == 0) q_output[row] = sum;
+        else if (projection == 1) k_output[row] = sum;
+        else v_output[row] = sum;
+    }
+}
+
+// SIMD-group tiled counterpart of the fused Q/K/V projection.  This keeps
+// the existing fused dispatch boundary while removing redundant activation
+// loads for the four rows owned by each SIMD-group.
+kernel void matmul_q4_0_qkv_16row_simdgroup_tiled(
+    device const float *input [[buffer(0)]],
+    device const uchar *q_weights [[buffer(1)]],
+    device const uchar *k_weights [[buffer(2)]],
+    device const uchar *v_weights [[buffer(3)]],
+    device float *q_output [[buffer(4)]],
+    device float *k_output [[buffer(5)]],
+    device float *v_output [[buffer(6)]],
+    constant uint &input_width [[buffer(7)]],
+    constant uint &q_width [[buffer(8)]],
+    constant uint &kv_width [[buffer(9)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint q_groups = (q_width + 15) / 16;
+    uint kv_groups = (kv_width + 15) / 16;
+    uint projection = group < q_groups ? 0 : (group < q_groups + kv_groups ? 1 : 2);
+    uint local_group = projection == 0 ? group :
+        (projection == 1 ? group - q_groups : group - q_groups - kv_groups);
+    uint output_width = projection == 0 ? q_width : kv_width;
+    uint simdgroup = tid / 32;
+    uint lane = tid % 32;
+    uint row_in_simd = lane / 8;
+    uint column = lane % 8;
+    uint row = local_group * 16 + simdgroup * 4 + row_in_simd;
+    float sum = 0.0f;
+    if (row < output_width) {
+        uint blocks = input_width / 32;
+        device const uchar *weights = projection == 0 ? q_weights :
+            (projection == 1 ? k_weights : v_weights);
+        for (uint block = 0; block < blocks; ++block) {
+            float input_lane = input[block * 32 + lane];
+            float input0 = simd_shuffle(input_lane, ushort(column));
+            float input8 = simd_shuffle(input_lane, ushort(column + 8));
+            float input16 = simd_shuffle(input_lane, ushort(column + 16));
+            float input24 = simd_shuffle(input_lane, ushort(column + 24));
+            device const uchar *base = weights + (row * blocks + block) * 18;
+            float scale = float(*(device const half *)base);
+            uchar packed0 = base[2 + column];
+            uchar packed1 = base[2 + column + 8];
+            sum += input0 * float(int(packed0 & 15) - 8) * scale;
+            sum += input8 * float(int(packed1 & 15) - 8) * scale;
+            sum += input16 * float(int(packed0 >> 4) - 8) * scale;
+            sum += input24 * float(int(packed1 >> 4) - 8) * scale;
         }
     }
     sum += simd_shuffle_xor(sum, 4);
@@ -400,6 +572,53 @@ kernel void matmul_q4_0_gate_up_16row(
     }
 }
 
+kernel void matmul_q4_0_gate_up_16row_simdgroup_tiled(
+    device const float *input [[buffer(0)]],
+    device const uchar *gate_weights [[buffer(1)]],
+    device const uchar *up_weights [[buffer(2)]],
+    device float *gate_output [[buffer(3)]],
+    device float *up_output [[buffer(4)]],
+    constant uint &input_width [[buffer(5)]],
+    constant uint &output_width [[buffer(6)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint groups = (output_width + 15) / 16;
+    uint projection = group < groups ? 0 : 1;
+    uint local_group = projection == 0 ? group : group - groups;
+    uint simdgroup = tid / 32;
+    uint lane = tid % 32;
+    uint row_in_simd = lane / 8;
+    uint column = lane % 8;
+    uint row = local_group * 16 + simdgroup * 4 + row_in_simd;
+    float sum = 0.0f;
+    if (row < output_width) {
+        uint blocks = input_width / 32;
+        device const uchar *weights = projection == 0 ? gate_weights : up_weights;
+        for (uint block = 0; block < blocks; ++block) {
+            float input_lane = input[block * 32 + lane];
+            float input0 = simd_shuffle(input_lane, ushort(column));
+            float input8 = simd_shuffle(input_lane, ushort(column + 8));
+            float input16 = simd_shuffle(input_lane, ushort(column + 16));
+            float input24 = simd_shuffle(input_lane, ushort(column + 24));
+            device const uchar *base = weights + (row * blocks + block) * 18;
+            float scale = float(*(device const half *)base);
+            uchar packed0 = base[2 + column];
+            uchar packed1 = base[2 + column + 8];
+            sum += input0 * float(int(packed0 & 15) - 8) * scale;
+            sum += input8 * float(int(packed1 & 15) - 8) * scale;
+            sum += input16 * float(int(packed0 >> 4) - 8) * scale;
+            sum += input24 * float(int(packed1 >> 4) - 8) * scale;
+        }
+    }
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (column == 0 && row < output_width) {
+        if (projection == 0) gate_output[row] = sum;
+        else up_output[row] = sum;
+    }
+}
+
 // Batched prefill building block.  Inputs and outputs are row-major
 // [batch, width] matrices; weights remain in their GGUF Q4_0 packing and each
 // output dot product still accumulates in FP32.  The executor can therefore
@@ -437,6 +656,84 @@ kernel void matmul_q4_0_batch_16row(
     sum += simd_shuffle_xor(sum, 1);
     if (column == 0 && token < batch && row < output_width)
         output[token * output_width + row] = sum;
+}
+
+kernel void matmul_q4_0_batch_16row_simdgroup_tiled(
+    device const float *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
+    constant uint &output_width [[buffer(4)]], constant uint &batch [[buffer(5)]],
+    uint group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    uint simdgroup = tid / 32;
+    uint lane = tid % 32;
+    uint row_in_simd = lane / 8;
+    uint column = lane % 8;
+    uint rows_per_batch = (output_width + 15) / 16;
+    uint token = group / rows_per_batch;
+    uint group_row = group % rows_per_batch;
+    uint row = group_row * 16 + simdgroup * 4 + row_in_simd;
+    float sum = 0.0f;
+    if (token < batch && row < output_width) {
+        uint blocks = input_width / 32;
+        device const float *token_input = input + token * input_width;
+        for (uint block = 0; block < blocks; ++block) {
+            float input_lane = token_input[block * 32 + lane];
+            float input0 = simd_shuffle(input_lane, ushort(column));
+            float input8 = simd_shuffle(input_lane, ushort(column + 8));
+            float input16 = simd_shuffle(input_lane, ushort(column + 16));
+            float input24 = simd_shuffle(input_lane, ushort(column + 24));
+            device const uchar *base = weights + (row * blocks + block) * 18;
+            float scale = float(*(device const half *)base);
+            uchar packed0 = base[2 + column];
+            uchar packed1 = base[2 + column + 8];
+            sum += input0 * float(int(packed0 & 15) - 8) * scale;
+            sum += input8 * float(int(packed1 & 15) - 8) * scale;
+            sum += input16 * float(int(packed0 >> 4) - 8) * scale;
+            sum += input24 * float(int(packed1 >> 4) - 8) * scale;
+        }
+    }
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (column == 0 && token < batch && row < output_width)
+        output[token * output_width + row] = sum;
+}
+
+// Batched prefill companion for matvec_q4_0_16row_ffn_down_interleaved.
+kernel void matmul_q4_0_batch_16row_ffn_down_interleaved(
+    device const float *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
+    constant uint &output_width [[buffer(4)]], constant uint &batch [[buffer(5)]],
+    uint group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    uint simdgroup = tid / 32;
+    uint lane = tid % 32;
+    uint row_in_simd = lane / 8;
+    uint column = lane % 8;
+    uint rows_per_batch = (output_width + 15) / 16;
+    uint token = group / rows_per_batch;
+    uint group_row = group % rows_per_batch;
+    uint row = group_row * 16 + simdgroup * 4 + row_in_simd;
+    float sum = 0.0f;
+    if (token < batch && row < output_width) {
+        uint blocks = input_width / 32;
+        uint tile_rows = min(16u, output_width - group_row * 16);
+        uint tile_base = group_row * 16 * blocks * 18;
+        device const float *token_input = input + token * input_width;
+        for (uint block = 0; block < blocks; ++block) {
+            device const uchar *base = weights + tile_base
+                + (block * tile_rows + simdgroup * 4 + row_in_simd) * 18;
+            float scale = float(*(device const half *)base);
+            uchar packed0 = base[2 + column];
+            uchar packed1 = base[2 + column + 8];
+            sum += token_input[block * 32 + column] * float(int(packed0 & 15) - 8) * scale;
+            sum += token_input[block * 32 + column + 8] * float(int(packed1 & 15) - 8) * scale;
+            sum += token_input[block * 32 + column + 16] * float(int(packed0 >> 4) - 8) * scale;
+            sum += token_input[block * 32 + column + 24] * float(int(packed1 >> 4) - 8) * scale;
+        }
+    }
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (column == 0 && token < batch && row < output_width) output[token * output_width + row] = sum;
 }
 
 kernel void matmul_f16_batch(
@@ -543,6 +840,44 @@ kernel void matvec_q6_k_8row(
             device const uchar *base = weights + (row * blocks + block) * 210;
             for (uint index = column; index < 256; index += 16)
                 sum += input[block * 256 + index] * q6_k_value(base, index);
+        }
+    }
+    sum += simd_shuffle_xor(sum, 8);
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (column == 0 && row < output_width) output[row] = sum;
+}
+
+// Opt-in LM-head variant: share the Q6_K super-block scale across the two
+// half-SIMD rows while retaining the canonical packed-bit and group-scale math.
+kernel void matvec_q6_k_8row_cacheopt(
+    device const float *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
+    constant uint &output_width [[buffer(4)]], uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    uint simdgroup = tid / 32;
+    uint row_in_simd = lane / 16;
+    uint column = lane % 16;
+    uint row = group * 8 + simdgroup * 2 + row_in_simd;
+    float sum = 0.0f;
+    if (row < output_width) {
+        uint blocks = input_width / 256;
+        for (uint block = 0; block < blocks; ++block) {
+            device const uchar *base = weights + (row * blocks + block) * 210;
+            float block_scale = simd_broadcast(float(*(device const half *)(base + 208)), row_in_simd * 16);
+            for (uint index = column; index < 256; index += 16) {
+                uint chunk = index / 128;
+                uint within = index % 128;
+                uint stream = within / 32;
+                uint value_lane = within % 32;
+                uchar packed = base[chunk * 64 + value_lane + ((stream & 1) ? 32 : 0)];
+                uchar low = stream >= 2 ? packed >> 4 : packed & 15;
+                uchar high = (base[128 + chunk * 32 + value_lane] >> (stream * 2)) & 3;
+                int group_scale = int((char) base[192 + chunk * 8 + value_lane / 16 + stream * 2]);
+                int quantized = int((high << 4) | low) - 32;
+                sum += input[block * 256 + index] * float(quantized * group_scale) * block_scale;
+            }
         }
     }
     sum += simd_shuffle_xor(sum, 8);
@@ -1345,6 +1680,140 @@ kernel void attention_decode_fused_gemma4_simd_q4_0_2pass_1(
     }
 }
 
+// Exact arithmetic variant of the accepted four-way split scan.  Each thread
+// owns disjoint partial-value elements, and the next key reads only query/KV
+// data plus the score scratch.  The trailing post-value barrier in the
+// production kernel therefore has no consumer; omitting it lets threads start
+// the next score while preserving the per-thread value accumulation order.
+kernel void attention_decode_fused_gemma4_simd_q4_0_2pass_1_no_value_barrier(
+    device const float *query [[buffer(0)]], device const uchar *cache [[buffer(1)]],
+    device float *partials [[buffer(2)]], device float *maxima [[buffer(3)]],
+    device float *sums [[buffer(4)]], constant uint &heads [[buffer(5)]],
+    constant uint &kv_heads [[buffer(6)]], constant uint &head_dim [[buffer(7)]],
+    constant uint &capacity [[buffer(8)]], constant uint &key_count [[buffer(9)]],
+    constant uint &blocks [[buffer(10)]], uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]], uint threads [[threads_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    uint head = group / blocks;
+    uint block = group % blocks;
+    if (head >= heads) return;
+    uint start = block * key_count / blocks;
+    uint end = (block + 1) * key_count / blocks;
+    uint slot = block * heads + head;
+    uint partial_base = slot * head_dim;
+    uint kv_head = head / (heads / kv_heads);
+    uint blocks_per_position = (kv_heads * head_dim) / 32;
+    uint value_base = capacity * blocks_per_position;
+    threadgroup float simd_sums[4], maximum, denominator, rescale, weight;
+    maximum = -INFINITY; denominator = 0.0f;
+    for (uint d = tid; d < head_dim; d += threads) partials[partial_base + d] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint key = start; key < end; ++key) {
+        float partial = 0.0f;
+        uint key_element = key * kv_heads * head_dim + kv_head * head_dim;
+        for (uint d = tid; d < head_dim; d += threads) {
+            uint index = key_element + d;
+            partial += query[head * head_dim + d]
+                * kv_q4_0_value(cache + (index / 32) * 18, index % 32);
+        }
+        float simd_total = simd_sum(partial);
+        if (lane == 0) simd_sums[simd_group] = simd_total;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            float score = simd_sums[0] + simd_sums[1] + simd_sums[2] + simd_sums[3];
+            if (score > maximum) {
+                rescale = exp(maximum - score);
+                weight = 1.0f;
+                maximum = score;
+                denominator = denominator * rescale + weight;
+            } else {
+                rescale = 1.0f;
+                weight = exp(score - maximum);
+                denominator += weight;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint d = tid; d < head_dim; d += threads) {
+            uint index = key_element + d;
+            partials[partial_base + d] = partials[partial_base + d] * rescale
+                + weight * kv_q4_0_value(cache + (value_base + index / 32) * 18, index % 32);
+        }
+    }
+    if (tid == 0) {
+        maxima[slot] = maximum;
+        sums[slot] = denominator;
+    }
+}
+
+// Candidate that preserves the production four-way, 128-thread geometry and
+// exact online-softmax/value update order. Its two-key inner loop is explicitly
+// unrolled so the compiler can optimize sequential KV address arithmetic.
+kernel void attention_decode_fused_gemma4_simd_q4_0_2pass_1_unroll2_no_value_barrier(
+    device const float *query [[buffer(0)]], device const uchar *cache [[buffer(1)]],
+    device float *partials [[buffer(2)]], device float *maxima [[buffer(3)]],
+    device float *sums [[buffer(4)]], constant uint &heads [[buffer(5)]],
+    constant uint &kv_heads [[buffer(6)]], constant uint &head_dim [[buffer(7)]],
+    constant uint &capacity [[buffer(8)]], constant uint &key_count [[buffer(9)]],
+    constant uint &blocks [[buffer(10)]], uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]], uint threads [[threads_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    uint head = group / blocks;
+    uint block = group % blocks;
+    if (head >= heads) return;
+    uint start = block * key_count / blocks;
+    uint end = (block + 1) * key_count / blocks;
+    uint slot = block * heads + head;
+    uint partial_base = slot * head_dim;
+    uint kv_head = head / (heads / kv_heads);
+    uint blocks_per_position = (kv_heads * head_dim) / 32;
+    uint value_base = capacity * blocks_per_position;
+    threadgroup float simd_sums[4], maximum, denominator, rescale, weight;
+    maximum = -INFINITY; denominator = 0.0f;
+    for (uint d = tid; d < head_dim; d += threads) partials[partial_base + d] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint pair_start = start; pair_start < end; pair_start += 2) {
+        uint pair_count = min(2u, end - pair_start);
+#pragma unroll
+        for (uint pair_offset = 0; pair_offset < 2; ++pair_offset) {
+            if (pair_offset >= pair_count) break;
+            uint key = pair_start + pair_offset;
+            float partial = 0.0f;
+            uint key_element = key * kv_heads * head_dim + kv_head * head_dim;
+            for (uint d = tid; d < head_dim; d += threads) {
+                uint index = key_element + d;
+                partial += query[head * head_dim + d]
+                    * kv_q4_0_value(cache + (index / 32) * 18, index % 32);
+            }
+            float simd_total = simd_sum(partial);
+            if (lane == 0) simd_sums[simd_group] = simd_total;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid == 0) {
+                float score = simd_sums[0] + simd_sums[1] + simd_sums[2] + simd_sums[3];
+                if (score > maximum) {
+                    rescale = exp(maximum - score);
+                    weight = 1.0f;
+                    maximum = score;
+                    denominator = denominator * rescale + weight;
+                } else {
+                    rescale = 1.0f;
+                    weight = exp(score - maximum);
+                    denominator += weight;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint d = tid; d < head_dim; d += threads) {
+                uint index = key_element + d;
+                partials[partial_base + d] = partials[partial_base + d] * rescale
+                    + weight * kv_q4_0_value(cache + (value_base + index / 32) * 18, index % 32);
+            }
+        }
+    }
+    if (tid == 0) {
+        maxima[slot] = maximum;
+        sums[slot] = denominator;
+    }
+}
+
 // One-SIMD-group variant of the split first pass. Each lane calculates the
 // four interleaved partial sums owned by the production kernel's four SIMD
 // groups, then reduces each partial independently in the same order. This
@@ -1500,6 +1969,80 @@ kernel void attention_decode_fused_gemma4_simd_q4_0_2pass_1_cacheopt(
             partials[partial_base + d] = partials[partial_base + d] * rescale + weight * value;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        maxima[slot] = maximum;
+        sums[slot] = denominator;
+    }
+}
+
+// Hybrid candidate: retain cacheopt's one-scale-per-Q4-block dequantization
+// while removing the post-value barrier proven unnecessary by the production
+// no-value-barrier scan. Each thread still owns a distinct partial element,
+// and the next key only reads query/KV plus score scratch.
+kernel void attention_decode_fused_gemma4_simd_q4_0_2pass_1_cacheopt_no_value_barrier(
+    device const float *query [[buffer(0)]], device const uchar *cache [[buffer(1)]],
+    device float *partials [[buffer(2)]], device float *maxima [[buffer(3)]],
+    device float *sums [[buffer(4)]], constant uint &heads [[buffer(5)]],
+    constant uint &kv_heads [[buffer(6)]], constant uint &head_dim [[buffer(7)]],
+    constant uint &capacity [[buffer(8)]], constant uint &key_count [[buffer(9)]],
+    constant uint &blocks [[buffer(10)]], uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]], uint threads [[threads_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    uint head = group / blocks;
+    uint block = group % blocks;
+    if (head >= heads) return;
+    uint start = block * key_count / blocks;
+    uint end = (block + 1) * key_count / blocks;
+    uint slot = block * heads + head;
+    uint partial_base = slot * head_dim;
+    uint kv_head = head / (heads / kv_heads);
+    uint blocks_per_head = head_dim / 32;
+    uint blocks_per_position = kv_heads * blocks_per_head;
+    uint value_base = capacity * blocks_per_position;
+    threadgroup float simd_sums[4], maximum, denominator, rescale, weight;
+    maximum = -INFINITY; denominator = 0.0f;
+    for (uint d = tid; d < head_dim; d += threads) partials[partial_base + d] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint key = start; key < end; ++key) {
+        float partial = 0.0f;
+        uint key_block_base = key * blocks_per_position + kv_head * blocks_per_head;
+        for (uint q4_block = simd_group; q4_block < blocks_per_head; q4_block += 4) {
+            device const uchar *base = cache + (key_block_base + q4_block) * 18;
+            float scale = simd_broadcast(float(*(device const half *)base), 0);
+            uchar packed = base[2 + (lane & 15)];
+            uchar nibble = lane < 16 ? packed & 15 : packed >> 4;
+            float value = scale * float(int(nibble) - 8);
+            uint d = q4_block * 32 + lane;
+            partial += query[head * head_dim + d] * value;
+        }
+        float simd_total = simd_sum(partial);
+        if (lane == 0) simd_sums[simd_group] = simd_total;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            float score = simd_sums[0] + simd_sums[1] + simd_sums[2] + simd_sums[3];
+            if (score > maximum) {
+                rescale = exp(maximum - score);
+                weight = 1.0f;
+                maximum = score;
+                denominator = denominator * rescale + weight;
+            } else {
+                rescale = 1.0f;
+                weight = exp(score - maximum);
+                denominator += weight;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint value_block_base = value_base + key_block_base;
+        for (uint q4_block = simd_group; q4_block < blocks_per_head; q4_block += 4) {
+            device const uchar *base = cache + (value_block_base + q4_block) * 18;
+            float scale = simd_broadcast(float(*(device const half *)base), 0);
+            uchar packed = base[2 + (lane & 15)];
+            uchar nibble = lane < 16 ? packed & 15 : packed >> 4;
+            float value = scale * float(int(nibble) - 8);
+            uint d = q4_block * 32 + lane;
+            partials[partial_base + d] = partials[partial_base + d] * rescale + weight * value;
+        }
     }
     if (tid == 0) {
         maxima[slot] = maximum;

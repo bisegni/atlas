@@ -69,6 +69,7 @@ dependencies = [
  "atlas-ops",
  "rand",
  "serde_json",
+ "sha2",
  "tokenizers",
 ]
 

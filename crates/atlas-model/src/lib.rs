@@ -7,8 +7,10 @@
 
 pub mod executor;
 pub mod gemma4_executor;
+pub mod gemma4_quantization_preflight;
 pub mod inference;
 pub mod kv_cache;
+pub mod quantization_plan;
 pub mod runtime;
 pub mod sampling;
 
@@ -471,6 +473,7 @@ impl Gemma4E2bConfig {
 /// or reparsing the artifact.
 pub struct Gemma4E2bModel {
     pub config: Gemma4E2bConfig,
+    model_path: PathBuf,
     tokenizer: Tokenizer,
     gguf: GgufModel,
     ops: NeuralOps,
@@ -607,10 +610,71 @@ mod gemma4_chat_tests {
 struct Gemma4ResidentWeights {
     buffers: HashMap<String, GpuBuffer>,
     formats: HashMap<String, GgufTensorType>,
+    ffn_down_interleaved: Option<bool>,
+}
+
+pub(crate) fn gemma4_ffn_down_interleaved_enabled_for(experiment: Option<&str>) -> bool {
+    matches!(experiment, Some("interleaved16"))
+}
+
+pub(crate) fn gemma4_ffn_down_interleaved_enabled() -> bool {
+    gemma4_ffn_down_interleaved_enabled_for(
+        std::env::var("ATLAS_GEMMA4_FFN_DOWN_EXPERIMENT")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn gemma4_is_ffn_down_weight(name: &str) -> bool {
+    name.starts_with("blk.") && name.ends_with(".ffn_down.weight")
+}
+
+/// Reorders Q4_0 records from row-major `[row][block]` to
+/// `[16-row tile][block][row in tile]`. The record bytes themselves are never
+/// changed, so Q4 scales, nibble order, and per-row block order stay exact.
+pub(crate) fn gemma4_interleave_ffn_down_q4_0(bytes: &[u8], input_width: usize) -> Result<Vec<u8>> {
+    const BLOCK_WIDTH: usize = 32;
+    const BLOCK_BYTES: usize = 18;
+    ensure!(
+        input_width > 0 && input_width.is_multiple_of(BLOCK_WIDTH),
+        "Gemma FFN-down Q4_0 input width must be non-zero and block aligned"
+    );
+    let blocks = input_width / BLOCK_WIDTH;
+    let row_bytes = blocks
+        .checked_mul(BLOCK_BYTES)
+        .context("Gemma FFN-down Q4_0 row size overflows")?;
+    ensure!(
+        bytes.len().is_multiple_of(row_bytes),
+        "Gemma FFN-down Q4_0 bytes do not contain complete rows"
+    );
+    let rows = bytes.len() / row_bytes;
+    let mut interleaved = vec![0u8; bytes.len()];
+    for tile_start in (0..rows).step_by(16) {
+        let tile_rows = (rows - tile_start).min(16);
+        let tile_offset = tile_start
+            .checked_mul(row_bytes)
+            .context("Gemma FFN-down Q4_0 tile offset overflows")?;
+        for block in 0..blocks {
+            for row_in_tile in 0..tile_rows {
+                let source = (tile_start + row_in_tile) * row_bytes + block * BLOCK_BYTES;
+                let destination = tile_offset + (block * tile_rows + row_in_tile) * BLOCK_BYTES;
+                interleaved[destination..destination + BLOCK_BYTES]
+                    .copy_from_slice(&bytes[source..source + BLOCK_BYTES]);
+            }
+        }
+    }
+    Ok(interleaved)
 }
 
 impl Gemma4E2bModel {
     pub fn load_gguf(path: impl AsRef<Path>) -> Result<Self> {
+        let model = Self::load_gguf_without_quantization_preflight(path)?;
+        crate::gemma4_quantization_preflight::maybe_run_gemma4_quantization_preflight(&model)
+            .context("Gemma quantization preflight failed during automatic load")?;
+        Ok(model)
+    }
+
+    pub fn load_gguf_without_quantization_preflight(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let gguf = GgufModel::open(path)
             .map_err(|error| anyhow::anyhow!("read Gemma 4 GGUF {}: {error}", path.display()))?;
@@ -623,6 +687,7 @@ impl Gemma4E2bModel {
             .with_context(|| format!("build Gemma 4 tokenizer for {}", path.display()))?;
         Ok(Self {
             config,
+            model_path: path.to_path_buf(),
             tokenizer,
             gguf,
             ops: NeuralOps::new().context("initialize Metal execution for Gemma 4")?,
@@ -661,6 +726,40 @@ impl Gemma4E2bModel {
         &self.gguf
     }
 
+    pub fn model_path(&self) -> &Path {
+        &self.model_path
+    }
+
+    /// Load and validate the optional profiling sidecar for this exact GGUF.
+    /// Invalid or stale plans are errors; absence is the normal default path.
+    pub fn quantization_plan(&self) -> Result<Option<quantization_plan::QuantizationPlan>> {
+        self.quantization_plan_with_identity(None)
+    }
+
+    pub fn quantization_plan_with_identity(
+        &self,
+        expected_hardware_identity: Option<&str>,
+    ) -> Result<Option<quantization_plan::QuantizationPlan>> {
+        let path = quantization_plan::default_sidecar_path(&self.model_path);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let digest = quantization_plan::sha256_file(&self.model_path)?;
+        let plan = quantization_plan::QuantizationPlan::from_path(&path)?;
+        plan.validate_for_model_with_identity(
+            &self.gguf,
+            &digest,
+            expected_hardware_identity,
+            None,
+        )?;
+        crate::gemma4_quantization_preflight::validate_gemma4_quantization_plan_groups(
+            &plan,
+            &self.gguf,
+            self.config.layers,
+        )?;
+        Ok(Some(plan))
+    }
+
     pub(crate) fn runtime(&self) -> &atlas_metal::MetalRuntime {
         self.ops.runtime()
     }
@@ -677,6 +776,15 @@ impl Gemma4E2bModel {
             .resident_weights
             .lock()
             .expect("Gemma resident weight lock");
+        let ffn_down_interleaved = gemma4_ffn_down_interleaved_enabled();
+        if let Some(existing) = resident.ffn_down_interleaved {
+            ensure!(
+                existing == ffn_down_interleaved,
+                "Gemma resident FFN-down layout is already initialized; create a new model before changing ATLAS_GEMMA4_FFN_DOWN_EXPERIMENT"
+            );
+        } else {
+            resident.ffn_down_interleaved = Some(ffn_down_interleaved);
+        }
         let mut uploaded = 0u64;
         for tensor in &self.gguf.tensors {
             if skip_q6_vocabulary
@@ -697,7 +805,16 @@ impl Gemma4E2bModel {
             }
             let bytes = self.gguf.tensor_data(tensor)?;
             validate_gemma_q6_k_scales(tensor, bytes)?;
-            let buffer = self.runtime().upload_bytes(bytes)?;
+            let interleaved_ffn_down = ffn_down_interleaved
+                && tensor.tensor_type == GgufTensorType::Q4_0
+                && gemma4_is_ffn_down_weight(&tensor.name);
+            let buffer = if interleaved_ffn_down {
+                let input_width = tensor.dims.first().copied().unwrap_or_default();
+                let packed = gemma4_interleave_ffn_down_q4_0(bytes, input_width)?;
+                self.runtime().upload_bytes(&packed)?
+            } else {
+                self.runtime().upload_bytes(bytes)?
+            };
             uploaded = uploaded.saturating_add(buffer.bytes() as u64);
             resident
                 .formats
@@ -1451,7 +1568,7 @@ fn scatter_head(
 
 #[cfg(test)]
 mod gemma_q6_validation_tests {
-    use super::validate_gemma_q6_k_scales;
+    use super::{gemma4_interleave_ffn_down_q4_0, validate_gemma_q6_k_scales};
     use atlas_core::{GgufTensor, GgufTensorType};
 
     #[test]
@@ -1470,5 +1587,39 @@ mod gemma_q6_validation_tests {
             error.to_string(),
             "Gemma Q6_K non-finite block scale: tensor=`per_layer_token_embd.weight` row=0 block=0 tensor_byte_offset=208 gguf_byte_offset=4304 scale_bits=0x7e00"
         );
+    }
+
+    #[test]
+    fn ffn_down_interleave_keeps_every_q4_record_exact_including_partial_tiles() {
+        const BLOCK_BYTES: usize = 18;
+        let input_width = 64;
+        let blocks = input_width / 32;
+        let rows = 17;
+        let mut row_major = vec![0u8; rows * blocks * BLOCK_BYTES];
+        for row in 0..rows {
+            for block in 0..blocks {
+                let value = u8::try_from(row * blocks + block).unwrap();
+                row_major[(row * blocks + block) * BLOCK_BYTES
+                    ..(row * blocks + block + 1) * BLOCK_BYTES]
+                    .fill(value);
+            }
+        }
+
+        let packed = gemma4_interleave_ffn_down_q4_0(&row_major, input_width).unwrap();
+        for row in 0..rows {
+            let tile_start = row / 16 * 16;
+            let tile_rows = (rows - tile_start).min(16);
+            let row_in_tile = row - tile_start;
+            for block in 0..blocks {
+                let packed_offset = tile_start * blocks * BLOCK_BYTES
+                    + (block * tile_rows + row_in_tile) * BLOCK_BYTES;
+                let original_offset = (row * blocks + block) * BLOCK_BYTES;
+                assert_eq!(
+                    &packed[packed_offset..packed_offset + BLOCK_BYTES],
+                    &row_major[original_offset..original_offset + BLOCK_BYTES],
+                    "row={row} block={block}"
+                );
+            }
+        }
     }
 }

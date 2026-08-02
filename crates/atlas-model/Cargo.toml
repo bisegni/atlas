@@ -12,4 +12,5 @@ atlas-metal = { path = "../atlas-metal" }
 atlas-ops = { path = "../atlas-ops" }
 rand.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokenizers.workspace = true

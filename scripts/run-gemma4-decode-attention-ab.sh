@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 # Compare Gemma Resident decode kernel configurations at a sustained context
 # window. Each argument is one environment assignment (NAME=value) or
-# `-` for the production default with no environment override.
+# `-` for the production default with no environment override. Add
+# `--screen` before the assignments for a short two-run smoke test.
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
 
+screen=false
+if [[ "${1:-}" == "--screen" ]]; then
+    screen=true
+    shift
+fi
 baseline_env=${1:--}
 candidate_env=${2:-ATLAS_GEMMA4_WEIGHT_FORMAT=all_q4}
 model_id=gemma4-e2b-q4_0
@@ -18,6 +24,14 @@ long_context=2048
 short_measure_tokens=128
 short_context=4096
 runs=5
+if [[ "$screen" == true ]]; then
+    # Fast screening preserves both workloads and parity checks while avoiding
+    # the long promotion-quality warmup/repetition budget.
+    runs=2
+    long_warmup_tokens=128
+    long_measure_tokens=128
+    short_measure_tokens=64
+fi
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 artifact_dir="artifacts/phase-12a-decode-attention-ab/${stamp}"
 fixture=models/gguf/gemma-4-e2b-it-q4_0/gemma-4-E2B_q4_0-it.gguf
@@ -50,10 +64,10 @@ run_configuration() {
         --model "$model_id" --kv-cache-type "$cache_type" \
         --decode-tokens "$long_warmup_tokens" --max-context "$long_context" \
         > "$mode_dir/profile.json" 2> "$mode_dir/profile.log"
-    jq -e '
+    jq -e --argjson profile_target "$long_warmup_tokens" '
       .executor == "resident"
       and (.kv_cache_type == "q4_0")
-      and ([.samples[].decode_position] | index(1024) != null)
+      and ([.samples[].decode_position] | index($profile_target) != null)
     ' "$mode_dir/profile.json" >/dev/null
 
     for workload in long short; do
@@ -75,7 +89,7 @@ run_configuration() {
                 2> "$mode_dir/${workload}-${run}.log"
         done
         cat "$mode_dir"/"$workload"-*.json > "$mode_dir/${workload}.jsonl"
-        jq -s --arg workload "$workload" --arg env_assignment "$env_assignment" '
+        jq -s --arg workload "$workload" --arg env_assignment "$env_assignment" --argjson expected_runs "$runs" '
           def median: sort | .[length / 2 | floor];
           . as $records
           | ($records | map(.decode_tok_s)) as $decode
@@ -86,7 +100,7 @@ run_configuration() {
               median_decode_tok_s: ($decode | median),
               attention_kernel: $records[0].selected_kernels.attention,
               checks: {
-                expected_runs: ($records | length == 5),
+                expected_runs: ($records | length == $expected_runs),
                 resident_executor: all($records[]; .executor == "resident"),
                 q4_kv_cache: all($records[]; .kv_cache_type == "q4_0"),
                 deterministic_prompt: (($records | map(.prompt_token_sha256) | unique | length) == 1),

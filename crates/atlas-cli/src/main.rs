@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::{
     env, fs,
     io::{self, BufRead, Write},
@@ -12,7 +14,14 @@ use atlas_core::{GgufModel, GgufTensorType};
 use atlas_metal::MetalRuntime;
 use atlas_model::{
     Gemma4ChatMessage, Gemma4ChatRole, Gemma4E2bModel,
-    gemma4_executor::{Gemma4E2bExecutor, Gemma4FinishReason, Gemma4Generation, Gemma4KvCacheType},
+    gemma4_executor::{
+        Gemma4E2bExecutor, Gemma4FinishReason, Gemma4Generation, Gemma4KvCacheType,
+        Gemma4SelectedGroupFormat,
+    },
+    gemma4_quantization_preflight::{
+        Gemma4QuantizationPreflightInvocation, run_gemma4_quantization_preflight,
+    },
+    quantization_plan::default_sidecar_path,
     render_gemma4_chat,
 };
 use serde_json::{Value, json};
@@ -350,7 +359,50 @@ fn emit_metrics(
         generation.metrics.decode_command_buffers as usize,
         generation.metrics.decode,
     );
-    let record = json!({"event":"generation_metrics","model_id":record.id,"executor":"resident","format":"gguf-gemma4-q4_0","weight_format":generation.metrics.weight_format.as_str(),"embedding_kernel":generation.metrics.embedding_kernel,"output_projection_kernel":generation.metrics.output_projection_kernel,"rms_norm_kernel":generation.metrics.rms_norm_kernel,"prompt_tokens":generation.generation.prompt_token_ids.len(),"generated_tokens":generation.generation.generated_token_ids.len(),"finish_reason":finish_reason,"max_new_tokens":max_tokens,"token_limit_source":if context_limit { "context" } else { "explicit" },"visible_chars":visible.chars().count(),"prefill_tok_s":prefill,"decode_tok_s":decode,"resident_bytes":generation.metrics.resident_bytes,"kv_cache_type":generation.metrics.kv_cache_type.as_str(),"kv_cache_bytes":generation.metrics.kv_cache_bytes,"weight_upload_bytes":generation.metrics.weight_upload_bytes,"readback_bytes":generation.metrics.readback_bytes,"command_buffers":generation.metrics.command_buffers,"prefill_command_buffers":generation.metrics.prefill_command_buffers,"decode_command_buffers":generation.metrics.decode_command_buffers,"prefill_path":generation.metrics.prefill_path,"prefill_chunk_size":generation.metrics.prefill_chunk_size,"prefill_chunks":generation.metrics.prefill_chunks,"attention_kernel":generation.metrics.attention_kernel,"timing":{"prefill_ms":generation.metrics.prefill.as_secs_f64()*1000.0,"decode_ms":generation.metrics.decode.as_secs_f64()*1000.0,"host_ms":generation.metrics.host_wall_time.as_secs_f64()*1000.0}});
+    let record = json!({
+        "event": "generation_metrics",
+        "model_id": record.id,
+        "executor": "resident",
+        "format": "gguf-gemma4-q4_0",
+        "weight_format": generation.metrics.weight_format.as_str(),
+        "embedding_kernel": generation.metrics.embedding_kernel,
+        "output_projection_kernel": generation.metrics.output_projection_kernel,
+        "q4_projection_kernel": generation.metrics.q4_projection_kernel,
+        "q4_qkv_projection_kernel": generation.metrics.q4_qkv_projection_kernel,
+        "q4_gate_up_projection_kernel": generation.metrics.q4_gate_up_projection_kernel,
+        "q4_batch_projection_kernel": generation.metrics.q4_batch_projection_kernel,
+        "ffn_down_projection_kernel": generation.metrics.ffn_down_projection_kernel,
+        "rms_norm_kernel": generation.metrics.rms_norm_kernel,
+        "prompt_tokens": generation.generation.prompt_token_ids.len(),
+        "generated_tokens": generation.generation.generated_token_ids.len(),
+        "finish_reason": finish_reason,
+        "max_new_tokens": max_tokens,
+        "token_limit_source": if context_limit { "context" } else { "explicit" },
+        "visible_chars": visible.chars().count(),
+        "prefill_tok_s": prefill,
+        "decode_tok_s": decode,
+        "resident_bytes": generation.metrics.resident_bytes,
+        "kv_cache_type": generation.metrics.kv_cache_type.as_str(),
+        "kv_cache_bytes": generation.metrics.kv_cache_bytes,
+        "weight_upload_bytes": generation.metrics.weight_upload_bytes,
+        "readback_bytes": generation.metrics.readback_bytes,
+        "command_buffers": generation.metrics.command_buffers,
+        "prefill_command_buffers": generation.metrics.prefill_command_buffers,
+        "decode_command_buffers": generation.metrics.decode_command_buffers,
+        "prefill_path": generation.metrics.prefill_path,
+        "prefill_chunk_size": generation.metrics.prefill_chunk_size,
+        "prefill_chunks": generation.metrics.prefill_chunks,
+        "quantization_preflight_state": generation.metrics.quantization_preflight_state,
+        "quantization_plan": generation.metrics.quantization_plan_path,
+        "selected_group_formats": selected_group_formats_json(&generation.metrics.selected_group_formats),
+        "quantization_rejections": generation.metrics.quantization_rejections,
+        "attention_kernel": generation.metrics.attention_kernel,
+        "timing": {
+            "prefill_ms": generation.metrics.prefill.as_secs_f64() * 1000.0,
+            "decode_ms": generation.metrics.decode.as_secs_f64() * 1000.0,
+            "host_ms": generation.metrics.host_wall_time.as_secs_f64() * 1000.0
+        }
+    });
     eprintln!("{record}");
     append_jsonl(&record)?;
     eprintln!("chat performance log: {CHAT_PERFORMANCE_LOG}");
@@ -364,13 +416,38 @@ fn rate(tokens: usize, elapsed: Duration) -> f64 {
     }
 }
 
+fn selected_group_formats_json(formats: &[Gemma4SelectedGroupFormat]) -> Vec<Value> {
+    formats
+        .iter()
+        .map(|entry| {
+            json!({
+                "group": entry.group,
+                "source_format": gguf_tensor_type_name(entry.source_format),
+                "selected_format": gguf_tensor_type_name(entry.selected_format),
+                "selected_kernel": entry.selected_kernel,
+                "rejection_reason": entry.rejection_reason,
+            })
+        })
+        .collect()
+}
+
+fn gguf_tensor_type_name(format: GgufTensorType) -> &'static str {
+    match format {
+        GgufTensorType::F32 => "f32",
+        GgufTensorType::F16 => "f16",
+        GgufTensorType::Q4_0 => "q4_0",
+        GgufTensorType::Q8_0 => "q8_0",
+        GgufTensorType::Q6K => "q6_k",
+    }
+}
+
 fn generate(args: &[String]) -> Result<()> {
     let mut model = None;
     let mut prompt = None;
     let mut max_tokens = None;
     let mut greedy = false;
     let mut chat = false;
-    let mut kv_cache_type = Gemma4KvCacheType::F32;
+    let mut kv_cache_type = Gemma4KvCacheType::Q4_0;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -426,7 +503,7 @@ fn generate(args: &[String]) -> Result<()> {
     );
     println!(
         "{}",
-        json!({"event":"generation_metrics","model_id":selection.id,"executor":"resident","format":"gguf-gemma4-q4_0","weight_format":result.metrics.weight_format.as_str(),"embedding_kernel":result.metrics.embedding_kernel,"output_projection_kernel":result.metrics.output_projection_kernel,"rms_norm_kernel":result.metrics.rms_norm_kernel,"finish_reason":match result.finish_reason { Gemma4FinishReason::Eos => "eos", Gemma4FinishReason::MaxTokens => "max_tokens", Gemma4FinishReason::Cancelled => "cancelled" },"resident_bytes":result.metrics.resident_bytes,"kv_cache_type":result.metrics.kv_cache_type.as_str(),"kv_cache_bytes":result.metrics.kv_cache_bytes,"weight_upload_bytes":result.metrics.weight_upload_bytes,"readback_bytes":result.metrics.readback_bytes,"command_buffers":result.metrics.command_buffers})
+        json!({"event":"generation_metrics","model_id":selection.id,"executor":"resident","format":"gguf-gemma4-q4_0","weight_format":result.metrics.weight_format.as_str(),"embedding_kernel":result.metrics.embedding_kernel,"output_projection_kernel":result.metrics.output_projection_kernel,"q4_projection_kernel":result.metrics.q4_projection_kernel,"q4_qkv_projection_kernel":result.metrics.q4_qkv_projection_kernel,"q4_gate_up_projection_kernel":result.metrics.q4_gate_up_projection_kernel,"q4_batch_projection_kernel":result.metrics.q4_batch_projection_kernel,"ffn_down_projection_kernel":result.metrics.ffn_down_projection_kernel,"rms_norm_kernel":result.metrics.rms_norm_kernel,"finish_reason":match result.finish_reason { Gemma4FinishReason::Eos => "eos", Gemma4FinishReason::MaxTokens => "max_tokens", Gemma4FinishReason::Cancelled => "cancelled" },"resident_bytes":result.metrics.resident_bytes,"kv_cache_type":result.metrics.kv_cache_type.as_str(),"kv_cache_bytes":result.metrics.kv_cache_bytes,"weight_upload_bytes":result.metrics.weight_upload_bytes,"readback_bytes":result.metrics.readback_bytes,"command_buffers":result.metrics.command_buffers})
     );
     Ok(())
 }
@@ -506,6 +583,24 @@ fn benchmark(args: &[String]) -> Result<()> {
     let token_digest = token_ids_sha256(&generation.generation.generated_token_ids);
     let measured_token_digest =
         token_ids_sha256(&generation.generation.generated_token_ids[args.warmup_decode_tokens..]);
+    let selected_kernels = json!({
+        "attention": generation.metrics.attention_kernel,
+        "q4_projection": generation.metrics.q4_projection_kernel,
+        "q4_qkv_projection": generation.metrics.q4_qkv_projection_kernel,
+        "q4_gate_up_projection": generation.metrics.q4_gate_up_projection_kernel,
+        "q4_batch_projection": generation.metrics.q4_batch_projection_kernel,
+        "quantization_plan": generation.metrics.quantization_plan_path,
+        "ffn_down_projection": generation.metrics.ffn_down_projection_kernel,
+        "q6_projection": generation.metrics.q6_projection_kernel,
+        "rms_norm": generation.metrics.rms_norm_kernel,
+        "embedding": generation.metrics.embedding_kernel,
+        "output_projection": generation.metrics.output_projection_kernel,
+        "kv_append": match generation.metrics.kv_cache_type {
+            Gemma4KvCacheType::F32 => "kv_append_decode_f32",
+            Gemma4KvCacheType::Q8_0 => "kv_append_decode_q8_0",
+            Gemma4KvCacheType::Q4_0 => "kv_append_decode_q4_0",
+        },
+    });
     let record = json!({
         "event": "gemma4_fixed_workload_benchmark",
         "diagnostic": true,
@@ -515,6 +610,8 @@ fn benchmark(args: &[String]) -> Result<()> {
         "weight_format": generation.metrics.weight_format.as_str(),
         "embedding_kernel": generation.metrics.embedding_kernel,
         "output_projection_kernel": generation.metrics.output_projection_kernel,
+        "q4_projection_kernel": generation.metrics.q4_projection_kernel,
+        "ffn_down_projection_kernel": generation.metrics.ffn_down_projection_kernel,
         "rms_norm_kernel": generation.metrics.rms_norm_kernel,
         "prompt_template": "gemma4_chat",
         "prompt_token_sha256": prompt_token_digest,
@@ -540,19 +637,11 @@ fn benchmark(args: &[String]) -> Result<()> {
         "prefill_path": generation.metrics.prefill_path,
         "prefill_chunk_size": generation.metrics.prefill_chunk_size,
         "prefill_chunks": generation.metrics.prefill_chunks,
-        "selected_kernels": {
-            "attention": generation.metrics.attention_kernel,
-            "q4_projection": "matvec_q4_0_16row",
-            "q6_projection": generation.metrics.q6_projection_kernel,
-            "rms_norm": generation.metrics.rms_norm_kernel,
-            "embedding": generation.metrics.embedding_kernel,
-            "output_projection": generation.metrics.output_projection_kernel,
-            "kv_append": match generation.metrics.kv_cache_type {
-                Gemma4KvCacheType::F32 => "kv_append_decode_f32",
-                Gemma4KvCacheType::Q8_0 => "kv_append_decode_q8_0",
-                Gemma4KvCacheType::Q4_0 => "kv_append_decode_q4_0",
-            },
-        },
+        "quantization_preflight_state": generation.metrics.quantization_preflight_state,
+        "quantization_plan": generation.metrics.quantization_plan_path,
+        "selected_group_formats": selected_group_formats_json(&generation.metrics.selected_group_formats),
+        "quantization_rejections": generation.metrics.quantization_rejections,
+        "selected_kernels": selected_kernels,
         "timing": {
             "prefill_ms": generation.metrics.prefill.as_secs_f64() * 1000.0,
             "decode_ms": generation.metrics.decode.as_secs_f64() * 1000.0,
@@ -580,7 +669,7 @@ fn parse_profile_args(args: &[String]) -> Result<GemmaProfileArgs> {
             .to_owned();
     let mut decode_tokens = 128;
     let mut max_context = 4096;
-    let mut kv_cache_type = Gemma4KvCacheType::F32;
+    let mut kv_cache_type = Gemma4KvCacheType::Q4_0;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -633,7 +722,7 @@ fn parse_benchmark_args(args: &[String]) -> Result<GemmaBenchmarkArgs> {
     let mut decode_tokens = None;
     let mut warmup_decode_tokens = 0;
     let mut max_context = 4096;
-    let mut kv_cache_type = Gemma4KvCacheType::F32;
+    let mut kv_cache_type = Gemma4KvCacheType::Q4_0;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -702,7 +791,7 @@ fn parse_chat_args(
     let mut prompt = None;
     let mut max = None;
     let mut thoughts = false;
-    let mut kv_cache_type = Gemma4KvCacheType::F32;
+    let mut kv_cache_type = Gemma4KvCacheType::Q4_0;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -754,9 +843,58 @@ fn model_command(args: &[String]) -> Result<()> {
     match command.as_str() {
         "search" => model_search(&args[1..]),
         "download" => model_download(&args[1..]),
-        "inspect" | "verify" => {
+        "inspect" | "verify" | "quantization-plan" => {
             let id = option_value(&args[1..], "--model")?;
             let model = resolve_model(&id)?;
+            let model_path = model.path.join(&model.model_file);
+            if command == "quantization-plan" && args.iter().any(|arg| arg == "--profile") {
+                let output_path = args
+                    .iter()
+                    .position(|arg| arg == "--output")
+                    .and_then(|index| args.get(index + 1))
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        PathBuf::from(format!("artifacts/quantization-plans/{id}.json"))
+                    });
+                let model =
+                    Gemma4E2bModel::load_gguf_without_quantization_preflight(&model_path)
+                        .with_context(|| format!("load Gemma 4 GGUF {}", model_path.display()))?;
+                let report = run_gemma4_quantization_preflight(
+                    &model,
+                    Gemma4QuantizationPreflightInvocation::CliProfile,
+                    Some(&output_path),
+                )?
+                .context("Gemma quantization preflight produced no report")?;
+                println!("{}", report.to_value());
+                eprintln!(
+                    "Gemma quantization preflight artifact: {}",
+                    output_path.display()
+                );
+                return Ok(());
+            }
+            if command == "quantization-plan" {
+                let gguf = GgufModel::open(&model_path)
+                    .with_context(|| format!("read GGUF {}", model_path.display()))?;
+                let plan_path = args
+                    .iter()
+                    .position(|arg| arg == "--plan")
+                    .and_then(|index| args.get(index + 1))
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| default_sidecar_path(&model_path));
+                ensure!(
+                    plan_path.exists(),
+                    "no quantization plan sidecar exists at {}",
+                    plan_path.display()
+                );
+                let plan = atlas_model::quantization_plan::QuantizationPlan::from_path(&plan_path)?;
+                let model_sha256 = sha256_file(&model_path)?;
+                plan.validate_for_model(&gguf, &model_sha256)?;
+                println!(
+                    "{}",
+                    json!({"model_id": id, "plan": plan_path, "validated": true, "schema_version": plan.schema_version, "tensor_count": plan.tensors.len()})
+                );
+                return Ok(());
+            }
             if command == "verify" {
                 verify_manifest_model(&model)?;
                 println!(
@@ -771,7 +909,7 @@ fn model_command(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
-        _ => bail!("model command must be search, download, inspect, or verify"),
+        _ => bail!("model command must be search, download, inspect, verify, or quantization-plan"),
     }
 }
 fn model_search(args: &[String]) -> Result<()> {
@@ -1002,6 +1140,38 @@ mod kv_cache_cli_tests {
         ];
         let (_, _, _, _, cache_type) = parse_chat_args(&args).expect("parse chat options");
         assert_eq!(cache_type, Gemma4KvCacheType::Q8_0);
+    }
+
+    #[test]
+    fn gemma_cli_defaults_to_the_promoted_q4_kv_cache() {
+        let chat = vec!["--model".to_owned(), "gemma4-e2b-q4_0".to_owned()];
+        assert_eq!(
+            parse_chat_args(&chat).expect("parse chat options").4,
+            Gemma4KvCacheType::Q4_0
+        );
+
+        let benchmark = vec![
+            "--model".to_owned(),
+            "gemma4-e2b-q4_0".to_owned(),
+            "--prompt".to_owned(),
+            "fixed workload".to_owned(),
+            "--decode-tokens".to_owned(),
+            "128".to_owned(),
+        ];
+        assert_eq!(
+            parse_benchmark_args(&benchmark)
+                .expect("parse benchmark options")
+                .kv_cache_type,
+            Gemma4KvCacheType::Q4_0
+        );
+
+        let profile = vec!["--model".to_owned(), "gemma4-e2b-q4_0".to_owned()];
+        assert_eq!(
+            parse_profile_args(&profile)
+                .expect("parse profile options")
+                .kv_cache_type,
+            Gemma4KvCacheType::Q4_0
+        );
     }
 
     #[test]

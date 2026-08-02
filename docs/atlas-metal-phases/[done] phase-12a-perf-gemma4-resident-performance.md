@@ -203,7 +203,8 @@ cargo run --release -p atlas-cli -- chat --model gemma4-e2b-q4_0 \
   --kv-cache-type q8_0 --max-tokens 128
 ```
 
-Supported values are `f32` (default), `q8_0`, and `q4_0`. Q8/Q4 cache only
+Supported values are `f32`, `q8_0`, and `q4_0` (the current Gemma CLI default).
+Q8/Q4 cache only
 pack transient K/V entries; query activations, online softmax, and attention
 outputs remain FP32. Metrics record `kv_cache_type` and `kv_cache_bytes`.
 There is no fallback from a selected packed mode to F32 or Reference execution.

@@ -29,6 +29,7 @@ cross-phase exit rules.
 | 12a | [Gemma-only inference architecture and correctness reset](phase-12a-gemma-only-inference-architecture.md) — open |
 | 12a-perf | [Gemma 4 Resident performance remediation]([done]%20phase-12a-perf-gemma4-resident-performance.md) |
 | 12.1 | [Resident decode performance remediation](phase-12a-resident-decode-performance.md) |
+| 12.2 | [Dynamic quantization preflight](phase-12.2-dynamic-quantization-preflight.md) — baseline-safe implementation complete; per-group search open |
 | 12b | [Gemma 4 agentic tools](phase-12b-gemma4-agentic-tools.md) |
 | 13 | [Atlas local attention](phase-13-local-attention.md) |
 | 14 | [Recurrent working memory](phase-14-working-memory.md) |

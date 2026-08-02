@@ -176,6 +176,10 @@ cargo run --release -p atlas-cli -- chat \
   --model gemma4-e2b-q4_0
 ```
 
+Gemma chat uses the promoted GPU-resident `q4_0` KV cache and its matching
+no-value-barrier Q4 attention kernel by default. Pass `--kv-cache-type f32`
+only for a diagnostic comparison.
+
 Wait for the `you>` prompt and type a message. The REPL supports:
 
 - `/help` to show the available commands;

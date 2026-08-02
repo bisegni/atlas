@@ -6,3 +6,4 @@
 .DS_Store
 /fixtures/
 manifest.toml
+PROMPT-*

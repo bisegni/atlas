@@ -635,9 +635,16 @@ mod macos {
                 "matvec_q4_0",
                 "matvec_q4_0_blocked",
                 "matvec_q4_0_16row",
+                "matvec_q4_0_16row_ffn_down_interleaved",
+                "matvec_q4_0_16row_shared_input",
+                "matvec_q4_0_16row_simdgroup_tiled",
                 "matmul_q4_0_qkv_16row",
+                "matmul_q4_0_qkv_16row_simdgroup_tiled",
                 "matmul_q4_0_gate_up_16row",
+                "matmul_q4_0_gate_up_16row_simdgroup_tiled",
                 "matmul_q4_0_batch_16row",
+                "matmul_q4_0_batch_16row_simdgroup_tiled",
+                "matmul_q4_0_batch_16row_ffn_down_interleaved",
                 "matmul_f16_batch",
                 "matvec_q8_0",
                 "embedding_lookup_q4_0",
@@ -645,6 +652,7 @@ mod macos {
                 "embedding_lookup_q6_k",
                 "matvec_q6_k",
                 "matvec_q6_k_8row",
+                "matvec_q6_k_8row_cacheopt",
                 "matmul_q6_k_batch_8row",
                 "matvec_f16",
                 "gelu_f32",
@@ -682,7 +690,10 @@ mod macos {
                 "attention_decode_fused_gemma4_simd_q8_0",
                 "attention_decode_fused_gemma4_simd_q4_0",
                 "attention_decode_fused_gemma4_simd_q4_0_2pass_1",
+                "attention_decode_fused_gemma4_simd_q4_0_2pass_1_no_value_barrier",
+                "attention_decode_fused_gemma4_simd_q4_0_2pass_1_unroll2_no_value_barrier",
                 "attention_decode_fused_gemma4_simd_q4_0_2pass_1_cacheopt",
+                "attention_decode_fused_gemma4_simd_q4_0_2pass_1_cacheopt_no_value_barrier",
                 "attention_decode_fused_gemma4_simd_q4_0_2pass_1_gqa",
                 "attention_decode_fused_gemma4_simd_q4_0_2pass_1_simd",
                 "attention_decode_fused_gemma4_simd_q4_0_2pass_2",
@@ -1167,6 +1178,103 @@ mod macos {
                     &output_width_buffer,
                 ],
                 output_width,
+            )?;
+            self.copy_buffer_to_slice(&output_buffer, &mut output)?;
+            Ok((output, timing))
+        }
+
+        /// Execute either 16-row Q4_0 Resident projection kernel for parity
+        /// diagnostics. Normal Gemma execution selects the same pipelines
+        /// inside its Resident command buffer.
+        pub fn matvec_q4_0_16row_packed(
+            &self,
+            input: &[f32],
+            weights: &[u8],
+            input_width: usize,
+            output_width: usize,
+            shared_input: bool,
+        ) -> Result<(Vec<f32>, DispatchTiming), MetalError> {
+            let kernel = if shared_input {
+                "matvec_q4_0_16row_shared_input"
+            } else {
+                "matvec_q4_0_16row"
+            };
+            self.matvec_q4_0_16row_packed_with_kernel(
+                input,
+                weights,
+                input_width,
+                output_width,
+                kernel,
+            )
+        }
+
+        /// Execute the opt-in SIMD-group-tiled 16-row Q4_0 kernel for parity
+        /// diagnostics. Normal Gemma execution selects it only through the
+        /// explicit experiment environment variable.
+        pub fn matvec_q4_0_16row_simdgroup_tiled_packed(
+            &self,
+            input: &[f32],
+            weights: &[u8],
+            input_width: usize,
+            output_width: usize,
+        ) -> Result<(Vec<f32>, DispatchTiming), MetalError> {
+            self.matvec_q4_0_16row_packed_with_kernel(
+                input,
+                weights,
+                input_width,
+                output_width,
+                "matvec_q4_0_16row_simdgroup_tiled",
+            )
+        }
+
+        fn matvec_q4_0_16row_packed_with_kernel(
+            &self,
+            input: &[f32],
+            weights: &[u8],
+            input_width: usize,
+            output_width: usize,
+            kernel: &'static str,
+        ) -> Result<(Vec<f32>, DispatchTiming), MetalError> {
+            if input_width == 0 || output_width == 0 || !input_width.is_multiple_of(32) {
+                return Err(MetalError::InvalidInput(
+                    "Q4_0 16-row matvec requires a non-zero block-32 width".into(),
+                ));
+            }
+            require_len(input, Some(input_width), "Q4_0 16-row matvec input")?;
+            require_len(
+                weights,
+                Some(checked_product(
+                    output_width,
+                    input_width / 32 * GgufTensorType::Q4_0.block_bytes(),
+                    "Q4_0 16-row matvec weights",
+                )?),
+                "Q4_0 16-row matvec weights",
+            )?;
+            let mut output = vec![0.0; output_width];
+            let input_buffer = self.buffer_from_slice(input)?;
+            let weights_buffer = self.buffer_from_slice(weights)?;
+            let output_buffer = self.buffer_from_slice(&output)?;
+            let input_width_buffer = self.buffer_from_slice(&[count_u32(input_width)?])?;
+            let output_width_buffer = self.buffer_from_slice(&[count_u32(output_width)?])?;
+            let timing = self.dispatch(
+                kernel,
+                &[
+                    &input_buffer,
+                    &weights_buffer,
+                    &output_buffer,
+                    &input_width_buffer,
+                    &output_width_buffer,
+                ],
+                MTLSize {
+                    width: output_width.div_ceil(16) * 128,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 128,
+                    height: 1,
+                    depth: 1,
+                },
             )?;
             self.copy_buffer_to_slice(&output_buffer, &mut output)?;
             Ok((output, timing))
