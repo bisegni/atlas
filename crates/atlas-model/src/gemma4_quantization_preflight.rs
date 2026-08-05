@@ -14,21 +14,22 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use atlas_core::{GgufModel, GgufTensorType};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::{
+    Gemma4ChatMessage, Gemma4ChatRole, Gemma4E2bModel,
     gemma4_executor::{
+        Gemma4E2bExecutor, Gemma4FinishReason, Gemma4KvCacheType, Gemma4WeightFormat,
         gemma4_ffn_down_projection_kernel, gemma4_q4_gate_up_projection_kernel,
-        gemma4_q4_projection_kernel, gemma4_q4_qkv_projection_kernel, Gemma4E2bExecutor,
-        Gemma4FinishReason, Gemma4KvCacheType, Gemma4WeightFormat,
+        gemma4_q4_projection_kernel, gemma4_q4_qkv_projection_kernel,
     },
     quantization_plan::{
-        default_sidecar_path, sha256_file, QuantizationPlan, QuantizationPlanProfilerConfig,
-        QuantizationPlanTensor, QUANTIZATION_PLAN_STATE_READY,
+        QUANTIZATION_PLAN_STATE_READY, QuantizationPlan, QuantizationPlanProfilerConfig,
+        QuantizationPlanTensor, default_sidecar_path, sha256_file,
     },
-    render_gemma4_chat, Gemma4ChatMessage, Gemma4ChatRole, Gemma4E2bModel,
+    render_gemma4_chat,
 };
 
 pub const ATLAS_GEMMA4_QUANTIZATION_PREFLIGHT: &str = "ATLAS_GEMMA4_QUANTIZATION_PREFLIGHT";
@@ -1648,18 +1649,22 @@ mod tests {
         let model = test_model(&[true, true]);
         let specs = gemma4_plan_group_specs(&model, 2, Gemma4WeightFormat::AllQ4).unwrap();
         assert_eq!(specs.len(), 12);
-        assert!(specs
-            .iter()
-            .any(|spec| spec.tensor_names == vec!["per_layer_model_proj.weight"]));
+        assert!(
+            specs
+                .iter()
+                .any(|spec| spec.tensor_names == vec!["per_layer_model_proj.weight"])
+        );
         assert!(specs.iter().any(|spec| spec.tensor_names
             == vec![
                 "blk.0.attn_q.weight",
                 "blk.0.attn_k.weight",
                 "blk.0.attn_v.weight"
             ]));
-        assert!(specs
-            .iter()
-            .all(|spec| spec.selected_format != GgufTensorType::Q8_0));
+        assert!(
+            specs
+                .iter()
+                .all(|spec| spec.selected_format != GgufTensorType::Q8_0)
+        );
 
         let plan = build_test_plan(&model, Gemma4WeightFormat::AllQ4, 2);
         validate_gemma4_quantization_plan_groups(&plan, &model, 2).unwrap();
@@ -1687,9 +1692,11 @@ mod tests {
     fn gemma4_plan_group_specs_preserve_shared_kv_absence() {
         let model = test_model(&[true, false]);
         let specs = gemma4_plan_group_specs(&model, 2, Gemma4WeightFormat::MixedQ4Q6).unwrap();
-        assert!(specs
-            .iter()
-            .any(|spec| spec.tensor_names == vec!["blk.1.attn_q.weight"]));
+        assert!(
+            specs
+                .iter()
+                .any(|spec| spec.tensor_names == vec!["blk.1.attn_q.weight"])
+        );
         assert!(specs.iter().any(|spec| spec.tensor_names
             == vec![
                 "blk.0.attn_q.weight",
@@ -1761,8 +1768,10 @@ mod tests {
 
         let (selected, _, rejections, _, _, _) = select_candidate(&baseline, &candidate);
         assert_eq!(selected, Gemma4WeightFormat::AllQ4);
-        assert!(!rejections
-            .values()
-            .any(|reason| reason.contains("accounting")));
+        assert!(
+            !rejections
+                .values()
+                .any(|reason| reason.contains("accounting"))
+        );
     }
 }

@@ -334,6 +334,42 @@ kernel void matvec_q4_0_16row_ffn_down_interleaved(
     if (column == 0 && row < output_width) output[row] = sum;
 }
 
+// General resident packed-16 companion.  Its byte layout is identical to the
+// FFN-down experiment above, but it is named separately so PLE/FFN composition
+// telemetry can prove which opt-in layout was selected.
+kernel void matvec_q4_0_16row_packed16(
+    device const float *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
+    constant uint &output_width [[buffer(4)]], uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint simdgroup = tid / 32;
+    uint lane = tid % 32;
+    uint row_in_simd = lane / 8;
+    uint column = lane % 8;
+    uint row = group * 16 + simdgroup * 4 + row_in_simd;
+    float sum = 0.0f;
+    if (row < output_width) {
+        uint blocks = input_width / 32;
+        uint tile_rows = min(16u, output_width - group * 16);
+        uint tile_base = group * 16 * blocks * 18;
+        for (uint block = 0; block < blocks; ++block) {
+            device const uchar *base = weights + tile_base
+                + (block * tile_rows + simdgroup * 4 + row_in_simd) * 18;
+            float scale = float(*(device const half *)base);
+            uchar packed0 = base[2 + column];
+            uchar packed1 = base[2 + column + 8];
+            sum += input[block * 32 + column] * float(int(packed0 & 15) - 8) * scale;
+            sum += input[block * 32 + column + 8] * float(int(packed1 & 15) - 8) * scale;
+            sum += input[block * 32 + column + 16] * float(int(packed0 >> 4) - 8) * scale;
+            sum += input[block * 32 + column + 24] * float(int(packed1 >> 4) - 8) * scale;
+        }
+    }
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (column == 0 && row < output_width) output[row] = sum;
+}
+
 // Same 16-row Q4_0 tile as matvec_q4_0_16row, but each SIMD group loads a
 // 32-value activation block once.  The four rows in the group then obtain the
 // values needed by their eight-lane partial reductions through SIMD shuffles.
@@ -619,6 +655,66 @@ kernel void matmul_q4_0_gate_up_16row_simdgroup_tiled(
     }
 }
 
+inline float atlas_tanh_f32(float value);
+
+// Decode-only Gate/Up epilogue. Each eight-lane unit preserves the Q4_0
+// accumulation and reduction order used by matmul_q4_0_gate_up_16row, but
+// keeps the paired row sums in registers and writes only the FFN-down input.
+kernel void matmul_q4_0_gate_up_gelu_16row(
+    device const float *input [[buffer(0)]],
+    device const uchar *gate_weights [[buffer(1)]],
+    device const uchar *up_weights [[buffer(2)]],
+    device float *output [[buffer(3)]],
+    constant uint &input_width [[buffer(4)]],
+    constant uint &output_width [[buffer(5)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint simdgroup = tid / 32;
+    uint lane = tid % 32;
+    uint row_in_simd = lane / 8;
+    uint column = lane % 8;
+    uint row = group * 16 + simdgroup * 4 + row_in_simd;
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    if (row < output_width) {
+        uint blocks = input_width / 32;
+        for (uint block = 0; block < blocks; ++block) {
+            device const uchar *gate_base = gate_weights + (row * blocks + block) * 18;
+            device const uchar *up_base = up_weights + (row * blocks + block) * 18;
+            float gate_scale = float(*(device const half *)gate_base);
+            float up_scale = float(*(device const half *)up_base);
+            uchar gate0 = gate_base[2 + column];
+            uchar gate1 = gate_base[2 + column + 8];
+            uchar up0 = up_base[2 + column];
+            uchar up1 = up_base[2 + column + 8];
+            float x0 = input[block * 32 + column];
+            float x8 = input[block * 32 + column + 8];
+            float x16 = input[block * 32 + column + 16];
+            float x24 = input[block * 32 + column + 24];
+            gate_sum += x0 * float(int(gate0 & 15) - 8) * gate_scale;
+            gate_sum += x8 * float(int(gate1 & 15) - 8) * gate_scale;
+            gate_sum += x16 * float(int(gate0 >> 4) - 8) * gate_scale;
+            gate_sum += x24 * float(int(gate1 >> 4) - 8) * gate_scale;
+            up_sum += x0 * float(int(up0 & 15) - 8) * up_scale;
+            up_sum += x8 * float(int(up1 & 15) - 8) * up_scale;
+            up_sum += x16 * float(int(up0 >> 4) - 8) * up_scale;
+            up_sum += x24 * float(int(up1 >> 4) - 8) * up_scale;
+        }
+    }
+    gate_sum += simd_shuffle_xor(gate_sum, 4);
+    gate_sum += simd_shuffle_xor(gate_sum, 2);
+    gate_sum += simd_shuffle_xor(gate_sum, 1);
+    up_sum += simd_shuffle_xor(up_sum, 4);
+    up_sum += simd_shuffle_xor(up_sum, 2);
+    up_sum += simd_shuffle_xor(up_sum, 1);
+    if (column == 0 && row < output_width) {
+        float argument = 0.7978845608f * (gate_sum + 0.044715f * gate_sum * gate_sum * gate_sum);
+        float gelu = isinf(argument) ? (argument > 0.0f ? gate_sum : 0.0f)
+                                   : 0.5f * gate_sum * (1.0f + atlas_tanh_f32(argument));
+        output[row] = gelu * up_sum;
+    }
+}
+
 // Batched prefill building block.  Inputs and outputs are row-major
 // [batch, width] matrices; weights remain in their GGUF Q4_0 packing and each
 // output dot product still accumulates in FP32.  The executor can therefore
@@ -700,6 +796,44 @@ kernel void matmul_q4_0_batch_16row_simdgroup_tiled(
 
 // Batched prefill companion for matvec_q4_0_16row_ffn_down_interleaved.
 kernel void matmul_q4_0_batch_16row_ffn_down_interleaved(
+    device const float *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
+    constant uint &output_width [[buffer(4)]], constant uint &batch [[buffer(5)]],
+    uint group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    uint simdgroup = tid / 32;
+    uint lane = tid % 32;
+    uint row_in_simd = lane / 8;
+    uint column = lane % 8;
+    uint rows_per_batch = (output_width + 15) / 16;
+    uint token = group / rows_per_batch;
+    uint group_row = group % rows_per_batch;
+    uint row = group_row * 16 + simdgroup * 4 + row_in_simd;
+    float sum = 0.0f;
+    if (token < batch && row < output_width) {
+        uint blocks = input_width / 32;
+        uint tile_rows = min(16u, output_width - group_row * 16);
+        uint tile_base = group_row * 16 * blocks * 18;
+        device const float *token_input = input + token * input_width;
+        for (uint block = 0; block < blocks; ++block) {
+            device const uchar *base = weights + tile_base
+                + (block * tile_rows + simdgroup * 4 + row_in_simd) * 18;
+            float scale = float(*(device const half *)base);
+            uchar packed0 = base[2 + column];
+            uchar packed1 = base[2 + column + 8];
+            sum += token_input[block * 32 + column] * float(int(packed0 & 15) - 8) * scale;
+            sum += token_input[block * 32 + column + 8] * float(int(packed1 & 15) - 8) * scale;
+            sum += token_input[block * 32 + column + 16] * float(int(packed0 >> 4) - 8) * scale;
+            sum += token_input[block * 32 + column + 24] * float(int(packed1 >> 4) - 8) * scale;
+        }
+    }
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (column == 0 && token < batch && row < output_width) output[token * output_width + row] = sum;
+}
+
+// Batched prefill companion for the general packed-16 resident layout.
+kernel void matmul_q4_0_batch_16row_packed16(
     device const float *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
     device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
     constant uint &output_width [[buffer(4)]], constant uint &batch [[buffer(5)]],
@@ -956,6 +1090,23 @@ kernel void gelu_f32(
         } else {
             output[id] = 0.5f * x * (1.0f + atlas_tanh_f32(argument));
         }
+    }
+}
+
+// Decode-only PLE composition.  The baseline writes GELU(gate) back to the
+// gate buffer, then launches vector_multiply_offset_f32 to select the current
+// layer's PLE slice.  This candidate keeps the same per-element GELU and
+// multiply operations but removes that intermediate write/read pair.
+kernel void ple_gelu_multiply_offset_f32(
+    device const float *gate [[buffer(0)]], device const float *ple [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &ple_offset [[buffer(3)]],
+    constant uint &count [[buffer(4)]], uint id [[thread_position_in_grid]]) {
+    if (id < count) {
+        float x = gate[id];
+        float argument = 0.7978845608f * (x + 0.044715f * x * x * x);
+        float gelu = isinf(argument) ? (argument > 0.0f ? x : 0.0f)
+                                      : 0.5f * x * (1.0f + atlas_tanh_f32(argument));
+        output[id] = gelu * ple[ple_offset + id];
     }
 }
 
@@ -2164,6 +2315,111 @@ kernel void attention_decode_fused_gemma4_simd_q4_0_2pass_1_gqa(
         uint slot = block * query_heads + tid;
         maxima[slot] = maximum[tid];
         sums[slot] = denominator[tid];
+    }
+}
+
+// Parallel shared-KV candidate for Gemma's 8-query-head, 1-KV-head global
+// attention. Unlike the older _gqa experiment, every query head owns one
+// SIMD group: the group cooperatively stages each Q4 key/value position once,
+// then all eight heads consume it concurrently. This is intentionally limited
+// to the 8x512 shape selected by the Resident executor.
+kernel void attention_decode_fused_gemma4_simd_q4_0_2pass_1_mqa_tiled(
+    device const float *query [[buffer(0)]], device const uchar *cache [[buffer(1)]],
+    device float *partials [[buffer(2)]], device float *maxima [[buffer(3)]],
+    device float *sums [[buffer(4)]], constant uint &heads [[buffer(5)]],
+    constant uint &kv_heads [[buffer(6)]], constant uint &head_dim [[buffer(7)]],
+    constant uint &capacity [[buffer(8)]], constant uint &key_count [[buffer(9)]],
+    constant uint &blocks [[buffer(10)]], uint block [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint query_heads = 8;
+    constexpr uint q4_blocks_per_head = 16;
+    constexpr uint q4_bytes_per_block = 18;
+    constexpr uint q4_packed_bytes_per_block = 16;
+    constexpr uint head_width = 512;
+    if (heads != query_heads || kv_heads != 1 || head_dim != head_width || block >= blocks
+        || simd_group >= query_heads) return;
+
+    uint start = block * key_count / blocks;
+    uint end = (block + 1) * key_count / blocks;
+    uint value_base = capacity * q4_blocks_per_head;
+    threadgroup half key_scales[q4_blocks_per_head], value_scales[q4_blocks_per_head];
+    threadgroup uchar key_packed[q4_blocks_per_head * q4_packed_bytes_per_block];
+    threadgroup uchar value_packed[q4_blocks_per_head * q4_packed_bytes_per_block];
+    threadgroup float maximum[query_heads], denominator[query_heads];
+    threadgroup float rescale[query_heads], weight[query_heads];
+
+    for (uint index = tid; index < query_heads * head_width; index += 256) {
+        uint head = index / head_width;
+        uint d = index % head_width;
+        partials[(block * query_heads + head) * head_width + d] = 0.0f;
+    }
+    if (tid < query_heads) {
+        maximum[tid] = -INFINITY;
+        denominator[tid] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint head = simd_group;
+    uint partial_base = (block * query_heads + head) * head_width;
+    for (uint key = start; key < end; ++key) {
+        uint key_block_base = key * q4_blocks_per_head;
+        if (tid < q4_blocks_per_head)
+            key_scales[tid] = *(device const half *)(cache + (key_block_base + tid) * q4_bytes_per_block);
+        if (tid < q4_blocks_per_head * q4_packed_bytes_per_block) {
+            uint q4_block = tid / q4_packed_bytes_per_block;
+            uint byte = tid % q4_packed_bytes_per_block;
+            key_packed[tid] = cache[(key_block_base + q4_block) * q4_bytes_per_block + 2 + byte];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float score_partial = 0.0f;
+        for (uint q4_block = 0; q4_block < q4_blocks_per_head; ++q4_block) {
+            uchar packed = key_packed[q4_block * q4_packed_bytes_per_block + (lane & 15)];
+            uchar nibble = lane < 16 ? packed & 15 : packed >> 4;
+            uint d = q4_block * 32 + lane;
+            score_partial += query[head * head_width + d]
+                * float(key_scales[q4_block]) * float(int(nibble) - 8);
+        }
+        float score = simd_sum(score_partial);
+        if (lane == 0) {
+            if (score > maximum[head]) {
+                rescale[head] = exp(maximum[head] - score);
+                weight[head] = 1.0f;
+                maximum[head] = score;
+                denominator[head] = denominator[head] * rescale[head] + weight[head];
+            } else {
+                rescale[head] = 1.0f;
+                weight[head] = exp(score - maximum[head]);
+                denominator[head] += weight[head];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint value_block_base = value_base + key_block_base;
+        if (tid < q4_blocks_per_head)
+            value_scales[tid] = *(device const half *)(cache + (value_block_base + tid) * q4_bytes_per_block);
+        if (tid < q4_blocks_per_head * q4_packed_bytes_per_block) {
+            uint q4_block = tid / q4_packed_bytes_per_block;
+            uint byte = tid % q4_packed_bytes_per_block;
+            value_packed[tid] = cache[(value_block_base + q4_block) * q4_bytes_per_block + 2 + byte];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint q4_block = 0; q4_block < q4_blocks_per_head; ++q4_block) {
+            uchar packed = value_packed[q4_block * q4_packed_bytes_per_block + (lane & 15)];
+            uchar nibble = lane < 16 ? packed & 15 : packed >> 4;
+            uint d = q4_block * 32 + lane;
+            float value = float(value_scales[q4_block]) * float(int(nibble) - 8);
+            partials[partial_base + d] = partials[partial_base + d] * rescale[head]
+                + weight[head] * value;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+        uint slot = block * query_heads + head;
+        maxima[slot] = maximum[head];
+        sums[slot] = denominator[head];
     }
 }
 

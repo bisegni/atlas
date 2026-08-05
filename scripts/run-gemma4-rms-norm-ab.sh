@@ -6,6 +6,7 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
 
 baseline_env=ATLAS_GEMMA4_RMS_NORM_EXPERIMENT=baseline
+candidate_env=ATLAS_GEMMA4_RMS_NORM_EXPERIMENT=vec4
 runs=5
 promotion=true
 while (($#)); do
@@ -20,7 +21,7 @@ model_id=gemma4-e2b-q4_0
 fixture=models/gguf/gemma-4-e2b-it-q4_0/gemma-4-E2B_q4_0-it.gguf
 prompt='Explain why batching prompt tokens improves transformer prefill performance on a unified-memory GPU. Compare command scheduling, matrix projection reuse, causal attention, key-value cache updates, synchronization, and readback. Keep the answer concise and use one paragraph.'
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
-artifact_dir="artifacts/phase-12a-rms-norm-ab/${stamp}"
+artifact_dir="artifacts/phase-12.3-rms-norm-ab/${stamp}"
 mkdir -p "$artifact_dir"
 
 [[ -f "$fixture" ]] || { echo "missing Gemma fixture: $fixture" >&2; exit 2; }
@@ -35,19 +36,12 @@ run_mode() {
         [[ "$workload" == long ]] && { warmup=1024; measured=512; context=2048; }
         echo "Running ${runs} ${label} ${workload}-context Resident windows..."
         for run in $(seq 1 "$runs"); do
-            if [[ "$env_assignment" == "-" ]]; then
-                env -u ATLAS_GEMMA4_RMS_NORM_EXPERIMENT \
-                    -u ATLAS_GEMMA4_RMS_EPILOGUE_EXPERIMENT \
-                    -u ATLAS_GEMMA4_Q6_LM_HEAD_EXPERIMENT \
-                    -u ATLAS_GEMMA4_WEIGHT_FORMAT \
-                    cargo run --release -p atlas-cli -- benchmark --model "$model_id" --kv-cache-type q4_0 --prompt "$prompt" --warmup-decode-tokens "$warmup" --decode-tokens "$measured" --max-context "$context" > "$mode_dir/$workload-$run.json" 2> "$mode_dir/$workload-$run.log"
-            else
-                env -u ATLAS_GEMMA4_RMS_EPILOGUE_EXPERIMENT \
-                    -u ATLAS_GEMMA4_Q6_LM_HEAD_EXPERIMENT \
-                    -u ATLAS_GEMMA4_WEIGHT_FORMAT \
-                    "$env_assignment" \
-                    cargo run --release -p atlas-cli -- benchmark --model "$model_id" --kv-cache-type q4_0 --prompt "$prompt" --warmup-decode-tokens "$warmup" --decode-tokens "$measured" --max-context "$context" > "$mode_dir/$workload-$run.json" 2> "$mode_dir/$workload-$run.log"
-            fi
+            env -u ATLAS_GEMMA4_RMS_EPILOGUE_EXPERIMENT \
+                -u ATLAS_GEMMA4_Q6_LM_HEAD_EXPERIMENT \
+                -u ATLAS_GEMMA4_WEIGHT_FORMAT \
+                -u ATLAS_GEMMA4_PLE_COMPOSITION_EXPERIMENT \
+                "$env_assignment" \
+                cargo run --release -p atlas-cli -- benchmark --model "$model_id" --kv-cache-type q4_0 --prompt "$prompt" --warmup-decode-tokens "$warmup" --decode-tokens "$measured" --max-context "$context" > "$mode_dir/$workload-$run.json" 2> "$mode_dir/$workload-$run.log"
         done
         jq -s --arg workload "$workload" --argjson runs "$runs" '
           def median: sort | .[length / 2 | floor];
@@ -76,15 +70,15 @@ echo "Verifying pinned Gemma fixture..."
 cargo run --release -p atlas-cli -- model verify --model "$model_id" | tee "$artifact_dir/model-verify.json"
 shasum -a 256 "$fixture" | tee "$artifact_dir/fixture-sha256.txt"
 run_mode baseline "$baseline_env"
-run_mode candidate -
+run_mode candidate "$candidate_env"
 
-jq -n --arg baseline_env "$baseline_env" --argjson promotion "$promotion" \
+jq -n --arg baseline_env "$baseline_env" --arg candidate_env "$candidate_env" --argjson promotion "$promotion" \
   --slurpfile baseline_long "$artifact_dir/baseline/long-summary.json" \
   --slurpfile baseline_short "$artifact_dir/baseline/short-summary.json" \
   --slurpfile candidate_long "$artifact_dir/candidate/long-summary.json" \
   --slurpfile candidate_short "$artifact_dir/candidate/short-summary.json" '
     ($baseline_long[0]) as $base_long | ($baseline_short[0]) as $base_short | ($candidate_long[0]) as $candidate_long | ($candidate_short[0]) as $candidate_short
-    | {baseline_environment: $baseline_env, candidate_environment: "-", baseline: {long: $base_long, short: $base_short}, candidate: {long: $candidate_long, short: $candidate_short}, comparison: {
+    | {baseline_environment: $baseline_env, candidate_environment: $candidate_env, baseline: {long: $base_long, short: $base_short}, candidate: {long: $candidate_long, short: $candidate_short}, comparison: {
         exact_long: ($base_long.records[0].generated_token_sha256 == $candidate_long.records[0].generated_token_sha256 and $base_long.records[0].measured_generated_token_sha256 == $candidate_long.records[0].measured_generated_token_sha256 and $base_long.records[0].first_eos_position == $candidate_long.records[0].first_eos_position),
         exact_short: ($base_short.records[0].generated_token_sha256 == $candidate_short.records[0].generated_token_sha256 and $base_short.records[0].first_eos_position == $candidate_short.records[0].first_eos_position),
         stable_long_accounting: ($base_long.records[0].kv_cache_bytes == $candidate_long.records[0].kv_cache_bytes and $base_long.records[0].resident_bytes == $candidate_long.records[0].resident_bytes),

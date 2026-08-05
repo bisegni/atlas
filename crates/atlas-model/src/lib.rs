@@ -611,6 +611,66 @@ struct Gemma4ResidentWeights {
     buffers: HashMap<String, GpuBuffer>,
     formats: HashMap<String, GgufTensorType>,
     ffn_down_interleaved: Option<bool>,
+    q4_packed16_layout: Option<Gemma4Q4Packed16Layout>,
+}
+
+/// Decode-only Q4_0 resident layouts that reorder complete 16-row tiles.
+/// The records themselves remain byte-for-byte identical, preserving scales,
+/// nibble order, and the arithmetic contract of the matching Metal kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Gemma4Q4Packed16Layout {
+    ffn_down: bool,
+    ple_projection: bool,
+}
+
+impl Gemma4Q4Packed16Layout {
+    const BASELINE: Self = Self {
+        ffn_down: false,
+        ple_projection: false,
+    };
+
+    fn name(self) -> &'static str {
+        match (self.ffn_down, self.ple_projection) {
+            (false, false) => "baseline",
+            (true, false) => "ffn_down",
+            (false, true) => "ple",
+            (true, true) => "ffn_down_ple",
+        }
+    }
+}
+
+fn gemma4_q4_packed16_layout_for(experiment: Option<&str>) -> Gemma4Q4Packed16Layout {
+    match experiment {
+        Some("ffn_down") => Gemma4Q4Packed16Layout {
+            ffn_down: true,
+            ple_projection: false,
+        },
+        Some("ple") => Gemma4Q4Packed16Layout {
+            ffn_down: false,
+            ple_projection: true,
+        },
+        Some("ffn_down_ple") => Gemma4Q4Packed16Layout {
+            ffn_down: true,
+            ple_projection: true,
+        },
+        _ => Gemma4Q4Packed16Layout::BASELINE,
+    }
+}
+
+fn gemma4_q4_packed16_layout() -> Gemma4Q4Packed16Layout {
+    gemma4_q4_packed16_layout_for(
+        std::env::var("ATLAS_GEMMA4_Q4_PACKED16_EXPERIMENT")
+            .ok()
+            .as_deref(),
+    )
+}
+
+pub(crate) fn gemma4_q4_packed16_ffn_down_enabled() -> bool {
+    gemma4_q4_packed16_layout().ffn_down
+}
+
+pub(crate) fn gemma4_q4_packed16_ple_projection_enabled() -> bool {
+    gemma4_q4_packed16_layout().ple_projection
 }
 
 pub(crate) fn gemma4_ffn_down_interleaved_enabled_for(experiment: Option<&str>) -> bool {
@@ -629,23 +689,27 @@ fn gemma4_is_ffn_down_weight(name: &str) -> bool {
     name.starts_with("blk.") && name.ends_with(".ffn_down.weight")
 }
 
+fn gemma4_is_ple_projection_weight(name: &str) -> bool {
+    name.starts_with("blk.") && name.ends_with(".per_layer_embedding.proj.weight")
+}
+
 /// Reorders Q4_0 records from row-major `[row][block]` to
 /// `[16-row tile][block][row in tile]`. The record bytes themselves are never
 /// changed, so Q4 scales, nibble order, and per-row block order stay exact.
-pub(crate) fn gemma4_interleave_ffn_down_q4_0(bytes: &[u8], input_width: usize) -> Result<Vec<u8>> {
+pub(crate) fn gemma4_pack_q4_0_16row(bytes: &[u8], input_width: usize) -> Result<Vec<u8>> {
     const BLOCK_WIDTH: usize = 32;
     const BLOCK_BYTES: usize = 18;
     ensure!(
         input_width > 0 && input_width.is_multiple_of(BLOCK_WIDTH),
-        "Gemma FFN-down Q4_0 input width must be non-zero and block aligned"
+        "Gemma packed Q4_0 input width must be non-zero and block aligned"
     );
     let blocks = input_width / BLOCK_WIDTH;
     let row_bytes = blocks
         .checked_mul(BLOCK_BYTES)
-        .context("Gemma FFN-down Q4_0 row size overflows")?;
+        .context("Gemma packed Q4_0 row size overflows")?;
     ensure!(
         bytes.len().is_multiple_of(row_bytes),
-        "Gemma FFN-down Q4_0 bytes do not contain complete rows"
+        "Gemma packed Q4_0 bytes do not contain complete rows"
     );
     let rows = bytes.len() / row_bytes;
     let mut interleaved = vec![0u8; bytes.len()];
@@ -653,7 +717,7 @@ pub(crate) fn gemma4_interleave_ffn_down_q4_0(bytes: &[u8], input_width: usize) 
         let tile_rows = (rows - tile_start).min(16);
         let tile_offset = tile_start
             .checked_mul(row_bytes)
-            .context("Gemma FFN-down Q4_0 tile offset overflows")?;
+            .context("Gemma packed Q4_0 tile offset overflows")?;
         for block in 0..blocks {
             for row_in_tile in 0..tile_rows {
                 let source = (tile_start + row_in_tile) * row_bytes + block * BLOCK_BYTES;
@@ -777,6 +841,12 @@ impl Gemma4E2bModel {
             .lock()
             .expect("Gemma resident weight lock");
         let ffn_down_interleaved = gemma4_ffn_down_interleaved_enabled();
+        let q4_packed16_layout = gemma4_q4_packed16_layout();
+        ensure!(
+            !(ffn_down_interleaved && q4_packed16_layout.ffn_down),
+            "ATLAS_GEMMA4_FFN_DOWN_EXPERIMENT=interleaved16 conflicts with ATLAS_GEMMA4_Q4_PACKED16_EXPERIMENT={}; choose one FFN-down layout",
+            q4_packed16_layout.name(),
+        );
         if let Some(existing) = resident.ffn_down_interleaved {
             ensure!(
                 existing == ffn_down_interleaved,
@@ -784,6 +854,14 @@ impl Gemma4E2bModel {
             );
         } else {
             resident.ffn_down_interleaved = Some(ffn_down_interleaved);
+        }
+        if let Some(existing) = resident.q4_packed16_layout {
+            ensure!(
+                existing == q4_packed16_layout,
+                "Gemma Resident Q4 packed16 layout is already initialized; create a new model before changing ATLAS_GEMMA4_Q4_PACKED16_EXPERIMENT"
+            );
+        } else {
+            resident.q4_packed16_layout = Some(q4_packed16_layout);
         }
         let mut uploaded = 0u64;
         for tensor in &self.gguf.tensors {
@@ -808,9 +886,13 @@ impl Gemma4E2bModel {
             let interleaved_ffn_down = ffn_down_interleaved
                 && tensor.tensor_type == GgufTensorType::Q4_0
                 && gemma4_is_ffn_down_weight(&tensor.name);
-            let buffer = if interleaved_ffn_down {
+            let packed16 = tensor.tensor_type == GgufTensorType::Q4_0
+                && ((q4_packed16_layout.ffn_down && gemma4_is_ffn_down_weight(&tensor.name))
+                    || (q4_packed16_layout.ple_projection
+                        && gemma4_is_ple_projection_weight(&tensor.name)));
+            let buffer = if interleaved_ffn_down || packed16 {
                 let input_width = tensor.dims.first().copied().unwrap_or_default();
-                let packed = gemma4_interleave_ffn_down_q4_0(bytes, input_width)?;
+                let packed = gemma4_pack_q4_0_16row(bytes, input_width)?;
                 self.runtime().upload_bytes(&packed)?
             } else {
                 self.runtime().upload_bytes(bytes)?
@@ -1568,7 +1650,9 @@ fn scatter_head(
 
 #[cfg(test)]
 mod gemma_q6_validation_tests {
-    use super::{gemma4_interleave_ffn_down_q4_0, validate_gemma_q6_k_scales};
+    use super::{
+        gemma4_pack_q4_0_16row, gemma4_q4_packed16_layout_for, validate_gemma_q6_k_scales,
+    };
     use atlas_core::{GgufTensor, GgufTensorType};
 
     #[test]
@@ -1605,7 +1689,7 @@ mod gemma_q6_validation_tests {
             }
         }
 
-        let packed = gemma4_interleave_ffn_down_q4_0(&row_major, input_width).unwrap();
+        let packed = gemma4_pack_q4_0_16row(&row_major, input_width).unwrap();
         for row in 0..rows {
             let tile_start = row / 16 * 16;
             let tile_rows = (rows - tile_start).min(16);
@@ -1621,5 +1705,23 @@ mod gemma_q6_validation_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn packed16_layouts_are_explicit_and_default_off() {
+        let baseline = gemma4_q4_packed16_layout_for(None);
+        assert_eq!(baseline.name(), "baseline");
+        assert!(!baseline.ffn_down);
+        assert!(!baseline.ple_projection);
+
+        let ffn_down_ple = gemma4_q4_packed16_layout_for(Some("ffn_down_ple"));
+        assert_eq!(ffn_down_ple.name(), "ffn_down_ple");
+        assert!(ffn_down_ple.ffn_down);
+        assert!(ffn_down_ple.ple_projection);
+
+        assert_eq!(
+            gemma4_q4_packed16_layout_for(Some("unknown")).name(),
+            "baseline"
+        );
     }
 }

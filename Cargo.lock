@@ -31,6 +31,7 @@ dependencies = [
  "atlas-core",
  "atlas-metal",
  "atlas-model",
+ "atlas-profiler",
  "keyring",
  "ratatui",
  "rpassword",
@@ -56,6 +57,7 @@ dependencies = [
  "objc2-core-graphics",
  "objc2-foundation",
  "objc2-metal",
+ "serde",
  "thiserror 2.0.19",
 ]
 
@@ -81,6 +83,14 @@ dependencies = [
  "atlas-metal",
  "serde_json",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "atlas-profiler"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

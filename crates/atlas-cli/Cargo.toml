@@ -10,6 +10,7 @@ anyhow.workspace = true
 atlas-core = { path = "../atlas-core" }
 atlas-metal = { path = "../atlas-metal" }
 atlas-model = { path = "../atlas-model" }
+atlas-profiler = { path = "../atlas-profiler" }
 serde_json.workspace = true
 sha2.workspace = true
 ureq.workspace = true

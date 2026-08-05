@@ -21,7 +21,7 @@ model_id=gemma4-e2b-q4_0
 fixture=models/gguf/gemma-4-e2b-it-q4_0/gemma-4-E2B_q4_0-it.gguf
 prompt='Explain why batching prompt tokens improves transformer prefill performance on a unified-memory GPU. Compare command scheduling, matrix projection reuse, causal attention, key-value cache updates, synchronization, and readback. Keep the answer concise and use one paragraph.'
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
-artifact_dir="artifacts/phase-12a-q4-ffn-down-ab/${stamp}"
+artifact_dir="artifacts/phase-12.3-q4-ffn-down-ab/${stamp}"
 mkdir -p "$artifact_dir"
 
 [[ -f "$fixture" ]] || { echo "missing Gemma fixture: $fixture" >&2; exit 2; }
@@ -37,12 +37,14 @@ run_mode() {
         echo "Running ${runs} ${label} ${workload}-context Resident windows..."
         for run in $(seq 1 "$runs"); do
             if ! env -u ATLAS_GEMMA4_Q4_MATVEC_EXPERIMENT \
+                -u ATLAS_GEMMA4_Q4_PACKED16_EXPERIMENT \
                 -u ATLAS_GEMMA4_Q4_ATTENTION_EXPERIMENT \
                 -u ATLAS_GEMMA4_RMS_EPILOGUE_EXPERIMENT \
                 -u ATLAS_GEMMA4_RMS_NORM_EXPERIMENT \
                 -u ATLAS_GEMMA4_Q6_LM_HEAD_EXPERIMENT \
                 -u ATLAS_GEMMA4_WEIGHT_FORMAT \
                 -u ATLAS_GEMMA4_FFN_GATE_UP_EXPERIMENT \
+                -u ATLAS_GEMMA4_PLE_COMPOSITION_EXPERIMENT \
                 "$env_assignment" \
                 cargo run --release -p atlas-cli -- benchmark --model "$model_id" --kv-cache-type q4_0 --prompt "$prompt" --warmup-decode-tokens "$warmup" --decode-tokens "$measured" --max-context "$context" > "$mode_dir/$workload-$run.json" 2> "$mode_dir/$workload-$run.log"; then
                 echo "${label} ${workload} run ${run} failed; log follows:" >&2

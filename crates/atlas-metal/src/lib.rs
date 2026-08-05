@@ -24,8 +24,9 @@ mod macos {
     use objc2_metal::{
         MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
         MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary,
-        MTLResourceOptions, MTLSize,
+        MTLCounter, MTLCounterSamplingPoint, MTLCounterSet, MTLResourceOptions, MTLSize,
     };
+    use serde::Serialize;
     use thiserror::Error;
 
     #[link(name = "CoreGraphics", kind = "framework")]
@@ -57,12 +58,128 @@ mod macos {
         pub registry_id: u64,
     }
 
+    /// Static diagnostic data. It is collected outside production command
+    /// timing and contains no throughput claim.
+    #[derive(Debug, Clone, Serialize)]
+    pub struct DiagnosticCounterMetadata {
+        pub device_name: String,
+        pub dispatch_boundary_sampling_supported: bool,
+        pub available_counter_names: Vec<String>,
+        pub pipelines: Vec<PipelineMetadata>,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    pub struct PipelineMetadata {
+        pub kernel_name: String,
+        pub thread_execution_width: u64,
+        pub max_total_threads_per_threadgroup: u64,
+        pub static_threadgroup_memory_bytes: u64,
+    }
+
     #[derive(Debug, Clone, Copy)]
     pub struct DispatchTiming {
         pub wall_time: Duration,
         /// CPU time spent submitting the completed command buffer to Metal.
         pub command_buffer_schedule: Duration,
         pub gpu_time: Option<Duration>,
+        pub gpu_idle_gap: Option<Duration>,
+    }
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct RuntimeTelemetry {
+        pub command_buffers: u64,
+        pub dispatches: u64,
+        pub threadgroups_dispatched: u64,
+        pub threads_dispatched: u64,
+        pub timed_dispatches: u64,
+        pub gpu_execution_nanos: u64,
+        pub cpu_wait_nanos: u64,
+        pub command_buffer_idle_gap_nanos: u64,
+        pub command_buffer_schedule_nanos: u64,
+        pub upload_bytes: u64,
+        pub readback_bytes: u64,
+        pub upload_time_nanos: u64,
+        pub readback_time_nanos: u64,
+        pub buffer_allocations: u64,
+        pub resident_bytes: u64,
+        pub peak_resident_bytes: u64,
+        pub pipeline_count: u64,
+    }
+
+    impl RuntimeTelemetry {
+        pub fn saturating_add(self, other: Self) -> Self {
+            Self {
+                command_buffers: self.command_buffers.saturating_add(other.command_buffers),
+                dispatches: self.dispatches.saturating_add(other.dispatches),
+                threadgroups_dispatched: self
+                    .threadgroups_dispatched
+                    .saturating_add(other.threadgroups_dispatched),
+                threads_dispatched: self
+                    .threads_dispatched
+                    .saturating_add(other.threads_dispatched),
+                timed_dispatches: self.timed_dispatches.saturating_add(other.timed_dispatches),
+                gpu_execution_nanos: self
+                    .gpu_execution_nanos
+                    .saturating_add(other.gpu_execution_nanos),
+                cpu_wait_nanos: self.cpu_wait_nanos.saturating_add(other.cpu_wait_nanos),
+                command_buffer_idle_gap_nanos: self
+                    .command_buffer_idle_gap_nanos
+                    .saturating_add(other.command_buffer_idle_gap_nanos),
+                command_buffer_schedule_nanos: self
+                    .command_buffer_schedule_nanos
+                    .saturating_add(other.command_buffer_schedule_nanos),
+                upload_bytes: self.upload_bytes.saturating_add(other.upload_bytes),
+                readback_bytes: self.readback_bytes.saturating_add(other.readback_bytes),
+                upload_time_nanos: self.upload_time_nanos.saturating_add(other.upload_time_nanos),
+                readback_time_nanos: self.readback_time_nanos.saturating_add(other.readback_time_nanos),
+                buffer_allocations: self
+                    .buffer_allocations
+                    .saturating_add(other.buffer_allocations),
+                resident_bytes: self.resident_bytes.saturating_add(other.resident_bytes),
+                peak_resident_bytes: self.peak_resident_bytes.max(other.peak_resident_bytes),
+                pipeline_count: self.pipeline_count.max(other.pipeline_count),
+            }
+        }
+
+        pub fn delta_from(self, baseline: Self) -> Self {
+            Self {
+                command_buffers: self
+                    .command_buffers
+                    .saturating_sub(baseline.command_buffers),
+                dispatches: self.dispatches.saturating_sub(baseline.dispatches),
+                threadgroups_dispatched: self
+                    .threadgroups_dispatched
+                    .saturating_sub(baseline.threadgroups_dispatched),
+                threads_dispatched: self
+                    .threads_dispatched
+                    .saturating_sub(baseline.threads_dispatched),
+                timed_dispatches: self
+                    .timed_dispatches
+                    .saturating_sub(baseline.timed_dispatches),
+                gpu_execution_nanos: self
+                    .gpu_execution_nanos
+                    .saturating_sub(baseline.gpu_execution_nanos),
+                cpu_wait_nanos: self.cpu_wait_nanos.saturating_sub(baseline.cpu_wait_nanos),
+                command_buffer_idle_gap_nanos: self
+                    .command_buffer_idle_gap_nanos
+                    .saturating_sub(baseline.command_buffer_idle_gap_nanos),
+                command_buffer_schedule_nanos: self
+                    .command_buffer_schedule_nanos
+                    .saturating_sub(baseline.command_buffer_schedule_nanos),
+                upload_bytes: self.upload_bytes.saturating_sub(baseline.upload_bytes),
+                readback_bytes: self.readback_bytes.saturating_sub(baseline.readback_bytes),
+                upload_time_nanos: self.upload_time_nanos.saturating_sub(baseline.upload_time_nanos),
+                readback_time_nanos: self.readback_time_nanos.saturating_sub(baseline.readback_time_nanos),
+                buffer_allocations: self
+                    .buffer_allocations
+                    .saturating_sub(baseline.buffer_allocations),
+                resident_bytes: self.resident_bytes.saturating_sub(baseline.resident_bytes),
+                // Peak resident memory is an absolute high-water mark. It
+                // cannot be reconstructed by subtracting a phase baseline.
+                peak_resident_bytes: self.peak_resident_bytes,
+                pipeline_count: self.pipeline_count,
+            }
+        }
     }
 
     /// Exact timing for one resident kernel dispatch. Present only for the
@@ -71,12 +188,20 @@ mod macos {
     #[derive(Debug, Clone)]
     pub struct ResidentKernelTiming {
         pub kernel: &'static str,
+        pub layer_index: Option<u32>,
+        pub command_buffer_id: Option<u64>,
         /// Optional executor-supplied semantic label for diagnostic profiles.
         /// This never changes the compiled pipeline selected by `kernel`.
         pub profiling_label: Option<&'static str>,
         pub threads: usize,
         pub threadgroups: usize,
         pub threads_per_threadgroup: usize,
+        /// Conservative traffic estimate for the bound buffer spans. The
+        /// estimate is intentionally separate from Metal bandwidth counters:
+        /// it is useful for ranking memory-heavy kernels, not for claiming
+        /// physical DRAM traffic.
+        pub bytes_read_estimate: u64,
+        pub bytes_written_estimate: u64,
         pub cpu_encode: Duration,
         pub timing: DispatchTiming,
     }
@@ -113,9 +238,15 @@ mod macos {
         encoder: Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
         exact_per_dispatch: bool,
         kernel_timings: Vec<ResidentKernelTiming>,
+        layer_index: Option<u32>,
+        previous_gpu_end: Option<f64>,
     }
 
     impl<'a> ResidentCommand<'a> {
+        pub fn set_layer_index(&mut self, layer_index: Option<u32>) {
+            self.layer_index = layer_index;
+        }
+
         /// Dispatch a fixed number of workgroups.  Resident fused kernels use
         /// this when their synchronization scope is one logical output unit
         /// (for example, one attention head) rather than a flat element range.
@@ -181,6 +312,7 @@ mod macos {
                 0,
                 threadgroups,
                 threads_per_threadgroup,
+                Self::estimate_bound_bytes(buffers.iter().copied().map(|buffer| (buffer, 0))),
                 encode_started.elapsed(),
             )?;
             Ok(())
@@ -259,6 +391,9 @@ mod macos {
                 0,
                 threadgroups,
                 threads_per_threadgroup,
+                Self::estimate_bound_bytes(buffers.iter().map(|(buffer, offset)| {
+                    (*buffer, *offset)
+                })),
                 encode_started.elapsed(),
             )?;
             Ok(())
@@ -320,6 +455,7 @@ mod macos {
                 count,
                 0,
                 self.runtime.pipeline_thread_width(kernel),
+                Self::estimate_bound_bytes(buffers.iter().copied().map(|buffer| (buffer, 0))),
                 encode_started.elapsed(),
             )?;
             Ok(())
@@ -377,6 +513,9 @@ mod macos {
                 count,
                 0,
                 self.runtime.pipeline_thread_width(kernel),
+                Self::estimate_bound_bytes(buffers.iter().map(|(buffer, offset)| {
+                    (*buffer, *offset)
+                })),
                 encode_started.elapsed(),
             )?;
             Ok(())
@@ -389,18 +528,40 @@ mod macos {
             threads: usize,
             threadgroups: usize,
             threads_per_threadgroup: usize,
+            (bytes_read_estimate, bytes_written_estimate): (u64, u64),
             cpu_encode: Duration,
         ) -> Result<(), MetalError> {
+            self.runtime.dispatch_count.fetch_add(1, Ordering::Relaxed);
+            let effective_threadgroups = if threadgroups > 0 {
+                threadgroups
+            } else {
+                threads.div_ceil(threads_per_threadgroup.max(1))
+            };
+            let effective_threads = if threads > 0 {
+                threads
+            } else {
+                threadgroups.saturating_mul(threads_per_threadgroup)
+            };
+            self.runtime
+                .threadgroups_dispatched
+                .fetch_add(effective_threadgroups as u64, Ordering::Relaxed);
+            self.runtime
+                .threads_dispatched
+                .fetch_add(effective_threads as u64, Ordering::Relaxed);
             if !self.exact_per_dispatch {
                 return Ok(());
             }
             let timing = self.submit_current()?;
             self.kernel_timings.push(ResidentKernelTiming {
                 kernel,
+                layer_index: self.layer_index,
+                command_buffer_id: Some(self.runtime.command_buffer_count().saturating_sub(1)),
                 profiling_label,
-                threads,
-                threadgroups,
+                threads: effective_threads,
+                threadgroups: effective_threadgroups,
                 threads_per_threadgroup,
+                bytes_read_estimate,
+                bytes_written_estimate,
                 cpu_encode,
                 timing,
             });
@@ -410,6 +571,22 @@ mod macos {
                 .commandBuffer()
                 .ok_or(MetalError::CommandCreation)?;
             Ok(())
+        }
+
+        fn estimate_bound_bytes<'b, I>(buffers: I) -> (u64, u64)
+        where
+            I: Iterator<Item = (&'b GpuBuffer, usize)>,
+        {
+            let spans = buffers
+                .map(|(buffer, offset)| buffer.bytes.saturating_sub(offset) as u64)
+                .collect::<Vec<_>>();
+            let total = spans.iter().copied().sum::<u64>();
+            // Resident kernels conventionally bind input/weight/scalar
+            // buffers before their output buffer. Use the third binding as a
+            // conservative output estimate and document it as a bound-span
+            // estimate rather than an exact read/write count.
+            let written = spans.get(2).copied().unwrap_or_default();
+            (total.saturating_sub(written), written)
         }
 
         fn submit_current(&mut self) -> Result<DispatchTiming, MetalError> {
@@ -423,7 +600,16 @@ mod macos {
             let schedule_started = Instant::now();
             self.command_buffer.commit();
             let command_buffer_schedule = schedule_started.elapsed();
+            self.runtime.command_buffer_schedule_nanos.fetch_add(
+                command_buffer_schedule.as_nanos().min(u64::MAX as u128) as u64,
+                Ordering::Relaxed,
+            );
+            let wait_started = Instant::now();
             self.command_buffer.waitUntilCompleted();
+            self.runtime.cpu_wait_nanos.fetch_add(
+                wait_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                Ordering::Relaxed,
+            );
             let wall_time = started.elapsed();
             if self.command_buffer.status() == objc2_metal::MTLCommandBufferStatus::Error {
                 return Err(MetalError::CommandFailed(
@@ -437,16 +623,35 @@ mod macos {
             let gpu_end = self.command_buffer.GPUEndTime();
             let gpu_time = (gpu_end > gpu_start && gpu_start > 0.0)
                 .then(|| Duration::from_secs_f64(gpu_end - gpu_start));
+            let gpu_idle_gap = self.previous_gpu_end.and_then(|previous_end| {
+                (gpu_start > previous_end)
+                    .then(|| Duration::from_secs_f64(gpu_start - previous_end))
+            });
+            if let Some(gpu_idle_gap) = gpu_idle_gap {
+                self.runtime.command_buffer_idle_gap_nanos.fetch_add(
+                    gpu_idle_gap.as_nanos().min(u64::MAX as u128) as u64,
+                    Ordering::Relaxed,
+                );
+            }
+            if gpu_end > 0.0 {
+                self.previous_gpu_end = Some(gpu_end);
+            }
             if let Some(gpu_time) = gpu_time {
                 self.runtime.gpu_execution_nanos.fetch_add(
                     u64::try_from(gpu_time.as_nanos()).unwrap_or(u64::MAX),
                     Ordering::Relaxed,
                 );
             }
+            if self.exact_per_dispatch {
+                self.runtime
+                    .timed_dispatches
+                    .fetch_add(u64::from(gpu_time.is_some()), Ordering::Relaxed);
+            }
             Ok(DispatchTiming {
                 wall_time,
                 command_buffer_schedule,
                 gpu_time,
+                gpu_idle_gap,
             })
         }
 
@@ -462,6 +667,7 @@ mod macos {
                     wall_time: Duration::ZERO,
                     command_buffer_schedule: Duration::ZERO,
                     gpu_time: Some(Duration::ZERO),
+                    gpu_idle_gap: None,
                 });
             }
             self.submit_current()
@@ -601,8 +807,21 @@ mod macos {
         queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
         pipelines: HashMap<&'static str, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
         command_buffer_count: AtomicU64,
+        dispatch_count: AtomicU64,
+        threadgroups_dispatched: AtomicU64,
+        threads_dispatched: AtomicU64,
+        timed_dispatches: AtomicU64,
         gpu_execution_nanos: AtomicU64,
+        cpu_wait_nanos: AtomicU64,
+        command_buffer_idle_gap_nanos: AtomicU64,
+        command_buffer_schedule_nanos: AtomicU64,
+        upload_bytes: AtomicU64,
         readback_bytes: AtomicU64,
+        upload_time_nanos: AtomicU64,
+        readback_time_nanos: AtomicU64,
+        buffer_allocations: AtomicU64,
+        resident_bytes: AtomicU64,
+        peak_resident_bytes: AtomicU64,
     }
 
     impl MetalRuntime {
@@ -636,15 +855,18 @@ mod macos {
                 "matvec_q4_0_blocked",
                 "matvec_q4_0_16row",
                 "matvec_q4_0_16row_ffn_down_interleaved",
+                "matvec_q4_0_16row_packed16",
                 "matvec_q4_0_16row_shared_input",
                 "matvec_q4_0_16row_simdgroup_tiled",
                 "matmul_q4_0_qkv_16row",
                 "matmul_q4_0_qkv_16row_simdgroup_tiled",
                 "matmul_q4_0_gate_up_16row",
                 "matmul_q4_0_gate_up_16row_simdgroup_tiled",
+                "matmul_q4_0_gate_up_gelu_16row",
                 "matmul_q4_0_batch_16row",
                 "matmul_q4_0_batch_16row_simdgroup_tiled",
                 "matmul_q4_0_batch_16row_ffn_down_interleaved",
+                "matmul_q4_0_batch_16row_packed16",
                 "matmul_f16_batch",
                 "matvec_q8_0",
                 "embedding_lookup_q4_0",
@@ -656,6 +878,7 @@ mod macos {
                 "matmul_q6_k_batch_8row",
                 "matvec_f16",
                 "gelu_f32",
+                "ple_gelu_multiply_offset_f32",
                 "gelu_trace_f32",
                 "copy_f32",
                 "copy_u32",
@@ -695,6 +918,7 @@ mod macos {
                 "attention_decode_fused_gemma4_simd_q4_0_2pass_1_cacheopt",
                 "attention_decode_fused_gemma4_simd_q4_0_2pass_1_cacheopt_no_value_barrier",
                 "attention_decode_fused_gemma4_simd_q4_0_2pass_1_gqa",
+                "attention_decode_fused_gemma4_simd_q4_0_2pass_1_mqa_tiled",
                 "attention_decode_fused_gemma4_simd_q4_0_2pass_1_simd",
                 "attention_decode_fused_gemma4_simd_q4_0_2pass_2",
                 "attention_decode_fused_gemma4_simd_q4_0_32",
@@ -720,8 +944,21 @@ mod macos {
                 queue,
                 pipelines,
                 command_buffer_count: AtomicU64::new(0),
+                dispatch_count: AtomicU64::new(0),
+                threadgroups_dispatched: AtomicU64::new(0),
+                threads_dispatched: AtomicU64::new(0),
+                timed_dispatches: AtomicU64::new(0),
                 gpu_execution_nanos: AtomicU64::new(0),
+                cpu_wait_nanos: AtomicU64::new(0),
+                command_buffer_idle_gap_nanos: AtomicU64::new(0),
+                command_buffer_schedule_nanos: AtomicU64::new(0),
+                upload_bytes: AtomicU64::new(0),
                 readback_bytes: AtomicU64::new(0),
+                upload_time_nanos: AtomicU64::new(0),
+                readback_time_nanos: AtomicU64::new(0),
+                buffer_allocations: AtomicU64::new(0),
+                resident_bytes: AtomicU64::new(0),
+                peak_resident_bytes: AtomicU64::new(0),
             })
         }
 
@@ -729,6 +966,35 @@ mod macos {
             DeviceInfo {
                 name: self.device.name().to_string(),
                 registry_id: self.device.registryID(),
+            }
+        }
+
+        /// Capability and pipeline metadata for opt-in diagnostic profiling.
+        /// Counter samples themselves are deliberately not requested by normal
+        /// Resident commands, preserving their command-buffer boundaries.
+        pub fn diagnostic_counter_metadata(&self) -> DiagnosticCounterMetadata {
+            let mut available_counter_names = Vec::new();
+            if let Some(counter_sets) = self.device.counterSets() {
+                for counter_set in counter_sets.iter() {
+                    for counter in counter_set.counters().iter() {
+                        available_counter_names.push(counter.name().to_string());
+                    }
+                }
+            }
+            available_counter_names.sort();
+            available_counter_names.dedup();
+            let mut pipelines = self.pipelines.iter().map(|(name, pipeline)| PipelineMetadata {
+                kernel_name: (*name).into(),
+                thread_execution_width: pipeline.threadExecutionWidth() as u64,
+                max_total_threads_per_threadgroup: pipeline.maxTotalThreadsPerThreadgroup() as u64,
+                static_threadgroup_memory_bytes: pipeline.staticThreadgroupMemoryLength() as u64,
+            }).collect::<Vec<_>>();
+            pipelines.sort_by(|left, right| left.kernel_name.cmp(&right.kernel_name));
+            DiagnosticCounterMetadata {
+                device_name: self.device.name().to_string(),
+                dispatch_boundary_sampling_supported: self.device.supportsCounterSampling(MTLCounterSamplingPoint::AtDispatchBoundary),
+                available_counter_names,
+                pipelines,
             }
         }
 
@@ -807,6 +1073,7 @@ mod macos {
                 .ok_or_else(|| {
                     MetalError::InvalidInput("Metal could not allocate a shared buffer".into())
                 })?;
+            self.record_allocation(bytes);
             Ok(GpuBuffer {
                 _buffer: buffer,
                 bytes,
@@ -827,10 +1094,15 @@ mod macos {
                     "u32 readback buffer is too small".into(),
                 ));
             }
+            let started = Instant::now();
             let value =
                 unsafe { ptr::read_unaligned(buffer.native().contents().as_ptr().cast::<u32>()) };
             self.readback_bytes
                 .fetch_add(size_of::<u32>() as u64, Ordering::Relaxed);
+            self.readback_time_nanos.fetch_add(
+                started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                Ordering::Relaxed,
+            );
             Ok(value)
         }
 
@@ -866,6 +1138,8 @@ mod macos {
                 encoder: None,
                 exact_per_dispatch,
                 kernel_timings: Vec::new(),
+                layer_index: None,
+                previous_gpu_end: None,
             })
         }
 
@@ -882,6 +1156,59 @@ mod macos {
 
         pub fn readback_bytes(&self) -> u64 {
             self.readback_bytes.load(Ordering::Relaxed)
+        }
+
+        pub fn dispatch_count(&self) -> u64 {
+            self.dispatch_count.load(Ordering::Relaxed)
+        }
+        pub fn uploaded_bytes(&self) -> u64 {
+            self.upload_bytes.load(Ordering::Relaxed)
+        }
+        pub fn runtime_telemetry(&self) -> RuntimeTelemetry {
+            RuntimeTelemetry {
+                command_buffers: self.command_buffer_count(),
+                dispatches: self.dispatch_count(),
+                threadgroups_dispatched: self.threadgroups_dispatched.load(Ordering::Relaxed),
+                threads_dispatched: self.threads_dispatched.load(Ordering::Relaxed),
+                timed_dispatches: self.timed_dispatches.load(Ordering::Relaxed),
+                gpu_execution_nanos: self.gpu_execution_time().as_nanos().min(u64::MAX as u128)
+                    as u64,
+                cpu_wait_nanos: self.cpu_wait_nanos.load(Ordering::Relaxed),
+                command_buffer_idle_gap_nanos: self
+                    .command_buffer_idle_gap_nanos
+                    .load(Ordering::Relaxed),
+                command_buffer_schedule_nanos: self
+                    .command_buffer_schedule_nanos
+                    .load(Ordering::Relaxed),
+                upload_bytes: self.uploaded_bytes(),
+                readback_bytes: self.readback_bytes(),
+                upload_time_nanos: self.upload_time_nanos.load(Ordering::Relaxed),
+                readback_time_nanos: self.readback_time_nanos.load(Ordering::Relaxed),
+                buffer_allocations: self.buffer_allocations.load(Ordering::Relaxed),
+                resident_bytes: self.resident_bytes.load(Ordering::Relaxed),
+                peak_resident_bytes: self.peak_resident_bytes.load(Ordering::Relaxed),
+                pipeline_count: self.pipelines.len() as u64,
+            }
+        }
+
+        fn record_allocation(&self, bytes: usize) {
+            self.buffer_allocations.fetch_add(1, Ordering::Relaxed);
+            let current = self
+                .resident_bytes
+                .fetch_add(bytes as u64, Ordering::Relaxed)
+                .saturating_add(bytes as u64);
+            let mut peak = self.peak_resident_bytes.load(Ordering::Relaxed);
+            while current > peak {
+                match self.peak_resident_bytes.compare_exchange(
+                    peak,
+                    current,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(next) => peak = next,
+                }
+            }
         }
 
         pub fn vector_add(
@@ -1647,6 +1974,7 @@ mod macos {
                 .ok_or_else(|| {
                     MetalError::InvalidInput("Metal could not allocate a shared buffer".into())
                 })?;
+            self.record_allocation(bytes);
             unsafe {
                 ptr::copy_nonoverlapping(
                     values.as_ptr().cast::<u8>(),
@@ -1671,6 +1999,7 @@ mod macos {
                     "resident buffer is too small for write".into(),
                 ));
             }
+            let started = Instant::now();
             unsafe {
                 ptr::copy_nonoverlapping(
                     values.as_ptr().cast::<u8>(),
@@ -1678,6 +2007,11 @@ mod macos {
                     bytes,
                 );
             }
+            self.upload_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+            self.upload_time_nanos.fetch_add(
+                started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                Ordering::Relaxed,
+            );
             Ok(())
         }
 
@@ -1690,6 +2024,7 @@ mod macos {
                 .len()
                 .checked_mul(size_of::<T>())
                 .ok_or_else(|| MetalError::InvalidInput("buffer size overflow".into()))?;
+            let started = Instant::now();
             unsafe {
                 ptr::copy_nonoverlapping(
                     buffer.contents().as_ptr().cast::<u8>(),
@@ -1699,6 +2034,10 @@ mod macos {
             }
             self.readback_bytes
                 .fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+            self.readback_time_nanos.fetch_add(
+                started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                Ordering::Relaxed,
+            );
             Ok(())
         }
 
@@ -1767,6 +2106,15 @@ mod macos {
                 .queue
                 .commandBuffer()
                 .ok_or(MetalError::CommandCreation)?;
+            self.dispatch_count.fetch_add(1, Ordering::Relaxed);
+            let threadgroup_count = threads.width.div_ceil(threadgroup.width.max(1))
+                * threads.height.div_ceil(threadgroup.height.max(1))
+                * threads.depth.div_ceil(threadgroup.depth.max(1));
+            let thread_count = threads.width * threads.height * threads.depth;
+            self.threadgroups_dispatched
+                .fetch_add(threadgroup_count as u64, Ordering::Relaxed);
+            self.threads_dispatched
+                .fetch_add(thread_count as u64, Ordering::Relaxed);
             let encoder = command_buffer
                 .computeCommandEncoder()
                 .ok_or(MetalError::CommandCreation)?;
@@ -1788,7 +2136,12 @@ mod macos {
             let schedule_started = Instant::now();
             command_buffer.commit();
             let command_buffer_schedule = schedule_started.elapsed();
+            let wait_started = Instant::now();
             command_buffer.waitUntilCompleted();
+            self.cpu_wait_nanos.fetch_add(
+                wait_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                Ordering::Relaxed,
+            );
             let wall_time = start.elapsed();
             if command_buffer.status() == objc2_metal::MTLCommandBufferStatus::Error {
                 return Err(MetalError::CommandFailed(
@@ -1808,10 +2161,13 @@ mod macos {
                     Ordering::Relaxed,
                 );
             }
+            self.timed_dispatches
+                .fetch_add(u64::from(gpu_time.is_some()), Ordering::Relaxed);
             Ok(DispatchTiming {
                 wall_time,
                 command_buffer_schedule,
                 gpu_time,
+                gpu_idle_gap: None,
             })
         }
     }

@@ -10,6 +10,7 @@ atlas-core = { path = "../atlas-core" }
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString"] }
 objc2-metal = { version = "0.3", features = [
+    "MTLCounters",
     "MTLBuffer",
     "MTLCommandBuffer",
     "MTLCommandQueue",
@@ -19,6 +20,7 @@ objc2-metal = { version = "0.3", features = [
     "MTLLibrary",
     "MTLResource",
 ] }
+serde.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
