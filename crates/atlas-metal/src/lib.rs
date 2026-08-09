@@ -23,8 +23,8 @@ mod macos {
     use objc2_foundation::NSString;
     use objc2_metal::{
         MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-        MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary,
-        MTLCounter, MTLCounterSamplingPoint, MTLCounterSet, MTLResourceOptions, MTLSize,
+        MTLComputePipelineState, MTLCounter, MTLCounterSamplingPoint, MTLCounterSet,
+        MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
     };
     use serde::Serialize;
     use thiserror::Error;
@@ -132,8 +132,12 @@ mod macos {
                     .saturating_add(other.command_buffer_schedule_nanos),
                 upload_bytes: self.upload_bytes.saturating_add(other.upload_bytes),
                 readback_bytes: self.readback_bytes.saturating_add(other.readback_bytes),
-                upload_time_nanos: self.upload_time_nanos.saturating_add(other.upload_time_nanos),
-                readback_time_nanos: self.readback_time_nanos.saturating_add(other.readback_time_nanos),
+                upload_time_nanos: self
+                    .upload_time_nanos
+                    .saturating_add(other.upload_time_nanos),
+                readback_time_nanos: self
+                    .readback_time_nanos
+                    .saturating_add(other.readback_time_nanos),
                 buffer_allocations: self
                     .buffer_allocations
                     .saturating_add(other.buffer_allocations),
@@ -170,8 +174,12 @@ mod macos {
                     .saturating_sub(baseline.command_buffer_schedule_nanos),
                 upload_bytes: self.upload_bytes.saturating_sub(baseline.upload_bytes),
                 readback_bytes: self.readback_bytes.saturating_sub(baseline.readback_bytes),
-                upload_time_nanos: self.upload_time_nanos.saturating_sub(baseline.upload_time_nanos),
-                readback_time_nanos: self.readback_time_nanos.saturating_sub(baseline.readback_time_nanos),
+                upload_time_nanos: self
+                    .upload_time_nanos
+                    .saturating_sub(baseline.upload_time_nanos),
+                readback_time_nanos: self
+                    .readback_time_nanos
+                    .saturating_sub(baseline.readback_time_nanos),
                 buffer_allocations: self
                     .buffer_allocations
                     .saturating_sub(baseline.buffer_allocations),
@@ -393,9 +401,9 @@ mod macos {
                 0,
                 threadgroups,
                 threads_per_threadgroup,
-                Self::estimate_bound_bytes(buffers.iter().map(|(buffer, offset)| {
-                    (*buffer, *offset)
-                })),
+                Self::estimate_bound_bytes(
+                    buffers.iter().map(|(buffer, offset)| (*buffer, *offset)),
+                ),
                 encode_started.elapsed(),
             )?;
             Ok(())
@@ -515,9 +523,9 @@ mod macos {
                 count,
                 0,
                 self.runtime.pipeline_thread_width(kernel),
-                Self::estimate_bound_bytes(buffers.iter().map(|(buffer, offset)| {
-                    (*buffer, *offset)
-                })),
+                Self::estimate_bound_bytes(
+                    buffers.iter().map(|(buffer, offset)| (*buffer, *offset)),
+                ),
                 encode_started.elapsed(),
             )?;
             Ok(())
@@ -866,6 +874,7 @@ mod macos {
                 "matmul_q4_0_gate_up_16row_simdgroup_tiled",
                 "matmul_q4_0_gate_up_gelu_16row",
                 "matmul_q4_0_batch_16row",
+                "matmul_q4_0_batch_16row_token_tiled",
                 "matmul_q4_0_batch_16row_simdgroup_tiled",
                 "matmul_q4_0_batch_16row_ffn_down_interleaved",
                 "matmul_q4_0_batch_16row_packed16",
@@ -908,6 +917,9 @@ mod macos {
                 "kv_append_decode_f32",
                 "kv_append_decode_q8_0",
                 "kv_append_decode_q4_0",
+                "kv_append_decode_f32_vnorm",
+                "kv_append_decode_q8_0_vnorm",
+                "kv_append_decode_q4_0_vnorm",
                 "attention_decode_f32",
                 "attention_decode_fused_f32",
                 "attention_decode_fused_gemma4_f32",
@@ -941,9 +953,17 @@ mod macos {
                 "matmul_q4_0_gate_up_gelu_16row_inline_loads",
                 "matmul_q4_0_gate_up_gelu_16row_split_loops",
                 "matvec_q4_0_32row_mv",
+                "matvec_q4_0_32row_mv_rms",
                 "matmul_q4_0_qkv_32row_mv",
+                "matmul_q4_0_qkv_32row_mv_rms",
                 "matmul_q4_0_gate_up_32row_mv",
+                "matmul_q4_0_gate_up_32row_mv_rms",
                 "matvec_q6_k_32row_mv",
+                "matvec_q6_k_32row_mv_rms",
+                "matvec_q4_0_64row_mv",
+                "matvec_q4_0_64row_mv_rms",
+                "matvec_q6_k_64row_mv",
+                "matvec_q6_k_64row_mv_rms",
                 "attention_scores_resident_f32",
                 "masked_softmax_resident_f32",
                 "attention_values_resident_f32",
@@ -1006,16 +1026,24 @@ mod macos {
             }
             available_counter_names.sort();
             available_counter_names.dedup();
-            let mut pipelines = self.pipelines.iter().map(|(name, pipeline)| PipelineMetadata {
-                kernel_name: (*name).into(),
-                thread_execution_width: pipeline.threadExecutionWidth() as u64,
-                max_total_threads_per_threadgroup: pipeline.maxTotalThreadsPerThreadgroup() as u64,
-                static_threadgroup_memory_bytes: pipeline.staticThreadgroupMemoryLength() as u64,
-            }).collect::<Vec<_>>();
+            let mut pipelines = self
+                .pipelines
+                .iter()
+                .map(|(name, pipeline)| PipelineMetadata {
+                    kernel_name: (*name).into(),
+                    thread_execution_width: pipeline.threadExecutionWidth() as u64,
+                    max_total_threads_per_threadgroup: pipeline.maxTotalThreadsPerThreadgroup()
+                        as u64,
+                    static_threadgroup_memory_bytes: pipeline.staticThreadgroupMemoryLength()
+                        as u64,
+                })
+                .collect::<Vec<_>>();
             pipelines.sort_by(|left, right| left.kernel_name.cmp(&right.kernel_name));
             DiagnosticCounterMetadata {
                 device_name: self.device.name().to_string(),
-                dispatch_boundary_sampling_supported: self.device.supportsCounterSampling(MTLCounterSamplingPoint::AtDispatchBoundary),
+                dispatch_boundary_sampling_supported: self
+                    .device
+                    .supportsCounterSampling(MTLCounterSamplingPoint::AtDispatchBoundary),
                 available_counter_names,
                 pipelines,
             }

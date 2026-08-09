@@ -1,14 +1,16 @@
-//! Tolerance-based correctness check for the llama.cpp-style `_32row_mv` Q4_0
-//! and Q6_K matvec kernels against the proven 16-row/8-row kernels. The
-//! speed-first policy replaced the bitwise parity gate for Q4 matvec
-//! experiments, so this asserts a small max-absolute-difference (same contract
-//! as `attention_flash_correctness.rs`) instead of byte equality. Covers the
-//! Gemma4 E2B geometries plus partial-width rows (non-multiples of 32) that
-//! exercise the active-lane paths in both kernel families.
+//! Tolerance-based correctness check for the RMS-input `_rms` matvec variants
+//! against the standalone `rms_norm_decode_f32_vec4` + unfused mv_ext path.
+//! The fused kernels fold the RMS reduction into the matvec dispatch, so the
+//! reference is the production pipeline: normalize the raw input with the
+//! vec4 kernel, then run the plain 32-row mv_ext kernel on the normalized
+//! buffer. Asserting max-abs < 1e-3 (same contract as
+//! `matvec_mv_ext_parity.rs` and `attention_flash_correctness.rs`) proves the
+//! fusion is numerically equivalent without requiring bitwise stream parity.
 
 use atlas_metal::{MetalError, MetalRuntime};
 
 const THREADS: usize = 128;
+const EPSILON: f32 = 1e-6;
 
 fn next_u32(state: &mut u32) -> u32 {
     *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -22,6 +24,12 @@ fn next_f32(state: &mut u32) -> f32 {
 fn fill_f32(values: &mut [f32], state: &mut u32) {
     for value in values.iter_mut() {
         *value = (next_f32(state) - 0.5) * 2.0;
+    }
+}
+
+fn fill_rms_weight(values: &mut [f32], state: &mut u32) {
+    for value in values.iter_mut() {
+        *value = 0.5 + next_f32(state);
     }
 }
 
@@ -70,7 +78,7 @@ fn compare(label: &str, reference: &[f32], candidate: &[f32]) {
     eprintln!("{label}: max_abs={max_abs:.3e} mean_abs={mean_abs:.3e}");
     assert!(
         max_abs < 1e-3,
-        "{label}: mv_ext output diverges from the production kernel (max_abs={max_abs:.3e})"
+        "{label}: fused RMS matvec diverges from vec4+unfused (max_abs={max_abs:.3e})"
     );
 }
 
@@ -79,30 +87,48 @@ fn dispatch(
     kernel: &'static str,
     buffers: &[(&atlas_metal::GpuBuffer, usize)],
     groups: usize,
+    threads: usize,
 ) {
     let mut command = runtime.begin_resident_command().unwrap();
     command
-        .dispatch_threadgroups_1d_at(kernel, buffers, groups, THREADS)
+        .dispatch_threadgroups_1d_at(kernel, buffers, groups, threads)
         .unwrap();
     command.finish().unwrap();
 }
 
-/// Dispatch a 64-row-per-threadgroup kernel with its required 256 threads.
-fn dispatch_64(
+/// Normalize `input` with rms_weight + epsilon into `norm` using the
+/// production vec4 kernel (hidden multiple of 128) or the scalar fallback.
+fn normalize_reference(
     runtime: &MetalRuntime,
-    kernel: &'static str,
-    buffers: &[(&atlas_metal::GpuBuffer, usize)],
-    groups: usize,
+    input: &atlas_metal::GpuBuffer,
+    rms_weight: &atlas_metal::GpuBuffer,
+    norm: &atlas_metal::GpuBuffer,
+    hidden: u32,
 ) {
-    let mut command = runtime.begin_resident_command().unwrap();
-    command
-        .dispatch_threadgroups_1d_at(kernel, buffers, groups, 256)
-        .unwrap();
-    command.finish().unwrap();
+    let hidden_buf = runtime.upload_u32(&[hidden]).unwrap();
+    let eps_buf = runtime.upload_f32(&[EPSILON]).unwrap();
+    let kernel = if hidden % 128 == 0 {
+        "rms_norm_decode_f32_vec4"
+    } else {
+        "rms_norm_decode_f32"
+    };
+    dispatch(
+        runtime,
+        kernel,
+        &[
+            (input, 0),
+            (rms_weight, 0),
+            (norm, 0),
+            (&hidden_buf, 0),
+            (&eps_buf, 0),
+        ],
+        1,
+        32,
+    );
 }
 
 #[test]
-fn matvec_q4_32row_mv_matches_16row() {
+fn matvec_q4_32row_mv_rms_matches_vec4_plus_unfused() {
     let runtime = match MetalRuntime::new() {
         Ok(runtime) => runtime,
         Err(MetalError::NoDevice) => {
@@ -112,54 +138,68 @@ fn matvec_q4_32row_mv_matches_16row() {
         Err(error) => panic!("Metal runtime should initialize: {error}"),
     };
     let mut state = 0x9e37_79b9u32;
-    for input_width in [32u32, 256u32, 2048u32] {
+    for input_width in [256u32, 2048u32, 2304u32] {
         let blocks = (input_width / 32) as usize;
-        let input = vec![0.0f32; input_width as usize];
-        let mut input = input;
+        let mut input = vec![0.0f32; input_width as usize];
         fill_f32(&mut input, &mut state);
-        for output_width in [31u32, 33u32, 96u32, 129u32, 137u32] {
+        let mut rms_weight = vec![0.0f32; input_width as usize];
+        fill_rms_weight(&mut rms_weight, &mut state);
+        let input_buf = runtime.upload_f32(&input).unwrap();
+        let rms_weight_buf = runtime.upload_f32(&rms_weight).unwrap();
+        let input_width_buf = runtime.upload_u32(&[input_width]).unwrap();
+        let eps_buf = runtime.upload_f32(&[EPSILON]).unwrap();
+        for output_width in [31u32, 129u32, 137u32] {
             let rows = output_width as usize;
             let weights = build_q4_weights(rows, blocks, &mut state);
-            let output = vec![0.0f32; rows];
-            let output = output;
-
-            let input_buf = runtime.upload_f32(&input).unwrap();
             let weights_buf = runtime.upload_bytes(&weights).unwrap();
-            let out_buf = runtime.upload_f32(&output).unwrap();
-            let input_width_buf = runtime.upload_u32(&[input_width]).unwrap();
             let output_width_buf = runtime.upload_u32(&[output_width]).unwrap();
-            let groups = ((output_width + 15) / 16) as usize;
-            dispatch(
-                &runtime,
-                "matvec_q4_0_16row",
-                &[
-                    (&input_buf, 0),
-                    (&weights_buf, 0),
-                    (&out_buf, 0),
-                    (&input_width_buf, 0),
-                    (&output_width_buf, 0),
-                ],
-                groups,
-            );
-            let reference = runtime.read_f32(&out_buf, rows).unwrap();
 
-            let out_buf = runtime.upload_f32(&output).unwrap();
+            let norm_buf = runtime
+                .upload_f32(&vec![0.0f32; input_width as usize])
+                .unwrap();
+            normalize_reference(
+                &runtime,
+                &input_buf,
+                &rms_weight_buf,
+                &norm_buf,
+                input_width,
+            );
+            let out_buf = runtime.upload_f32(&vec![0.0f32; rows]).unwrap();
             let groups = ((output_width + 31) / 32) as usize;
             dispatch(
                 &runtime,
                 "matvec_q4_0_32row_mv",
                 &[
-                    (&input_buf, 0),
+                    (&norm_buf, 0),
                     (&weights_buf, 0),
                     (&out_buf, 0),
                     (&input_width_buf, 0),
                     (&output_width_buf, 0),
                 ],
                 groups,
+                THREADS,
+            );
+            let reference = runtime.read_f32(&out_buf, rows).unwrap();
+
+            let out_buf = runtime.upload_f32(&vec![0.0f32; rows]).unwrap();
+            dispatch(
+                &runtime,
+                "matvec_q4_0_32row_mv_rms",
+                &[
+                    (&input_buf, 0),
+                    (&weights_buf, 0),
+                    (&out_buf, 0),
+                    (&input_width_buf, 0),
+                    (&output_width_buf, 0),
+                    (&rms_weight_buf, 0),
+                    (&eps_buf, 0),
+                ],
+                groups,
+                THREADS,
             );
             let candidate = runtime.read_f32(&out_buf, rows).unwrap();
             compare(
-                &format!("matvec_q4 input={input_width} output={output_width}"),
+                &format!("matvec_q4_rms input={input_width} output={output_width}"),
                 &reference,
                 &candidate,
             );
@@ -168,7 +208,7 @@ fn matvec_q4_32row_mv_matches_16row() {
 }
 
 #[test]
-fn qkv_32row_mv_matches_16row() {
+fn qkv_32row_mv_rms_matches_vec4_plus_unfused() {
     let runtime = match MetalRuntime::new() {
         Ok(runtime) => runtime,
         Err(MetalError::NoDevice) => {
@@ -180,35 +220,46 @@ fn qkv_32row_mv_matches_16row() {
     let mut state = 0x3243_f6a8u32;
     let input_width = 2048u32;
     let blocks = (input_width / 32) as usize;
-    let input = vec![0.0f32; input_width as usize];
-    let mut input = input;
+    let mut input = vec![0.0f32; input_width as usize];
     fill_f32(&mut input, &mut state);
+    let mut rms_weight = vec![0.0f32; input_width as usize];
+    fill_rms_weight(&mut rms_weight, &mut state);
+    let input_buf = runtime.upload_f32(&input).unwrap();
+    let rms_weight_buf = runtime.upload_f32(&rms_weight).unwrap();
+    let input_width_buf = runtime.upload_u32(&[input_width]).unwrap();
+    let eps_buf = runtime.upload_f32(&[EPSILON]).unwrap();
+    let norm_buf = runtime
+        .upload_f32(&vec![0.0f32; input_width as usize])
+        .unwrap();
+    normalize_reference(
+        &runtime,
+        &input_buf,
+        &rms_weight_buf,
+        &norm_buf,
+        input_width,
+    );
     for (q_width, kv_width) in [(129u32, 33u32), (1024u32, 256u32), (2048u32, 512u32)] {
         let q_rows = q_width as usize;
         let kv_rows = kv_width as usize;
         let q_weights = build_q4_weights(q_rows, blocks, &mut state);
         let k_weights = build_q4_weights(kv_rows, blocks, &mut state);
         let v_weights = build_q4_weights(kv_rows, blocks, &mut state);
-        let zero = vec![0.0f32; q_rows.max(kv_rows)];
-
-        let input_buf = runtime.upload_f32(&input).unwrap();
         let q_weights_buf = runtime.upload_bytes(&q_weights).unwrap();
         let k_weights_buf = runtime.upload_bytes(&k_weights).unwrap();
         let v_weights_buf = runtime.upload_bytes(&v_weights).unwrap();
-        let input_width_buf = runtime.upload_u32(&[input_width]).unwrap();
         let q_width_buf = runtime.upload_u32(&[q_width]).unwrap();
         let kv_width_buf = runtime.upload_u32(&[kv_width]).unwrap();
+        let zero = vec![0.0f32; q_rows.max(kv_rows)];
 
-        let q_groups = ((q_width + 15) / 16) as usize;
-        let kv_groups = ((kv_width + 15) / 16) as usize;
         let q_out = runtime.upload_f32(&zero).unwrap();
         let k_out = runtime.upload_f32(&zero).unwrap();
         let v_out = runtime.upload_f32(&zero).unwrap();
+        let groups = ((q_width + 31) / 32 + 2 * ((kv_width + 31) / 32)) as usize;
         dispatch(
             &runtime,
-            "matmul_q4_0_qkv_16row",
+            "matmul_q4_0_qkv_32row_mv",
             &[
-                (&input_buf, 0),
+                (&norm_buf, 0),
                 (&q_weights_buf, 0),
                 (&k_weights_buf, 0),
                 (&v_weights_buf, 0),
@@ -219,20 +270,19 @@ fn qkv_32row_mv_matches_16row() {
                 (&q_width_buf, 0),
                 (&kv_width_buf, 0),
             ],
-            q_groups + 2 * kv_groups,
+            groups,
+            THREADS,
         );
         let ref_q = runtime.read_f32(&q_out, q_rows).unwrap();
         let ref_k = runtime.read_f32(&k_out, kv_rows).unwrap();
         let ref_v = runtime.read_f32(&v_out, kv_rows).unwrap();
 
-        let q_groups = ((q_width + 31) / 32) as usize;
-        let kv_groups = ((kv_width + 31) / 32) as usize;
         let q_out = runtime.upload_f32(&zero).unwrap();
         let k_out = runtime.upload_f32(&zero).unwrap();
         let v_out = runtime.upload_f32(&zero).unwrap();
         dispatch(
             &runtime,
-            "matmul_q4_0_qkv_32row_mv",
+            "matmul_q4_0_qkv_32row_mv_rms",
             &[
                 (&input_buf, 0),
                 (&q_weights_buf, 0),
@@ -244,13 +294,16 @@ fn qkv_32row_mv_matches_16row() {
                 (&input_width_buf, 0),
                 (&q_width_buf, 0),
                 (&kv_width_buf, 0),
+                (&rms_weight_buf, 0),
+                (&eps_buf, 0),
             ],
-            q_groups + 2 * kv_groups,
+            groups,
+            THREADS,
         );
         let cand_q = runtime.read_f32(&q_out, q_rows).unwrap();
         let cand_k = runtime.read_f32(&k_out, kv_rows).unwrap();
         let cand_v = runtime.read_f32(&v_out, kv_rows).unwrap();
-        let label = format!("qkv q={q_width} kv={kv_width}");
+        let label = format!("qkv_rms q={q_width} kv={kv_width}");
         compare(&format!("{label} q"), &ref_q, &cand_q);
         compare(&format!("{label} k"), &ref_k, &cand_k);
         compare(&format!("{label} v"), &ref_v, &cand_v);
@@ -258,7 +311,7 @@ fn qkv_32row_mv_matches_16row() {
 }
 
 #[test]
-fn gate_up_32row_mv_matches_16row() {
+fn gate_up_32row_mv_rms_matches_vec4_plus_unfused() {
     let runtime = match MetalRuntime::new() {
         Ok(runtime) => runtime,
         Err(MetalError::NoDevice) => {
@@ -270,40 +323,32 @@ fn gate_up_32row_mv_matches_16row() {
     let mut state = 0xbb67_ae85u32;
     let input_width = 2048u32;
     let blocks = (input_width / 32) as usize;
-    let input = vec![0.0f32; input_width as usize];
-    let mut input = input;
+    let mut input = vec![0.0f32; input_width as usize];
     fill_f32(&mut input, &mut state);
+    let mut rms_weight = vec![0.0f32; input_width as usize];
+    fill_rms_weight(&mut rms_weight, &mut state);
+    let input_buf = runtime.upload_f32(&input).unwrap();
+    let rms_weight_buf = runtime.upload_f32(&rms_weight).unwrap();
+    let input_width_buf = runtime.upload_u32(&[input_width]).unwrap();
+    let eps_buf = runtime.upload_f32(&[EPSILON]).unwrap();
+    let norm_buf = runtime
+        .upload_f32(&vec![0.0f32; input_width as usize])
+        .unwrap();
+    normalize_reference(
+        &runtime,
+        &input_buf,
+        &rms_weight_buf,
+        &norm_buf,
+        input_width,
+    );
     for output_width in [31u32, 129u32, 2048u32] {
         let rows = output_width as usize;
         let gate_weights = build_q4_weights(rows, blocks, &mut state);
         let up_weights = build_q4_weights(rows, blocks, &mut state);
-        let zero = vec![0.0f32; rows];
-
-        let input_buf = runtime.upload_f32(&input).unwrap();
         let gate_buf = runtime.upload_bytes(&gate_weights).unwrap();
         let up_buf = runtime.upload_bytes(&up_weights).unwrap();
-        let input_width_buf = runtime.upload_u32(&[input_width]).unwrap();
         let output_width_buf = runtime.upload_u32(&[output_width]).unwrap();
-
-        let gate_out = runtime.upload_f32(&zero).unwrap();
-        let up_out = runtime.upload_f32(&zero).unwrap();
-        let groups = 2 * ((output_width + 15) / 16) as usize;
-        dispatch(
-            &runtime,
-            "matmul_q4_0_gate_up_16row",
-            &[
-                (&input_buf, 0),
-                (&gate_buf, 0),
-                (&up_buf, 0),
-                (&gate_out, 0),
-                (&up_out, 0),
-                (&input_width_buf, 0),
-                (&output_width_buf, 0),
-            ],
-            groups,
-        );
-        let ref_gate = runtime.read_f32(&gate_out, rows).unwrap();
-        let ref_up = runtime.read_f32(&up_out, rows).unwrap();
+        let zero = vec![0.0f32; rows];
 
         let gate_out = runtime.upload_f32(&zero).unwrap();
         let up_out = runtime.upload_f32(&zero).unwrap();
@@ -312,7 +357,7 @@ fn gate_up_32row_mv_matches_16row() {
             &runtime,
             "matmul_q4_0_gate_up_32row_mv",
             &[
-                (&input_buf, 0),
+                (&norm_buf, 0),
                 (&gate_buf, 0),
                 (&up_buf, 0),
                 (&gate_out, 0),
@@ -321,149 +366,40 @@ fn gate_up_32row_mv_matches_16row() {
                 (&output_width_buf, 0),
             ],
             groups,
+            THREADS,
+        );
+        let ref_gate = runtime.read_f32(&gate_out, rows).unwrap();
+        let ref_up = runtime.read_f32(&up_out, rows).unwrap();
+
+        let gate_out = runtime.upload_f32(&zero).unwrap();
+        let up_out = runtime.upload_f32(&zero).unwrap();
+        dispatch(
+            &runtime,
+            "matmul_q4_0_gate_up_32row_mv_rms",
+            &[
+                (&input_buf, 0),
+                (&gate_buf, 0),
+                (&up_buf, 0),
+                (&gate_out, 0),
+                (&up_out, 0),
+                (&input_width_buf, 0),
+                (&output_width_buf, 0),
+                (&rms_weight_buf, 0),
+                (&eps_buf, 0),
+            ],
+            groups,
+            THREADS,
         );
         let cand_gate = runtime.read_f32(&gate_out, rows).unwrap();
         let cand_up = runtime.read_f32(&up_out, rows).unwrap();
-        let label = format!("gate_up output={output_width}");
+        let label = format!("gate_up_rms output={output_width}");
         compare(&format!("{label} gate"), &ref_gate, &cand_gate);
         compare(&format!("{label} up"), &ref_up, &cand_up);
     }
 }
 
 #[test]
-fn matvec_q4_64row_mv_matches_16row() {
-    let runtime = match MetalRuntime::new() {
-        Ok(runtime) => runtime,
-        Err(MetalError::NoDevice) => {
-            eprintln!("skipping: no Metal device is available to this process");
-            return;
-        }
-        Err(error) => panic!("Metal runtime should initialize: {error}"),
-    };
-    let mut state = 0x2718_2818u32;
-    for input_width in [32u32, 256u32, 2048u32] {
-        let blocks = (input_width / 32) as usize;
-        let input = vec![0.0f32; input_width as usize];
-        let mut input = input;
-        fill_f32(&mut input, &mut state);
-        for output_width in [31u32, 33u32, 96u32, 129u32, 137u32, 2048u32] {
-            let rows = output_width as usize;
-            let weights = build_q4_weights(rows, blocks, &mut state);
-            let output = vec![0.0f32; rows];
-            let output = output;
-
-            let input_buf = runtime.upload_f32(&input).unwrap();
-            let weights_buf = runtime.upload_bytes(&weights).unwrap();
-            let out_buf = runtime.upload_f32(&output).unwrap();
-            let input_width_buf = runtime.upload_u32(&[input_width]).unwrap();
-            let output_width_buf = runtime.upload_u32(&[output_width]).unwrap();
-            let groups = ((output_width + 15) / 16) as usize;
-            dispatch(
-                &runtime,
-                "matvec_q4_0_16row",
-                &[
-                    (&input_buf, 0),
-                    (&weights_buf, 0),
-                    (&out_buf, 0),
-                    (&input_width_buf, 0),
-                    (&output_width_buf, 0),
-                ],
-                groups,
-            );
-            let reference = runtime.read_f32(&out_buf, rows).unwrap();
-
-            let out_buf = runtime.upload_f32(&output).unwrap();
-            let groups = ((output_width + 63) / 64) as usize;
-            dispatch_64(
-                &runtime,
-                "matvec_q4_0_64row_mv",
-                &[
-                    (&input_buf, 0),
-                    (&weights_buf, 0),
-                    (&out_buf, 0),
-                    (&input_width_buf, 0),
-                    (&output_width_buf, 0),
-                ],
-                groups,
-            );
-            let candidate = runtime.read_f32(&out_buf, rows).unwrap();
-            compare(
-                &format!("matvec_q4_64row input={input_width} output={output_width}"),
-                &reference,
-                &candidate,
-            );
-        }
-    }
-}
-
-#[test]
-fn matvec_q6_64row_mv_matches_8row() {
-    let runtime = match MetalRuntime::new() {
-        Ok(runtime) => runtime,
-        Err(MetalError::NoDevice) => {
-            eprintln!("skipping: no Metal device is available to this process");
-            return;
-        }
-        Err(error) => panic!("Metal runtime should initialize: {error}"),
-    };
-    let mut state = 0x3141_5926u32;
-    for input_width in [256u32, 512u32, 2304u32] {
-        let blocks = (input_width / 256) as usize;
-        let input = vec![0.0f32; input_width as usize];
-        let mut input = input;
-        fill_f32(&mut input, &mut state);
-        for output_width in [17u32, 33u32, 64u32, 129u32, 2048u32] {
-            let rows = output_width as usize;
-            let weights = build_q6_weights(rows, blocks, &mut state);
-            let output = vec![0.0f32; rows];
-            let output = output;
-
-            let input_buf = runtime.upload_f32(&input).unwrap();
-            let weights_buf = runtime.upload_bytes(&weights).unwrap();
-            let out_buf = runtime.upload_f32(&output).unwrap();
-            let input_width_buf = runtime.upload_u32(&[input_width]).unwrap();
-            let output_width_buf = runtime.upload_u32(&[output_width]).unwrap();
-            let groups = ((output_width + 7) / 8) as usize;
-            dispatch(
-                &runtime,
-                "matvec_q6_k_8row",
-                &[
-                    (&input_buf, 0),
-                    (&weights_buf, 0),
-                    (&out_buf, 0),
-                    (&input_width_buf, 0),
-                    (&output_width_buf, 0),
-                ],
-                groups,
-            );
-            let reference = runtime.read_f32(&out_buf, rows).unwrap();
-
-            let out_buf = runtime.upload_f32(&output).unwrap();
-            let groups = ((output_width + 63) / 64) as usize;
-            dispatch_64(
-                &runtime,
-                "matvec_q6_k_64row_mv",
-                &[
-                    (&input_buf, 0),
-                    (&weights_buf, 0),
-                    (&out_buf, 0),
-                    (&input_width_buf, 0),
-                    (&output_width_buf, 0),
-                ],
-                groups,
-            );
-            let candidate = runtime.read_f32(&out_buf, rows).unwrap();
-            compare(
-                &format!("matvec_q6_64row input={input_width} output={output_width}"),
-                &reference,
-                &candidate,
-            );
-        }
-    }
-}
-
-#[test]
-fn matvec_q6_32row_mv_matches_8row() {
+fn matvec_q6_32row_mv_rms_matches_vec4_plus_unfused() {
     let runtime = match MetalRuntime::new() {
         Ok(runtime) => runtime,
         Err(MetalError::NoDevice) => {
@@ -475,63 +411,226 @@ fn matvec_q6_32row_mv_matches_8row() {
     let mut state = 0x3c6e_f372u32;
     for input_width in [256u32, 512u32] {
         let blocks = (input_width / 256) as usize;
-        let input = vec![0.0f32; input_width as usize];
-        let mut input = input;
+        let mut input = vec![0.0f32; input_width as usize];
         fill_f32(&mut input, &mut state);
-        for output_width in [17u32, 33u32, 64u32, 129u32] {
+        let mut rms_weight = vec![0.0f32; input_width as usize];
+        fill_rms_weight(&mut rms_weight, &mut state);
+        let input_buf = runtime.upload_f32(&input).unwrap();
+        let rms_weight_buf = runtime.upload_f32(&rms_weight).unwrap();
+        let input_width_buf = runtime.upload_u32(&[input_width]).unwrap();
+        let eps_buf = runtime.upload_f32(&[EPSILON]).unwrap();
+        let norm_buf = runtime
+            .upload_f32(&vec![0.0f32; input_width as usize])
+            .unwrap();
+        normalize_reference(
+            &runtime,
+            &input_buf,
+            &rms_weight_buf,
+            &norm_buf,
+            input_width,
+        );
+        for output_width in [33u32, 129u32, 2048u32] {
             let rows = output_width as usize;
             let weights = build_q6_weights(rows, blocks, &mut state);
-            let output = vec![0.0f32; rows];
-            let output = output;
-
-            let input_buf = runtime.upload_f32(&input).unwrap();
             let weights_buf = runtime.upload_bytes(&weights).unwrap();
-            let out_buf = runtime.upload_f32(&output).unwrap();
-            let input_width_buf = runtime.upload_u32(&[input_width]).unwrap();
             let output_width_buf = runtime.upload_u32(&[output_width]).unwrap();
-            let groups = ((output_width + 7) / 8) as usize;
-            dispatch(
-                &runtime,
-                "matvec_q6_k_8row",
-                &[
-                    (&input_buf, 0),
-                    (&weights_buf, 0),
-                    (&out_buf, 0),
-                    (&input_width_buf, 0),
-                    (&output_width_buf, 0),
-                ],
-                groups,
-            );
-            let reference = runtime.read_f32(&out_buf, rows).unwrap();
 
-            let out_buf = runtime.upload_f32(&output).unwrap();
+            let out_buf = runtime.upload_f32(&vec![0.0f32; rows]).unwrap();
             let groups = ((output_width + 31) / 32) as usize;
             dispatch(
                 &runtime,
                 "matvec_q6_k_32row_mv",
                 &[
-                    (&input_buf, 0),
+                    (&norm_buf, 0),
                     (&weights_buf, 0),
                     (&out_buf, 0),
                     (&input_width_buf, 0),
                     (&output_width_buf, 0),
                 ],
                 groups,
+                THREADS,
+            );
+            let reference = runtime.read_f32(&out_buf, rows).unwrap();
+
+            let out_buf = runtime.upload_f32(&vec![0.0f32; rows]).unwrap();
+            dispatch(
+                &runtime,
+                "matvec_q6_k_32row_mv_rms",
+                &[
+                    (&input_buf, 0),
+                    (&weights_buf, 0),
+                    (&out_buf, 0),
+                    (&input_width_buf, 0),
+                    (&output_width_buf, 0),
+                    (&rms_weight_buf, 0),
+                    (&eps_buf, 0),
+                ],
+                groups,
+                THREADS,
             );
             let candidate = runtime.read_f32(&out_buf, rows).unwrap();
-            for (r, (rv, cv)) in reference.iter().zip(candidate.iter()).enumerate() {
-                if rv.is_nan() || cv.is_nan() {
-                    eprintln!(
-                        "  row {r}: ref={} cand={} (ref_nan={} cand_nan={})",
-                        rv,
-                        cv,
-                        rv.is_nan(),
-                        cv.is_nan()
-                    );
-                }
-            }
             compare(
-                &format!("matvec_q6 input={input_width} output={output_width}"),
+                &format!("matvec_q6_rms input={input_width} output={output_width}"),
+                &reference,
+                &candidate,
+            );
+        }
+    }
+}
+
+#[test]
+fn matvec_q4_64row_mv_rms_matches_vec4_plus_unfused() {
+    let runtime = match MetalRuntime::new() {
+        Ok(runtime) => runtime,
+        Err(MetalError::NoDevice) => {
+            eprintln!("skipping: no Metal device is available to this process");
+            return;
+        }
+        Err(error) => panic!("Metal runtime should initialize: {error}"),
+    };
+    let mut state = 0x2718_2818u32;
+    for input_width in [256u32, 2048u32, 2304u32] {
+        let blocks = (input_width / 32) as usize;
+        let mut input = vec![0.0f32; input_width as usize];
+        fill_f32(&mut input, &mut state);
+        let mut rms_weight = vec![0.0f32; input_width as usize];
+        fill_rms_weight(&mut rms_weight, &mut state);
+        let input_buf = runtime.upload_f32(&input).unwrap();
+        let rms_weight_buf = runtime.upload_f32(&rms_weight).unwrap();
+        let input_width_buf = runtime.upload_u32(&[input_width]).unwrap();
+        let eps_buf = runtime.upload_f32(&[EPSILON]).unwrap();
+        let norm_buf = runtime
+            .upload_f32(&vec![0.0f32; input_width as usize])
+            .unwrap();
+        normalize_reference(
+            &runtime,
+            &input_buf,
+            &rms_weight_buf,
+            &norm_buf,
+            input_width,
+        );
+        for output_width in [31u32, 129u32, 137u32, 2048u32] {
+            let rows = output_width as usize;
+            let weights = build_q4_weights(rows, blocks, &mut state);
+            let weights_buf = runtime.upload_bytes(&weights).unwrap();
+            let output_width_buf = runtime.upload_u32(&[output_width]).unwrap();
+
+            let out_buf = runtime.upload_f32(&vec![0.0f32; rows]).unwrap();
+            let groups = ((output_width + 63) / 64) as usize;
+            dispatch(
+                &runtime,
+                "matvec_q4_0_64row_mv",
+                &[
+                    (&norm_buf, 0),
+                    (&weights_buf, 0),
+                    (&out_buf, 0),
+                    (&input_width_buf, 0),
+                    (&output_width_buf, 0),
+                ],
+                groups,
+                256,
+            );
+            let reference = runtime.read_f32(&out_buf, rows).unwrap();
+
+            let out_buf = runtime.upload_f32(&vec![0.0f32; rows]).unwrap();
+            dispatch(
+                &runtime,
+                "matvec_q4_0_64row_mv_rms",
+                &[
+                    (&input_buf, 0),
+                    (&weights_buf, 0),
+                    (&out_buf, 0),
+                    (&input_width_buf, 0),
+                    (&output_width_buf, 0),
+                    (&rms_weight_buf, 0),
+                    (&eps_buf, 0),
+                ],
+                groups,
+                256,
+            );
+            let candidate = runtime.read_f32(&out_buf, rows).unwrap();
+            compare(
+                &format!("matvec_q4_64row_rms input={input_width} output={output_width}"),
+                &reference,
+                &candidate,
+            );
+        }
+    }
+}
+
+#[test]
+fn matvec_q6_64row_mv_rms_matches_vec4_plus_unfused() {
+    let runtime = match MetalRuntime::new() {
+        Ok(runtime) => runtime,
+        Err(MetalError::NoDevice) => {
+            eprintln!("skipping: no Metal device is available to this process");
+            return;
+        }
+        Err(error) => panic!("Metal runtime should initialize: {error}"),
+    };
+    let mut state = 0x3141_5926u32;
+    for input_width in [256u32, 512u32, 2304u32] {
+        let blocks = (input_width / 256) as usize;
+        let mut input = vec![0.0f32; input_width as usize];
+        fill_f32(&mut input, &mut state);
+        let mut rms_weight = vec![0.0f32; input_width as usize];
+        fill_rms_weight(&mut rms_weight, &mut state);
+        let input_buf = runtime.upload_f32(&input).unwrap();
+        let rms_weight_buf = runtime.upload_f32(&rms_weight).unwrap();
+        let input_width_buf = runtime.upload_u32(&[input_width]).unwrap();
+        let eps_buf = runtime.upload_f32(&[EPSILON]).unwrap();
+        let norm_buf = runtime
+            .upload_f32(&vec![0.0f32; input_width as usize])
+            .unwrap();
+        normalize_reference(
+            &runtime,
+            &input_buf,
+            &rms_weight_buf,
+            &norm_buf,
+            input_width,
+        );
+        for output_width in [17u32, 33u32, 129u32, 2048u32] {
+            let rows = output_width as usize;
+            let weights = build_q6_weights(rows, blocks, &mut state);
+            let weights_buf = runtime.upload_bytes(&weights).unwrap();
+            let output_width_buf = runtime.upload_u32(&[output_width]).unwrap();
+
+            let out_buf = runtime.upload_f32(&vec![0.0f32; rows]).unwrap();
+            let groups = ((output_width + 63) / 64) as usize;
+            dispatch(
+                &runtime,
+                "matvec_q6_k_64row_mv",
+                &[
+                    (&norm_buf, 0),
+                    (&weights_buf, 0),
+                    (&out_buf, 0),
+                    (&input_width_buf, 0),
+                    (&output_width_buf, 0),
+                ],
+                groups,
+                256,
+            );
+            let reference = runtime.read_f32(&out_buf, rows).unwrap();
+
+            let out_buf = runtime.upload_f32(&vec![0.0f32; rows]).unwrap();
+            dispatch(
+                &runtime,
+                "matvec_q6_k_64row_mv_rms",
+                &[
+                    (&input_buf, 0),
+                    (&weights_buf, 0),
+                    (&out_buf, 0),
+                    (&input_width_buf, 0),
+                    (&output_width_buf, 0),
+                    (&rms_weight_buf, 0),
+                    (&eps_buf, 0),
+                ],
+                groups,
+                256,
+            );
+            let candidate = runtime.read_f32(&out_buf, rows).unwrap();
+            compare(
+                &format!("matvec_q6_64row_rms input={input_width} output={output_width}"),
                 &reference,
                 &candidate,
             );

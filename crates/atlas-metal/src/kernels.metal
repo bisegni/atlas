@@ -158,31 +158,41 @@ kernel void rms_norm_decode_f32_vec4(
 }
 
 // Experimental Gemma decode epilogue.  This retains the 32-lane reduction
-// and explicit intermediate arithmetic of rms_norm_decode_f32, then writes
-// the following residual in the same dispatch.  It is intentionally opt-in:
-// its value is fewer dispatch boundaries, not a changed numerical contract.
+// and explicit intermediate arithmetic of rms_norm_decode_f32_vec4 (the
+// production decode norm), then writes the following residual in the same
+// dispatch.  It is intentionally opt-in: its value is fewer dispatch
+// boundaries, not a changed numerical contract.  Per-element values are
+// bitwise identical to rms_norm_decode_f32_vec4 followed by vector_add_f32.
 kernel void gemma4_rms_residual_f32(
     device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]],
     device const float *residual [[buffer(2)]],
     // Keep the normalized vector as a volatile device-memory intermediate.
-    // The baseline writes this value in rms_norm_decode_f32, then reloads it
-    // in vector_add_f32; retaining that rounding boundary is required for
-    // greedy-token parity.
+    // The baseline writes this value in rms_norm_decode_f32_vec4, then
+    // reloads it in vector_add_f32; retaining that rounding boundary is
+    // required for greedy-token parity.
     device volatile float *normalized [[buffer(3)]], device float *output [[buffer(4)]],
     constant uint &hidden [[buffer(5)]], constant float &epsilon [[buffer(6)]],
     uint lane [[thread_index_in_threadgroup]]) {
+    uint vector_tiles = hidden / 128;
     float squared_sum = 0.0f;
-    for (uint column = lane; column < hidden; column += 32) {
-        float value = input[column];
-        squared_sum += value * value;
+    for (uint tile = 0; tile < vector_tiles; ++tile) {
+        uint offset = tile * 128 + lane * 4;
+        float4 x = *(device const float4 *)(input + offset);
+        squared_sum += x.x * x.x + x.y * x.y + x.z * x.z + x.w * x.w;
     }
     float inverse_rms = rsqrt(simd_sum(squared_sum) / float(hidden) + epsilon);
-    for (uint column = lane; column < hidden; column += 32) {
-        normalized[column] = input[column] * inverse_rms * weight[column];
+    for (uint tile = 0; tile < vector_tiles; ++tile) {
+        uint offset = tile * 128 + lane * 4;
+        float4 x = *(device const float4 *)(input + offset);
+        float4 w = *(device const float4 *)(weight + offset);
+        *(device float4 *)(normalized + offset) = x * inverse_rms * w;
     }
     threadgroup_barrier(mem_flags::mem_device);
-    for (uint column = lane; column < hidden; column += 32) {
-        output[column] = residual[column] + normalized[column];
+    for (uint tile = 0; tile < vector_tiles; ++tile) {
+        uint offset = tile * 128 + lane * 4;
+        float4 n = *(device const float4 *)(normalized + offset);
+        float4 r = *(device const float4 *)(residual + offset);
+        *(device float4 *)(output + offset) = r + n;
     }
 }
 
@@ -1041,6 +1051,81 @@ kernel void matmul_q4_0_batch_16row(
         output[token * output_width + row] = sum;
 }
 
+// Flash-style token-tiled batched Q4_0 projection companion for
+// matmul_q4_0_batch_16row. One threadgroup covers TOKEN_TILE prompt tokens
+// and a 16-row strip of the output: the input tile and the 16-row weight
+// block are staged in threadgroup memory once per 32-column block and reused
+// across every token in the tile, cutting weight DRAM traffic by TOKEN_TILE
+// (the per-token variant re-reads the same weight row once per token).
+kernel void matmul_q4_0_batch_16row_token_tiled(
+    device const float *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
+    constant uint &output_width [[buffer(4)]], constant uint &batch [[buffer(5)]],
+    uint group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    const uint TOKEN_TILE = 8;
+    threadgroup float input_tile[TOKEN_TILE][32];
+    threadgroup uchar weight_tile[16][18];
+    uint simdgroup = tid / 32;
+    uint lane = tid % 32;
+    uint row_in_simd = lane / 8;
+    uint column = lane % 8;
+    uint row_groups = (output_width + 15) / 16;
+    uint token_tile = group / row_groups;
+    uint group_row = group % row_groups;
+    uint token_base = token_tile * TOKEN_TILE;
+    uint row = group_row * 16 + simdgroup * 4 + row_in_simd;
+    uint blocks = input_width / 32;
+    uint tokens = (token_base < batch) ? min(TOKEN_TILE, batch - token_base) : 0;
+    float acc[TOKEN_TILE];
+#pragma unroll
+    for (uint token = 0; token < TOKEN_TILE; ++token) acc[token] = 0.0f;
+    for (uint block = 0; block < blocks; ++block) {
+        for (uint k = 0; k < 2; ++k) {
+            uint e = tid + k * 128;
+            uint t = e / 32;
+            uint col = e % 32;
+            if (t < tokens)
+                input_tile[t][col] =
+                    input[(token_base + t) * input_width + block * 32 + col];
+        }
+        for (uint k = 0; k < 3; ++k) {
+            uint b = tid + k * 128;
+            uint load_row = group_row * 16 + b / 18;
+            if (b < 288 && load_row < output_width)
+                weight_tile[b / 18][b % 18] =
+                    weights[(load_row * blocks + block) * 18 + b % 18];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint local_row = simdgroup * 4 + row_in_simd;
+        uchar packed0 = weight_tile[local_row][2 + column];
+        uchar packed1 = weight_tile[local_row][2 + column + 8];
+        float scale = float(as_type<half>(
+            ushort(weight_tile[local_row][0] | (weight_tile[local_row][1] << 8))));
+#pragma unroll
+        for (uint token = 0; token < TOKEN_TILE; ++token) {
+            if (token < tokens && row < output_width) {
+                float input0 = input_tile[token][column];
+                float input8 = input_tile[token][column + 8];
+                float input16 = input_tile[token][column + 16];
+                float input24 = input_tile[token][column + 24];
+                acc[token] += input0 * float(int(packed0 & 15) - 8) * scale;
+                acc[token] += input8 * float(int(packed1 & 15) - 8) * scale;
+                acc[token] += input16 * float(int(packed0 >> 4) - 8) * scale;
+                acc[token] += input24 * float(int(packed1 >> 4) - 8) * scale;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+#pragma unroll
+    for (uint token = 0; token < TOKEN_TILE; ++token) {
+        acc[token] += simd_shuffle_xor(acc[token], 4);
+        acc[token] += simd_shuffle_xor(acc[token], 2);
+        acc[token] += simd_shuffle_xor(acc[token], 1);
+        if (column == 0 && token_base + token < batch && row < output_width)
+            output[(token_base + token) * output_width + row] = acc[token];
+    }
+}
+
 kernel void matmul_q4_0_batch_16row_simdgroup_tiled(
     device const float *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
     device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
@@ -1787,6 +1872,98 @@ kernel void kv_append_decode_q4_0(
     for (uint i = 0; i < 16; ++i) {
         int low = scale == 0.0f ? 0 : int(round(clamp(value[base + i] / scale, -8.0f, 7.0f)));
         int high = scale == 0.0f ? 0 : int(round(clamp(value[base + i + 16] / scale, -8.0f, 7.0f)));
+        out[2 + i] = uchar((low + 8) | ((high + 8) << 4));
+    }
+}
+
+// Decode-only KV append with the provider V group RMS folded in.  The
+// unfused path launches rms_norm_groups_in_place_unweighted_f32 over the
+// whole V vector (one group), then kv_append_decode_* over the 32-wide
+// blocks.  This candidate removes that dispatch boundary: every block thread
+// redundantly computes the single group's sumsq in the reference's exact
+// sequential order, so inv_rms and the quantized V blocks are bitwise
+// identical while the raw V buffer is left untouched.
+kernel void kv_append_decode_f32_vnorm(
+    device const float *key [[buffer(0)]], device float *value [[buffer(1)]],
+    device float *cache [[buffer(2)]], constant uint &kv_width [[buffer(3)]],
+    constant uint &capacity [[buffer(4)]], constant uint &position [[buffer(5)]],
+    constant float &epsilon [[buffer(6)]], uint id [[thread_position_in_grid]]) {
+    if (id < kv_width && position < capacity) {
+        cache[position * kv_width + id] = key[id];
+    }
+    if (id == 0) {
+        float squared_sum = 0.0f;
+        for (uint index = 0; index < kv_width; ++index)
+            squared_sum += value[index] * value[index];
+        float inverse_rms = rsqrt(squared_sum / float(kv_width) + epsilon);
+        for (uint index = 0; index < kv_width; ++index)
+            cache[capacity * kv_width + position * kv_width + index] = value[index] * inverse_rms;
+    }
+}
+
+kernel void kv_append_decode_q8_0_vnorm(
+    device const float *key [[buffer(0)]], device const float *value [[buffer(1)]],
+    device uchar *cache [[buffer(2)]], constant uint &kv_width [[buffer(3)]],
+    constant uint &capacity [[buffer(4)]], constant uint &position [[buffer(5)]],
+    constant float &epsilon [[buffer(6)]], uint block [[thread_position_in_grid]]) {
+    uint blocks = kv_width / 32;
+    if (block >= blocks || position >= capacity) return;
+    uint base = block * 32;
+    float squared_sum = 0.0f;
+    for (uint index = 0; index < kv_width; ++index)
+        squared_sum += value[index] * value[index];
+    float inverse_rms = rsqrt(squared_sum / float(kv_width) + epsilon);
+    float maximum = 0.0f;
+    for (uint i = 0; i < 32; ++i) maximum = max(maximum, abs(key[base + i]));
+    float scale = maximum == 0.0f ? 0.0f : maximum / 127.0f;
+    device uchar *out = cache + (position * blocks + block) * 34;
+    *((device half *)out) = half(scale);
+    for (uint i = 0; i < 32; ++i)
+        out[2 + i] = uchar(char(scale == 0.0f ? 0 : int(round(clamp(key[base + i] / scale, -127.0f, 127.0f)))));
+    maximum = 0.0f;
+    for (uint i = 0; i < 32; ++i) maximum = max(maximum, abs(value[base + i] * inverse_rms));
+    scale = maximum == 0.0f ? 0.0f : maximum / 127.0f;
+    out = cache + (capacity * blocks + position * blocks + block) * 34;
+    *((device half *)out) = half(scale);
+    for (uint i = 0; i < 32; ++i)
+        out[2 + i] = uchar(char(scale == 0.0f ? 0 : int(round(clamp(value[base + i] * inverse_rms / scale, -127.0f, 127.0f)))));
+}
+
+kernel void kv_append_decode_q4_0_vnorm(
+    device const float *key [[buffer(0)]], device const float *value [[buffer(1)]],
+    device uchar *cache [[buffer(2)]], constant uint &kv_width [[buffer(3)]],
+    constant uint &capacity [[buffer(4)]], constant uint &position [[buffer(5)]],
+    constant float &epsilon [[buffer(6)]], uint block [[thread_position_in_grid]]) {
+    uint blocks = kv_width / 32;
+    if (block >= blocks || position >= capacity) return;
+    uint base = block * 32;
+    float squared_sum = 0.0f;
+    for (uint index = 0; index < kv_width; ++index)
+        squared_sum += value[index] * value[index];
+    float inverse_rms = rsqrt(squared_sum / float(kv_width) + epsilon);
+    float maximum = 0.0f, signed_maximum = 0.0f;
+    for (uint i = 0; i < 32; ++i) if (abs(key[base + i]) > maximum) { maximum = abs(key[base + i]); signed_maximum = key[base + i]; }
+    float scale = maximum == 0.0f ? 0.0f : signed_maximum / -8.0f;
+    device uchar *out = cache + (position * blocks + block) * 18;
+    *((device half *)out) = half(scale);
+    for (uint i = 0; i < 16; ++i) {
+        int low = scale == 0.0f ? 0 : int(round(clamp(key[base + i] / scale, -8.0f, 7.0f)));
+        int high = scale == 0.0f ? 0 : int(round(clamp(key[base + i + 16] / scale, -8.0f, 7.0f)));
+        out[2 + i] = uchar((low + 8) | ((high + 8) << 4));
+    }
+    maximum = 0.0f; signed_maximum = 0.0f;
+    for (uint i = 0; i < 32; ++i) {
+        float normalized = value[base + i] * inverse_rms;
+        if (abs(normalized) > maximum) { maximum = abs(normalized); signed_maximum = normalized; }
+    }
+    scale = maximum == 0.0f ? 0.0f : signed_maximum / -8.0f;
+    out = cache + (capacity * blocks + position * blocks + block) * 18;
+    *((device half *)out) = half(scale);
+    for (uint i = 0; i < 16; ++i) {
+        float normalized_low = value[base + i] * inverse_rms;
+        float normalized_high = value[base + i + 16] * inverse_rms;
+        int low = scale == 0.0f ? 0 : int(round(clamp(normalized_low / scale, -8.0f, 7.0f)));
+        int high = scale == 0.0f ? 0 : int(round(clamp(normalized_high / scale, -8.0f, 7.0f)));
         out[2 + i] = uchar((low + 8) | ((high + 8) << 4));
     }
 }
@@ -3496,6 +3673,92 @@ kernel void matvec_q4_0_32row_mv(
     }
 }
 
+// RMS-input counterpart of matvec_q4_0_32row_mv.  The input is the raw hidden
+// state: each SIMD group reduces the per-lane sum of squares of the input
+// values it already loads for the dot product, computes
+// rsqrt(mean_sq + epsilon), and folds rms_weight[column] into the yl cache so
+// the packed-nibble products match the standalone rms_norm_decode_f32_vec4 +
+// unfused matvec pipeline within tolerance.  The inverse-rms factor is applied
+// once per row after the simd_sum reduction; no normalized intermediate is
+// written to device memory.
+kernel void matvec_q4_0_32row_mv_rms(
+    device const float *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
+    constant uint &output_width [[buffer(4)]],
+    device const float *rms_weight [[buffer(5)]],
+    constant float &epsilon [[buffer(6)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint simdgroup = tid / 32;
+    uint lane = tid % 32;
+    uint row = group * 32 + simdgroup * 8;
+    bool active = row < output_width;
+    uint blocks = input_width / 32;
+    uint ix = lane / 2;
+    uint il = (lane % 2) * 8;
+    float sumf[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float sum_sq = 0.0f;
+    device const uchar *ax[8];
+    for (uint r = 0; r < 8; ++r) {
+        uint safe_row = min(row + r, output_width - 1);
+        ax[r] = weights + safe_row * blocks * 18;
+    }
+    float yl[16];
+    device const float *yb = input + ix * 32 + il;
+    device const float *wb = rms_weight + ix * 32 + il;
+    for (uint ib = ix; ib < blocks; ib += 16) {
+        float sumy0 = 0.0f;
+        float sumy1 = 0.0f;
+        #pragma unroll
+        for (uint i = 0; i < 8; i += 2) {
+            float y0 = yb[i + 0] * wb[i + 0];
+            float y1 = yb[i + 1] * wb[i + 1];
+            sumy0 += y0 + y1;
+            yl[i + 0] = y0;
+            yl[i + 1] = y1 * (1.0f / 256.0f);
+            sum_sq += yb[i + 0] * yb[i + 0] + yb[i + 1] * yb[i + 1];
+            float y2 = yb[i + 16] * wb[i + 16];
+            float y3 = yb[i + 17] * wb[i + 17];
+            sumy1 += y2 + y3;
+            yl[i + 8] = y2 * (1.0f / 16.0f);
+            yl[i + 9] = y3 * (1.0f / 4096.0f);
+            sum_sq += yb[i + 16] * yb[i + 16] + yb[i + 17] * yb[i + 17];
+        }
+        float sumy = sumy0 + sumy1;
+        if (active) {
+            #pragma unroll
+            for (uint r = 0; r < 8; ++r) {
+                device const uchar *base = ax[r] + ib * 18;
+                float scale = float(*(device const half *)base);
+                device const ushort *qs = (device const ushort *)(base + 2 + il);
+                float acc0 = 0.0f;
+                float acc1 = 0.0f;
+                float acc2 = 0.0f;
+                float acc3 = 0.0f;
+                #pragma unroll
+                for (uint i = 0; i < 8; i += 2) {
+                    ushort q = qs[i / 2];
+                    acc0 += yl[i + 0] * float(q & 0x000F);
+                    acc1 += yl[i + 1] * float(q & 0x0F00);
+                    acc2 += yl[i + 8] * float(q & 0x00F0);
+                    acc3 += yl[i + 9] * float(q & 0xF000);
+                }
+                sumf[r] += scale * (sumy * -8.0f + acc0 + acc1 + acc2 + acc3);
+            }
+        }
+        yb += 512;
+        wb += 512;
+    }
+    float inverse_rms = rsqrt(simd_sum(sum_sq) / float(input_width) + epsilon);
+    for (uint r = 0; r < 8; ++r) sumf[r] = simd_sum(sumf[r]);
+    if (lane == 0) {
+        for (uint r = 0; r < 8; ++r) {
+            uint out_row = row + r;
+            if (out_row < output_width) output[out_row] = sumf[r] * inverse_rms;
+        }
+    }
+}
+
 // Fused Q/K/V counterpart of matvec_q4_0_32row_mv.  Keeps the proven three
 // weight-buffer dispatch boundary; groups 0..q_groups-1 are the Q matrix,
 // the next kv_groups the K matrix, and the remainder the V matrix.
@@ -3583,6 +3846,108 @@ kernel void matmul_q4_0_qkv_32row_mv(
     }
 }
 
+// RMS-input counterpart of matmul_q4_0_qkv_32row_mv: the raw hidden state is
+// normalized in-kernel (per-SIMD-group sum-of-squares reduction folded into
+// the existing input loads) so the attention-input RMS dispatch and its
+// device-memory round trip disappear.  Same tolerance contract as
+// matvec_q4_0_32row_mv_rms.
+kernel void matmul_q4_0_qkv_32row_mv_rms(
+    device const float *input [[buffer(0)]],
+    device const uchar *q_weights [[buffer(1)]],
+    device const uchar *k_weights [[buffer(2)]],
+    device const uchar *v_weights [[buffer(3)]],
+    device float *q_output [[buffer(4)]],
+    device float *k_output [[buffer(5)]],
+    device float *v_output [[buffer(6)]],
+    constant uint &input_width [[buffer(7)]],
+    constant uint &q_width [[buffer(8)]],
+    constant uint &kv_width [[buffer(9)]],
+    device const float *rms_weight [[buffer(10)]],
+    constant float &epsilon [[buffer(11)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint q_groups = (q_width + 31) / 32;
+    uint kv_groups = (kv_width + 31) / 32;
+    uint projection = group < q_groups ? 0 : (group < q_groups + kv_groups ? 1 : 2);
+    uint local_group = projection == 0 ? group :
+        (projection == 1 ? group - q_groups : group - q_groups - kv_groups);
+    uint output_width = projection == 0 ? q_width : kv_width;
+    uint simdgroup = tid / 32;
+    uint lane = tid % 32;
+    uint row = local_group * 32 + simdgroup * 8;
+    bool active = row < output_width;
+    uint blocks = input_width / 32;
+    uint ix = lane / 2;
+    uint il = (lane % 2) * 8;
+    float sumf[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float sum_sq = 0.0f;
+    device const uchar *weights = projection == 0 ? q_weights :
+        (projection == 1 ? k_weights : v_weights);
+    device const uchar *ax[8];
+    for (uint r = 0; r < 8; ++r) {
+        uint safe_row = min(row + r, output_width - 1);
+        ax[r] = weights + safe_row * blocks * 18;
+    }
+    float yl[16];
+    device const float *yb = input + ix * 32 + il;
+    device const float *wb = rms_weight + ix * 32 + il;
+    for (uint ib = ix; ib < blocks; ib += 16) {
+        float sumy0 = 0.0f;
+        float sumy1 = 0.0f;
+        #pragma unroll
+        for (uint i = 0; i < 8; i += 2) {
+            float y0 = yb[i + 0] * wb[i + 0];
+            float y1 = yb[i + 1] * wb[i + 1];
+            sumy0 += y0 + y1;
+            yl[i + 0] = y0;
+            yl[i + 1] = y1 * (1.0f / 256.0f);
+            sum_sq += yb[i + 0] * yb[i + 0] + yb[i + 1] * yb[i + 1];
+            float y2 = yb[i + 16] * wb[i + 16];
+            float y3 = yb[i + 17] * wb[i + 17];
+            sumy1 += y2 + y3;
+            yl[i + 8] = y2 * (1.0f / 16.0f);
+            yl[i + 9] = y3 * (1.0f / 4096.0f);
+            sum_sq += yb[i + 16] * yb[i + 16] + yb[i + 17] * yb[i + 17];
+        }
+        float sumy = sumy0 + sumy1;
+        if (active) {
+            #pragma unroll
+            for (uint r = 0; r < 8; ++r) {
+                device const uchar *base = ax[r] + ib * 18;
+                float scale = float(*(device const half *)base);
+                device const ushort *qs = (device const ushort *)(base + 2 + il);
+                float acc0 = 0.0f;
+                float acc1 = 0.0f;
+                float acc2 = 0.0f;
+                float acc3 = 0.0f;
+                #pragma unroll
+                for (uint i = 0; i < 8; i += 2) {
+                    ushort q = qs[i / 2];
+                    acc0 += yl[i + 0] * float(q & 0x000F);
+                    acc1 += yl[i + 1] * float(q & 0x0F00);
+                    acc2 += yl[i + 8] * float(q & 0x00F0);
+                    acc3 += yl[i + 9] * float(q & 0xF000);
+                }
+                sumf[r] += scale * (sumy * -8.0f + acc0 + acc1 + acc2 + acc3);
+            }
+        }
+        yb += 512;
+        wb += 512;
+    }
+    float inverse_rms = rsqrt(simd_sum(sum_sq) / float(input_width) + epsilon);
+    for (uint r = 0; r < 8; ++r) sumf[r] = simd_sum(sumf[r]);
+    if (lane == 0) {
+        for (uint r = 0; r < 8; ++r) {
+            uint out_row = row + r;
+            if (out_row >= output_width) continue;
+            float value = sumf[r] * inverse_rms;
+            if (projection == 0) q_output[out_row] = value;
+            else if (projection == 1) k_output[out_row] = value;
+            else v_output[out_row] = value;
+        }
+    }
+}
+
 // Fused FFN gate/up counterpart of matvec_q4_0_32row_mv with the same
 // two-weight dispatch boundary as matmul_q4_0_gate_up_16row.
 kernel void matmul_q4_0_gate_up_32row_mv(
@@ -3662,6 +4027,96 @@ kernel void matmul_q4_0_gate_up_32row_mv(
     }
 }
 
+kernel void matmul_q4_0_gate_up_32row_mv_rms(
+    device const float *input [[buffer(0)]],
+    device const uchar *gate_weights [[buffer(1)]],
+    device const uchar *up_weights [[buffer(2)]],
+    device float *gate_output [[buffer(3)]],
+    device float *up_output [[buffer(4)]],
+    constant uint &input_width [[buffer(5)]],
+    constant uint &output_width [[buffer(6)]],
+    device const float *rms_weight [[buffer(7)]],
+    constant float &epsilon [[buffer(8)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint groups = (output_width + 31) / 32;
+    uint projection = group < groups ? 0 : 1;
+    uint local_group = projection == 0 ? group : group - groups;
+    uint simdgroup = tid / 32;
+    uint lane = tid % 32;
+    uint row = local_group * 32 + simdgroup * 8;
+    bool active = row < output_width;
+    uint blocks = input_width / 32;
+    uint ix = lane / 2;
+    uint il = (lane % 2) * 8;
+    float sumf[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float sum_sq = 0.0f;
+    device const uchar *weights = projection == 0 ? gate_weights : up_weights;
+    device const uchar *ax[8];
+    for (uint r = 0; r < 8; ++r) {
+        uint safe_row = min(row + r, output_width - 1);
+        ax[r] = weights + safe_row * blocks * 18;
+    }
+    float yl[16];
+    device const float *yb = input + ix * 32 + il;
+    device const float *wb = rms_weight + ix * 32 + il;
+    for (uint ib = ix; ib < blocks; ib += 16) {
+        float sumy0 = 0.0f;
+        float sumy1 = 0.0f;
+        #pragma unroll
+        for (uint i = 0; i < 8; i += 2) {
+            float y0 = yb[i + 0] * wb[i + 0];
+            float y1 = yb[i + 1] * wb[i + 1];
+            sumy0 += y0 + y1;
+            yl[i + 0] = y0;
+            yl[i + 1] = y1 * (1.0f / 256.0f);
+            sum_sq += yb[i + 0] * yb[i + 0] + yb[i + 1] * yb[i + 1];
+            float y2 = yb[i + 16] * wb[i + 16];
+            float y3 = yb[i + 17] * wb[i + 17];
+            sumy1 += y2 + y3;
+            yl[i + 8] = y2 * (1.0f / 16.0f);
+            yl[i + 9] = y3 * (1.0f / 4096.0f);
+            sum_sq += yb[i + 16] * yb[i + 16] + yb[i + 17] * yb[i + 17];
+        }
+        float sumy = sumy0 + sumy1;
+        if (active) {
+            #pragma unroll
+            for (uint r = 0; r < 8; ++r) {
+                device const uchar *base = ax[r] + ib * 18;
+                float scale = float(*(device const half *)base);
+                device const ushort *qs = (device const ushort *)(base + 2 + il);
+                float acc0 = 0.0f;
+                float acc1 = 0.0f;
+                float acc2 = 0.0f;
+                float acc3 = 0.0f;
+                #pragma unroll
+                for (uint i = 0; i < 8; i += 2) {
+                    ushort q = qs[i / 2];
+                    acc0 += yl[i + 0] * float(q & 0x000F);
+                    acc1 += yl[i + 1] * float(q & 0x0F00);
+                    acc2 += yl[i + 8] * float(q & 0x00F0);
+                    acc3 += yl[i + 9] * float(q & 0xF000);
+                }
+                sumf[r] += scale * (sumy * -8.0f + acc0 + acc1 + acc2 + acc3);
+            }
+        }
+        yb += 512;
+        wb += 512;
+    }
+    float inverse_rms = rsqrt(simd_sum(sum_sq) / float(input_width) + epsilon);
+    for (uint r = 0; r < 8; ++r) sumf[r] = simd_sum(sumf[r]);
+    if (lane == 0) {
+        for (uint r = 0; r < 8; ++r) {
+            uint out_row = row + r;
+            if (out_row < output_width) {
+                float value = sumf[r] * inverse_rms;
+                if (projection == 0) gate_output[out_row] = value;
+                else up_output[out_row] = value;
+            }
+        }
+    }
+}
+
 // llama.cpp-style mul_mv port for the Q6_K vocabulary projection.  Thirty-two
 // rows per threadgroup (4 SIMD groups x 8 rows); the 256-value super-block is
 // split into two 128-value halves (ip), each handled by eight threads (il)
@@ -3730,6 +4185,379 @@ kernel void matvec_q6_k_32row_mv(
         for (uint r = 0; r < 8; ++r) {
             uint out_row = row + r;
             if (out_row < output_width) output[out_row] = sumf[r];
+        }
+    }
+}
+
+// RMS-input counterpart of matvec_q6_k_32row_mv for the vocabulary output:
+// the final output-norm dispatch is folded into the LM-head projection, with
+// the per-lane sum-of-squares reduction riding the existing super-block input
+// loads and rms_weight folded into the yl cache.  Same tolerance contract as
+// matvec_q4_0_32row_mv_rms.
+kernel void matvec_q6_k_32row_mv_rms(
+    device const float *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
+    constant uint &output_width [[buffer(4)]],
+    device const float *rms_weight [[buffer(5)]],
+    constant float &epsilon [[buffer(6)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint simdgroup = tid / 32;
+    uint lane = tid % 32;
+    uint row = group * 32 + simdgroup * 8;
+    uint blocks = input_width / 256;
+    uint tid_l = lane / 2;
+    uint ix = lane % 2;
+    uint ip = tid_l / 8;
+    uint il = tid_l % 8;
+    uint l0 = 4 * il;
+    uint is = 8 * ip + l0 / 16;
+    uint y_offset = 128 * ip + l0;
+    uint q_offset_l = 64 * ip + l0;
+    uint q_offset_h = 32 * ip + l0;
+    float sumf[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float sum_sq = 0.0f;
+    float yl[16];
+    uint safe_row = min(row, output_width - 1);
+    bool active = row < output_width;
+    for (uint ib = ix; ib < blocks; ib += 2) {
+        device const uchar *base = weights + (safe_row * blocks + ib) * 210;
+        device const float *y = input + ib * 256 + y_offset;
+        device const float *w = rms_weight + ib * 256 + y_offset;
+        #pragma unroll
+        for (uint l = 0; l < 4; ++l) {
+            sum_sq += y[l + 0] * y[l + 0] + y[l + 32] * y[l + 32]
+                + y[l + 64] * y[l + 64] + y[l + 96] * y[l + 96];
+            yl[4 * l + 0] = y[l + 0] * w[l + 0];
+            yl[4 * l + 1] = y[l + 32] * w[l + 32];
+            yl[4 * l + 2] = y[l + 64] * w[l + 64];
+            yl[4 * l + 3] = y[l + 96] * w[l + 96];
+        }
+        if (active) {
+            #pragma unroll
+            for (uint r = 0; r < 8; ++r) {
+                device const uchar *base_r = base + r * blocks * 210;
+                device const uchar *q1 = base_r + q_offset_l;
+                device const uchar *q2 = q1 + 32;
+                device const uchar *qh = base_r + 128 + q_offset_h;
+                device const int8_t *sc = (device const int8_t *)(base_r + 192) + is;
+                float dh_r = float(*(device const half *)(base_r + 208));
+                float sums0 = 0.0f;
+                float sums1 = 0.0f;
+                float sums2 = 0.0f;
+                float sums3 = 0.0f;
+                #pragma unroll
+                for (uint l = 0; l < 4; ++l) {
+                    sums0 += yl[4 * l + 0] * float(int((q1[l] & 0xF) | ((qh[l] & 0x03) << 4)) - 32);
+                    sums1 += yl[4 * l + 1] * float(int((q2[l] & 0xF) | ((qh[l] & 0x0C) << 2)) - 32);
+                    sums2 += yl[4 * l + 2] * float(int((q1[l] >> 4) | ((qh[l] & 0x30) << 0)) - 32);
+                    sums3 += yl[4 * l + 3] * float(int((q2[l] >> 4) | ((qh[l] & 0xC0) >> 2)) - 32);
+                }
+                sumf[r] += dh_r * (sums0 * float(sc[0]) + sums1 * float(sc[2])
+                    + sums2 * float(sc[4]) + sums3 * float(sc[6]));
+            }
+        }
+    }
+    float inverse_rms = rsqrt(simd_sum(sum_sq) / float(input_width) + epsilon);
+    for (uint r = 0; r < 8; ++r) sumf[r] = simd_sum(sumf[r]);
+    if (lane == 0) {
+        for (uint r = 0; r < 8; ++r) {
+            uint out_row = row + r;
+            if (out_row < output_width) output[out_row] = sumf[r] * inverse_rms;
+        }
+    }
+}
+
+// 64-row-per-threadgroup variants (phase 13.0 P4) of the mv_ext matvec
+// family.  Each threadgroup covers 64 output rows via 8 SIMD groups of 8
+// rows and is dispatched with 256 threads.  The per-lane accumulation order
+// is byte-for-byte the 32-row kernel's, so the tolerance parity contract
+// (max-abs < 1e-3 vs the 16-row/8-row production kernels) is unchanged.
+kernel void matvec_q4_0_64row_mv(
+    device const float *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
+    constant uint &output_width [[buffer(4)]], uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint simdgroup = tid / 32;
+    uint lane = tid % 32;
+    uint row = group * 64 + simdgroup * 8;
+    bool active = row < output_width;
+    uint blocks = input_width / 32;
+    uint ix = lane / 2;
+    uint il = (lane % 2) * 8;
+    float sumf[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    device const uchar *ax[8];
+    for (uint r = 0; r < 8; ++r) {
+        uint safe_row = min(row + r, output_width - 1);
+        ax[r] = weights + safe_row * blocks * 18;
+    }
+    float yl[16];
+    device const float *yb = input + ix * 32 + il;
+    for (uint ib = ix; ib < blocks; ib += 16) {
+        float sumy0 = 0.0f;
+        float sumy1 = 0.0f;
+        #pragma unroll
+        for (uint i = 0; i < 8; i += 2) {
+            sumy0 += yb[i + 0] + yb[i + 1];
+            yl[i + 0] = yb[i + 0];
+            yl[i + 1] = yb[i + 1] * (1.0f / 256.0f);
+            sumy1 += yb[i + 16] + yb[i + 17];
+            yl[i + 8] = yb[i + 16] * (1.0f / 16.0f);
+            yl[i + 9] = yb[i + 17] * (1.0f / 4096.0f);
+        }
+        float sumy = sumy0 + sumy1;
+        if (active) {
+            #pragma unroll
+            for (uint r = 0; r < 8; ++r) {
+                device const uchar *base = ax[r] + ib * 18;
+                float scale = float(*(device const half *)base);
+                device const ushort *qs = (device const ushort *)(base + 2 + il);
+                float acc0 = 0.0f;
+                float acc1 = 0.0f;
+                float acc2 = 0.0f;
+                float acc3 = 0.0f;
+                #pragma unroll
+                for (uint i = 0; i < 8; i += 2) {
+                    ushort q = qs[i / 2];
+                    acc0 += yl[i + 0] * float(q & 0x000F);
+                    acc1 += yl[i + 1] * float(q & 0x0F00);
+                    acc2 += yl[i + 8] * float(q & 0x00F0);
+                    acc3 += yl[i + 9] * float(q & 0xF000);
+                }
+                sumf[r] += scale * (sumy * -8.0f + acc0 + acc1 + acc2 + acc3);
+            }
+        }
+        yb += 512;
+    }
+    for (uint r = 0; r < 8; ++r) sumf[r] = simd_sum(sumf[r]);
+    if (lane == 0) {
+        for (uint r = 0; r < 8; ++r) {
+            uint out_row = row + r;
+            if (out_row < output_width) output[out_row] = sumf[r];
+        }
+    }
+}
+
+// RMS-input counterpart of matvec_q4_0_64row_mv: the standalone rms-norm
+// dispatch is folded into the projection exactly as in the 32-row _rms
+// kernel, with the same per-lane sum-of-squares and yl-scale order.
+kernel void matvec_q4_0_64row_mv_rms(
+    device const float *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
+    constant uint &output_width [[buffer(4)]],
+    device const float *rms_weight [[buffer(5)]],
+    constant float &epsilon [[buffer(6)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint simdgroup = tid / 32;
+    uint lane = tid % 32;
+    uint row = group * 64 + simdgroup * 8;
+    bool active = row < output_width;
+    uint blocks = input_width / 32;
+    uint ix = lane / 2;
+    uint il = (lane % 2) * 8;
+    float sumf[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float sum_sq = 0.0f;
+    device const uchar *ax[8];
+    for (uint r = 0; r < 8; ++r) {
+        uint safe_row = min(row + r, output_width - 1);
+        ax[r] = weights + safe_row * blocks * 18;
+    }
+    float yl[16];
+    device const float *yb = input + ix * 32 + il;
+    device const float *wb = rms_weight + ix * 32 + il;
+    for (uint ib = ix; ib < blocks; ib += 16) {
+        float sumy0 = 0.0f;
+        float sumy1 = 0.0f;
+        #pragma unroll
+        for (uint i = 0; i < 8; i += 2) {
+            float y0 = yb[i + 0] * wb[i + 0];
+            float y1 = yb[i + 1] * wb[i + 1];
+            sumy0 += y0 + y1;
+            yl[i + 0] = y0;
+            yl[i + 1] = y1 * (1.0f / 256.0f);
+            sum_sq += yb[i + 0] * yb[i + 0] + yb[i + 1] * yb[i + 1];
+            float y2 = yb[i + 16] * wb[i + 16];
+            float y3 = yb[i + 17] * wb[i + 17];
+            sumy1 += y2 + y3;
+            yl[i + 8] = y2 * (1.0f / 16.0f);
+            yl[i + 9] = y3 * (1.0f / 4096.0f);
+            sum_sq += yb[i + 16] * yb[i + 16] + yb[i + 17] * yb[i + 17];
+        }
+        float sumy = sumy0 + sumy1;
+        if (active) {
+            #pragma unroll
+            for (uint r = 0; r < 8; ++r) {
+                device const uchar *base = ax[r] + ib * 18;
+                float scale = float(*(device const half *)base);
+                device const ushort *qs = (device const ushort *)(base + 2 + il);
+                float acc0 = 0.0f;
+                float acc1 = 0.0f;
+                float acc2 = 0.0f;
+                float acc3 = 0.0f;
+                #pragma unroll
+                for (uint i = 0; i < 8; i += 2) {
+                    ushort q = qs[i / 2];
+                    acc0 += yl[i + 0] * float(q & 0x000F);
+                    acc1 += yl[i + 1] * float(q & 0x0F00);
+                    acc2 += yl[i + 8] * float(q & 0x00F0);
+                    acc3 += yl[i + 9] * float(q & 0xF000);
+                }
+                sumf[r] += scale * (sumy * -8.0f + acc0 + acc1 + acc2 + acc3);
+            }
+        }
+        yb += 512;
+        wb += 512;
+    }
+    float inverse_rms = rsqrt(simd_sum(sum_sq) / float(input_width) + epsilon);
+    for (uint r = 0; r < 8; ++r) sumf[r] = simd_sum(sumf[r]);
+    if (lane == 0) {
+        for (uint r = 0; r < 8; ++r) {
+            uint out_row = row + r;
+            if (out_row < output_width) output[out_row] = sumf[r] * inverse_rms;
+        }
+    }
+}
+
+// 64-row-per-threadgroup counterpart of matvec_q6_k_32row_mv (8 SIMD groups
+// of 8 rows per threadgroup, 256 threads per dispatch).
+kernel void matvec_q6_k_64row_mv(
+    device const float *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
+    constant uint &output_width [[buffer(4)]], uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint simdgroup = tid / 32;
+    uint lane = tid % 32;
+    uint row = group * 64 + simdgroup * 8;
+    uint blocks = input_width / 256;
+    uint tid_l = lane / 2;
+    uint ix = lane % 2;
+    uint ip = tid_l / 8;
+    uint il = tid_l % 8;
+    uint l0 = 4 * il;
+    uint is = 8 * ip + l0 / 16;
+    uint y_offset = 128 * ip + l0;
+    uint q_offset_l = 64 * ip + l0;
+    uint q_offset_h = 32 * ip + l0;
+    float sumf[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float yl[16];
+    uint safe_row = min(row, output_width - 1);
+    bool active = row < output_width;
+    for (uint ib = ix; ib < blocks; ib += 2) {
+        device const uchar *base = weights + (safe_row * blocks + ib) * 210;
+        device const float *y = input + ib * 256 + y_offset;
+        #pragma unroll
+        for (uint l = 0; l < 4; ++l) {
+            yl[4 * l + 0] = y[l + 0];
+            yl[4 * l + 1] = y[l + 32];
+            yl[4 * l + 2] = y[l + 64];
+            yl[4 * l + 3] = y[l + 96];
+        }
+        if (active) {
+            #pragma unroll
+            for (uint r = 0; r < 8; ++r) {
+                device const uchar *base_r = base + r * blocks * 210;
+                device const uchar *q1 = base_r + q_offset_l;
+                device const uchar *q2 = q1 + 32;
+                device const uchar *qh = base_r + 128 + q_offset_h;
+                device const int8_t *sc = (device const int8_t *)(base_r + 192) + is;
+                float dh_r = float(*(device const half *)(base_r + 208));
+                float sums0 = 0.0f;
+                float sums1 = 0.0f;
+                float sums2 = 0.0f;
+                float sums3 = 0.0f;
+                #pragma unroll
+                for (uint l = 0; l < 4; ++l) {
+                    sums0 += yl[4 * l + 0] * float(int((q1[l] & 0xF) | ((qh[l] & 0x03) << 4)) - 32);
+                    sums1 += yl[4 * l + 1] * float(int((q2[l] & 0xF) | ((qh[l] & 0x0C) << 2)) - 32);
+                    sums2 += yl[4 * l + 2] * float(int((q1[l] >> 4) | ((qh[l] & 0x30) << 0)) - 32);
+                    sums3 += yl[4 * l + 3] * float(int((q2[l] >> 4) | ((qh[l] & 0xC0) >> 2)) - 32);
+                }
+                sumf[r] += dh_r * (sums0 * float(sc[0]) + sums1 * float(sc[2])
+                    + sums2 * float(sc[4]) + sums3 * float(sc[6]));
+            }
+        }
+    }
+    for (uint r = 0; r < 8; ++r) sumf[r] = simd_sum(sumf[r]);
+    if (lane == 0) {
+        for (uint r = 0; r < 8; ++r) {
+            uint out_row = row + r;
+            if (out_row < output_width) output[out_row] = sumf[r];
+        }
+    }
+}
+
+// RMS-input counterpart of matvec_q6_k_64row_mv for the vocabulary output.
+kernel void matvec_q6_k_64row_mv_rms(
+    device const float *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
+    constant uint &output_width [[buffer(4)]],
+    device const float *rms_weight [[buffer(5)]],
+    constant float &epsilon [[buffer(6)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint simdgroup = tid / 32;
+    uint lane = tid % 32;
+    uint row = group * 64 + simdgroup * 8;
+    uint blocks = input_width / 256;
+    uint tid_l = lane / 2;
+    uint ix = lane % 2;
+    uint ip = tid_l / 8;
+    uint il = tid_l % 8;
+    uint l0 = 4 * il;
+    uint is = 8 * ip + l0 / 16;
+    uint y_offset = 128 * ip + l0;
+    uint q_offset_l = 64 * ip + l0;
+    uint q_offset_h = 32 * ip + l0;
+    float sumf[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float sum_sq = 0.0f;
+    float yl[16];
+    uint safe_row = min(row, output_width - 1);
+    bool active = row < output_width;
+    for (uint ib = ix; ib < blocks; ib += 2) {
+        device const uchar *base = weights + (safe_row * blocks + ib) * 210;
+        device const float *y = input + ib * 256 + y_offset;
+        device const float *w = rms_weight + ib * 256 + y_offset;
+        #pragma unroll
+        for (uint l = 0; l < 4; ++l) {
+            sum_sq += y[l + 0] * y[l + 0] + y[l + 32] * y[l + 32]
+                + y[l + 64] * y[l + 64] + y[l + 96] * y[l + 96];
+            yl[4 * l + 0] = y[l + 0] * w[l + 0];
+            yl[4 * l + 1] = y[l + 32] * w[l + 32];
+            yl[4 * l + 2] = y[l + 64] * w[l + 64];
+            yl[4 * l + 3] = y[l + 96] * w[l + 96];
+        }
+        if (active) {
+            #pragma unroll
+            for (uint r = 0; r < 8; ++r) {
+                device const uchar *base_r = base + r * blocks * 210;
+                device const uchar *q1 = base_r + q_offset_l;
+                device const uchar *q2 = q1 + 32;
+                device const uchar *qh = base_r + 128 + q_offset_h;
+                device const int8_t *sc = (device const int8_t *)(base_r + 192) + is;
+                float dh_r = float(*(device const half *)(base_r + 208));
+                float sums0 = 0.0f;
+                float sums1 = 0.0f;
+                float sums2 = 0.0f;
+                float sums3 = 0.0f;
+                #pragma unroll
+                for (uint l = 0; l < 4; ++l) {
+                    sums0 += yl[4 * l + 0] * float(int((q1[l] & 0xF) | ((qh[l] & 0x03) << 4)) - 32);
+                    sums1 += yl[4 * l + 1] * float(int((q2[l] & 0xF) | ((qh[l] & 0x0C) << 2)) - 32);
+                    sums2 += yl[4 * l + 2] * float(int((q1[l] >> 4) | ((qh[l] & 0x30) << 0)) - 32);
+                    sums3 += yl[4 * l + 3] * float(int((q2[l] >> 4) | ((qh[l] & 0xC0) >> 2)) - 32);
+                }
+                sumf[r] += dh_r * (sums0 * float(sc[0]) + sums1 * float(sc[2])
+                    + sums2 * float(sc[4]) + sums3 * float(sc[6]));
+            }
+        }
+    }
+    float inverse_rms = rsqrt(simd_sum(sum_sq) / float(input_width) + epsilon);
+    for (uint r = 0; r < 8; ++r) sumf[r] = simd_sum(sumf[r]);
+    if (lane == 0) {
+        for (uint r = 0; r < 8; ++r) {
+            uint out_row = row + r;
+            if (out_row < output_width) output[out_row] = sumf[r] * inverse_rms;
         }
     }
 }

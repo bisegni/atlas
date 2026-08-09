@@ -207,11 +207,18 @@ pub enum OperationFamily {
 /// profiles can distinguish the global and sliding paths and each scan pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AttentionKind { Global, Sliding }
+pub enum AttentionKind {
+    Global,
+    Sliding,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AttentionScanPass { Scan, Combine, SinglePass }
+pub enum AttentionScanPass {
+    Scan,
+    Combine,
+    SinglePass,
+}
 
 impl Default for OperationFamily {
     fn default() -> Self {
@@ -576,15 +583,14 @@ impl Profiler {
                 .counters
                 .attributed_gpu_duration_ns
                 .saturating_add(gpu_ns);
-            self.counters.gpu_duration_source =
-                "exact_per_dispatch_diagnostic_pass".into();
+            self.counters.gpu_duration_source = "exact_per_dispatch_diagnostic_pass".into();
         }
         self.counters.gpu_ns = self
             .counters
             .gpu_ns
             .saturating_add(event.gpu_ns.unwrap_or_default());
-        let attributed = event.operation_family != OperationFamily::Other
-            && event.kernel_name.is_some();
+        let attributed =
+            event.operation_family != OperationFamily::Other && event.kernel_name.is_some();
         if attributed {
             self.counters.categorized_gpu_ns = self
                 .counters
@@ -618,8 +624,14 @@ impl Profiler {
             .counters
             .categorized_dispatches
             .saturating_add(dispatch_calls * u64::from(attributed));
-        self.counters.upload_time_ns = self.counters.upload_time_ns.saturating_add(event.upload_time_ns);
-        self.counters.readback_time_ns = self.counters.readback_time_ns.saturating_add(event.readback_time_ns);
+        self.counters.upload_time_ns = self
+            .counters
+            .upload_time_ns
+            .saturating_add(event.upload_time_ns);
+        self.counters.readback_time_ns = self
+            .counters
+            .readback_time_ns
+            .saturating_add(event.readback_time_ns);
         self.events.push(event);
     }
     pub fn report(&self) -> ProfileReport {
@@ -627,9 +639,7 @@ impl Profiler {
         let phase_reconciliation = self
             .phase_summaries
             .iter()
-            .filter(|summary| {
-                matches!(summary.phase, ProfilePhase::Prefill | ProfilePhase::Decode)
-            })
+            .filter(|summary| matches!(summary.phase, ProfilePhase::Prefill | ProfilePhase::Decode))
             .map(|summary| reconcile_phase(summary))
             .collect::<Vec<_>>();
         let coverage = coverage_summary(&self.counters, &self.events, &phase_reconciliation);
@@ -692,9 +702,7 @@ impl Profiler {
         let mut host_hotspots = host_recommendations(&self.phase_summaries);
         set_confidence(
             &mut overall_recommendations,
-            scope_attribution_complete(
-                self.scope_counters.get(&ProfileScope::DecodeMeasured),
-            ),
+            scope_attribution_complete(self.scope_counters.get(&ProfileScope::DecodeMeasured)),
         );
         set_confidence(
             &mut prefill_hotspots,
@@ -702,9 +710,7 @@ impl Profiler {
         );
         set_confidence(
             &mut decode_measured_hotspots,
-            scope_attribution_complete(
-                self.scope_counters.get(&ProfileScope::DecodeMeasured),
-            ),
+            scope_attribution_complete(self.scope_counters.get(&ProfileScope::DecodeMeasured)),
         );
         set_confidence(
             &mut decode_warmup_hotspots,
@@ -786,11 +792,25 @@ enum Key {
 fn aggregate(events: &[ProfileEvent], key: Key) -> Vec<ProfileAggregate> {
     let mut map: BTreeMap<String, ProfileAggregate> = BTreeMap::new();
     for e in events {
-        let (name, phase, layer, operation, kernel, attention_kind, attention_scan_pass) = match key {
-            Key::Phase => (format!("{:?}", e.phase), Some(e.phase), None, None, None, None, None),
+        let (name, phase, layer, operation, kernel, attention_kind, attention_scan_pass) = match key
+        {
+            Key::Phase => (
+                format!("{:?}", e.phase),
+                Some(e.phase),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
             Key::Operation => (
                 e.operation_family.as_str().into(),
-                None, None, Some(e.operation_family), None, None, None,
+                None,
+                None,
+                Some(e.operation_family),
+                None,
+                None,
+                None,
             ),
             Key::Layer => (
                 e.layer_index
@@ -809,11 +829,31 @@ fn aggregate(events: &[ProfileEvent], key: Key) -> Vec<ProfileAggregate> {
                 None,
                 None,
                 None,
-                e.kernel_name.clone(), None, None,
+                e.kernel_name.clone(),
+                None,
+                None,
             ),
             Key::AttentionDimensions => (
-                format!("layer={};kind={};pass={}", e.layer_index.map_or_else(|| "unattributed".into(), |v| v.to_string()), e.attention_kind.map_or("none", |v| match v { AttentionKind::Global => "global", AttentionKind::Sliding => "sliding" }), e.attention_scan_pass.map_or("none", |v| match v { AttentionScanPass::Scan => "scan", AttentionScanPass::Combine => "combine", AttentionScanPass::SinglePass => "single_pass" })),
-                None, e.layer_index, Some(e.operation_family), e.kernel_name.clone(), e.attention_kind, e.attention_scan_pass,
+                format!(
+                    "layer={};kind={};pass={}",
+                    e.layer_index
+                        .map_or_else(|| "unattributed".into(), |v| v.to_string()),
+                    e.attention_kind.map_or("none", |v| match v {
+                        AttentionKind::Global => "global",
+                        AttentionKind::Sliding => "sliding",
+                    }),
+                    e.attention_scan_pass.map_or("none", |v| match v {
+                        AttentionScanPass::Scan => "scan",
+                        AttentionScanPass::Combine => "combine",
+                        AttentionScanPass::SinglePass => "single_pass",
+                    })
+                ),
+                None,
+                e.layer_index,
+                Some(e.operation_family),
+                e.kernel_name.clone(),
+                e.attention_kind,
+                e.attention_scan_pass,
             ),
         };
         let x = map.entry(name.clone()).or_insert(ProfileAggregate {
@@ -851,7 +891,8 @@ fn reconcile(counters: &ProfileCounters) -> DispatchReconciliation {
     let untimed = counters
         .dispatches
         .saturating_sub(counters.timed_dispatches);
-    let attributed_gpu = effective_attributed_gpu_ns(counters.gpu_ns, counters.attributed_gpu_duration_ns);
+    let attributed_gpu =
+        effective_attributed_gpu_ns(counters.gpu_ns, counters.attributed_gpu_duration_ns);
     let categorized_gpu = counters.categorized_gpu_ns.min(attributed_gpu);
     let uncategorized_gpu = counters
         .attributed_gpu_duration_ns
@@ -912,13 +953,15 @@ fn effective_attributed_gpu_ns(production_gpu_ns: u64, attributed_gpu_ns: u64) -
 
 fn reconcile_phase(summary: &PhaseSummary) -> DispatchReconciliation {
     let attributed_gpu_ns = effective_attributed_gpu_ns(summary.gpu_ns, summary.attributed_gpu_ns);
-    let uncategorized_gpu_ns = attributed_gpu_ns
-        .saturating_sub(summary.categorized_gpu_ns);
+    let uncategorized_gpu_ns = attributed_gpu_ns.saturating_sub(summary.categorized_gpu_ns);
     let mut warnings = Vec::new();
     let dispatch_coverage = ratio(summary.categorized_dispatches, summary.dispatch_calls);
     let gpu_coverage = ratio(summary.categorized_gpu_ns, attributed_gpu_ns);
     if gpu_coverage < 0.90 {
-        warnings.push(format!("GPU attribution coverage is {:.1}%", gpu_coverage * 100.0));
+        warnings.push(format!(
+            "GPU attribution coverage is {:.1}%",
+            gpu_coverage * 100.0
+        ));
     }
     if gpu_coverage < 0.75 || dispatch_coverage < 0.75 {
         warnings.push("phase attribution is incomplete below the 75% threshold".into());
@@ -972,7 +1015,10 @@ fn coverage_summary(
     let synchronization_attribution = 0.0;
     let mut warnings = Vec::new();
     if gpu_attribution < 0.90 {
-        warnings.push(format!("GPU attribution coverage below 90%: {:.1}%", gpu_attribution * 100.0));
+        warnings.push(format!(
+            "GPU attribution coverage below 90%: {:.1}%",
+            gpu_attribution * 100.0
+        ));
     }
     warnings.push(
         "synchronization attribution is partial: GPU-wait-for-CPU and transfer waits are unavailable".into(),
@@ -1033,7 +1079,9 @@ fn synchronization_summary(summaries: &[PhaseSummary]) -> SynchronizationSummary
 }
 
 fn memory_summary(counters: &ProfileCounters, workload: &ProfileWorkload) -> MemorySummary {
-    let traffic = counters.upload_bytes.saturating_add(counters.readback_bytes);
+    let traffic = counters
+        .upload_bytes
+        .saturating_add(counters.readback_bytes);
     MemorySummary {
         resident_bytes: counters.resident_bytes,
         peak_resident_bytes: counters.peak_resident_bytes,
@@ -1162,17 +1210,111 @@ impl ProfileReport {
             self.profile_status,
             self.scope_contract.hotspot_scope.as_str()
         );
-        let _ = writeln!(out, "## Workload\n\n- Prompt tokens: {}\n- Generated tokens: {}\n- Warmup decode tokens: {}\n- Measured decode tokens: {}\n- Completed decode tokens: {}\n- Prefill: {:.3} ms\n- Measured decode: {:.3} ms\n- Measured decode throughput: {:.2} tok/s\n", self.workload.prompt_tokens, self.workload.generated_tokens, self.workload.warmup_decode_tokens, self.workload.measured_decode_tokens, self.workload.completed_decode_tokens, self.workload.prefill_ns as f64 / 1e6, self.workload.decode_ns as f64 / 1e6, if self.workload.decode_ns == 0 { 0.0 } else { self.workload.measured_decode_tokens as f64 / (self.workload.decode_ns as f64 / 1e9) });
-        let _ = writeln!(out, "## Counters\n\n| Metric | Value |\n|---|---:|\n| Command buffers | {} |\n| Dispatch calls | {} |\n| Threadgroups | {} |\n| Threads | {} |\n| Upload bytes | {} |\n| Readback bytes | {} |\n| Production GPU elapsed (ms) | {:.3} |\n| Attributed GPU duration (ms) | {:.3} |\n| Categorized GPU duration (ms) | {:.3} |\n| GPU duration source | {} |\n| CPU wait (ms) | {:.3} |\n| Peak resident bytes | {} |\n| KV-cache bytes | {} |\n", self.counters.command_buffers, self.counters.dispatches, self.counters.threadgroups_dispatched, self.counters.threads_dispatched, self.counters.upload_bytes, self.counters.readback_bytes, self.counters.production_gpu_elapsed_ns as f64 / 1e6, self.counters.attributed_gpu_duration_ns as f64 / 1e6, self.counters.categorized_gpu_ns as f64 / 1e6, self.counters.gpu_duration_source, self.counters.cpu_wait_ns as f64 / 1e6, self.counters.peak_resident_bytes, self.counters.kv_cache_bytes);
-        let _ = writeln!(out, "## Reconciliation\n\n- Dispatch coverage: {:.1}%\n- GPU timing coverage: {:.1}%\n- Production GPU elapsed: {:.3} ms\n- Attributed GPU duration: {:.3} ms\n- Complete: {}\n- Timed dispatches: {}\n- Untimed dispatches: {}\n- Categorized dispatches: {}\n- Uncategorized dispatches: {}\n", self.reconciliation.dispatch_coverage * 100.0, self.reconciliation.gpu_timing_coverage * 100.0, self.reconciliation.total_gpu_ns as f64 / 1e6, self.reconciliation.attributed_gpu_duration_ns as f64 / 1e6, self.reconciliation.complete, self.reconciliation.timed_dispatch_calls, self.reconciliation.untimed_dispatch_calls, self.reconciliation.categorized_dispatch_calls, self.reconciliation.uncategorized_dispatch_calls);
-        let _ = writeln!(out, "## Coverage\n\n- GPU attribution: {:.1}%\n- Dispatch attribution: {:.1}%\n- Operation attribution: {:.1}%\n- Kernel attribution: {:.1}%\n- Synchronization attribution: {:.1}%\n- Complete: {}\n", self.coverage.gpu_attribution * 100.0, self.coverage.dispatch_attribution * 100.0, self.coverage.operation_attribution * 100.0, self.coverage.kernel_attribution * 100.0, self.coverage.synchronization_attribution * 100.0, self.coverage.complete);
-        let _ = writeln!(out, "## Phase reconciliation\n\n| Phase | Wall ms | GPU ms | Categorized GPU ms | Uncategorized GPU ms | CPU encode ms | CPU wait ms | Upload ms | Readback ms | Unexplained ms |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+        let _ = writeln!(
+            out,
+            "## Workload\n\n- Prompt tokens: {}\n- Generated tokens: {}\n- Warmup decode tokens: {}\n- Measured decode tokens: {}\n- Completed decode tokens: {}\n- Prefill: {:.3} ms\n- Measured decode: {:.3} ms\n- Measured decode throughput: {:.2} tok/s\n",
+            self.workload.prompt_tokens,
+            self.workload.generated_tokens,
+            self.workload.warmup_decode_tokens,
+            self.workload.measured_decode_tokens,
+            self.workload.completed_decode_tokens,
+            self.workload.prefill_ns as f64 / 1e6,
+            self.workload.decode_ns as f64 / 1e6,
+            if self.workload.decode_ns == 0 {
+                0.0
+            } else {
+                self.workload.measured_decode_tokens as f64 / (self.workload.decode_ns as f64 / 1e9)
+            }
+        );
+        let _ = writeln!(
+            out,
+            "## Counters\n\n| Metric | Value |\n|---|---:|\n| Command buffers | {} |\n| Dispatch calls | {} |\n| Threadgroups | {} |\n| Threads | {} |\n| Upload bytes | {} |\n| Readback bytes | {} |\n| Production GPU elapsed (ms) | {:.3} |\n| Attributed GPU duration (ms) | {:.3} |\n| Categorized GPU duration (ms) | {:.3} |\n| GPU duration source | {} |\n| CPU wait (ms) | {:.3} |\n| Peak resident bytes | {} |\n| KV-cache bytes | {} |\n",
+            self.counters.command_buffers,
+            self.counters.dispatches,
+            self.counters.threadgroups_dispatched,
+            self.counters.threads_dispatched,
+            self.counters.upload_bytes,
+            self.counters.readback_bytes,
+            self.counters.production_gpu_elapsed_ns as f64 / 1e6,
+            self.counters.attributed_gpu_duration_ns as f64 / 1e6,
+            self.counters.categorized_gpu_ns as f64 / 1e6,
+            self.counters.gpu_duration_source,
+            self.counters.cpu_wait_ns as f64 / 1e6,
+            self.counters.peak_resident_bytes,
+            self.counters.kv_cache_bytes
+        );
+        let _ = writeln!(
+            out,
+            "## Reconciliation\n\n- Dispatch coverage: {:.1}%\n- GPU timing coverage: {:.1}%\n- Production GPU elapsed: {:.3} ms\n- Attributed GPU duration: {:.3} ms\n- Complete: {}\n- Timed dispatches: {}\n- Untimed dispatches: {}\n- Categorized dispatches: {}\n- Uncategorized dispatches: {}\n",
+            self.reconciliation.dispatch_coverage * 100.0,
+            self.reconciliation.gpu_timing_coverage * 100.0,
+            self.reconciliation.total_gpu_ns as f64 / 1e6,
+            self.reconciliation.attributed_gpu_duration_ns as f64 / 1e6,
+            self.reconciliation.complete,
+            self.reconciliation.timed_dispatch_calls,
+            self.reconciliation.untimed_dispatch_calls,
+            self.reconciliation.categorized_dispatch_calls,
+            self.reconciliation.uncategorized_dispatch_calls
+        );
+        let _ = writeln!(
+            out,
+            "## Coverage\n\n- GPU attribution: {:.1}%\n- Dispatch attribution: {:.1}%\n- Operation attribution: {:.1}%\n- Kernel attribution: {:.1}%\n- Synchronization attribution: {:.1}%\n- Complete: {}\n",
+            self.coverage.gpu_attribution * 100.0,
+            self.coverage.dispatch_attribution * 100.0,
+            self.coverage.operation_attribution * 100.0,
+            self.coverage.kernel_attribution * 100.0,
+            self.coverage.synchronization_attribution * 100.0,
+            self.coverage.complete
+        );
+        let _ = writeln!(
+            out,
+            "## Phase reconciliation\n\n| Phase | Wall ms | GPU ms | Categorized GPU ms | Uncategorized GPU ms | CPU encode ms | CPU wait ms | Upload ms | Readback ms | Unexplained ms |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
+        );
         for summary in &self.phase_summaries {
-            let _ = writeln!(out, "| {:?} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} |", summary.phase, summary.wall_ns as f64 / 1e6, summary.gpu_ns as f64 / 1e6, summary.categorized_gpu_ns as f64 / 1e6, summary.uncategorized_gpu_ns as f64 / 1e6, summary.host_encode_ns as f64 / 1e6, summary.cpu_wait_ns as f64 / 1e6, summary.upload_time_ns as f64 / 1e6, summary.readback_time_ns as f64 / 1e6, summary.unexplained_ns as f64 / 1e6);
+            let _ = writeln!(
+                out,
+                "| {:?} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} |",
+                summary.phase,
+                summary.wall_ns as f64 / 1e6,
+                summary.gpu_ns as f64 / 1e6,
+                summary.categorized_gpu_ns as f64 / 1e6,
+                summary.uncategorized_gpu_ns as f64 / 1e6,
+                summary.host_encode_ns as f64 / 1e6,
+                summary.cpu_wait_ns as f64 / 1e6,
+                summary.upload_time_ns as f64 / 1e6,
+                summary.readback_time_ns as f64 / 1e6,
+                summary.unexplained_ns as f64 / 1e6
+            );
         }
-        let _ = writeln!(out, "\n## Synchronization\n\n- CPU wait: {:.3} ms\n- Command-buffer idle gaps: {}\n- Command-buffer schedule time: {}\n- GPU waiting for CPU: {}\n- Readback waits: {}\n- Upload waits: {}\n", self.synchronization.cpu_wait_ns as f64 / 1e6, format_optional_ms(self.synchronization.command_buffer_idle_gap_ns), format_optional_ms(self.synchronization.command_buffer_schedule_ns), self.synchronization.gpu_waiting_for_cpu_ns.map_or_else(|| "unavailable".into(), |v| format!("{:.3} ms", v as f64 / 1e6)), format_optional_ms(self.synchronization.readback_wait_ns), format_optional_ms(self.synchronization.upload_wait_ns));
-        let _ = writeln!(out, "\n## Memory\n\n- Resident: {} bytes\n- Peak: {} bytes\n- KV cache: {} bytes\n- Upload: {} bytes\n- Readback: {} bytes\n- Effective bandwidth: {}\n", self.memory.resident_bytes, self.memory.peak_resident_bytes, self.memory.kv_cache_bytes, self.memory.upload_bytes, self.memory.readback_bytes, self.memory.effective_bandwidth_bytes_per_second.map_or_else(|| "unavailable".into(), |v| format!("{:.3} GB/s", v / 1e9)));
-        let _ = writeln!(out, "## Phases\n\n| Phase | Wall ms | GPU ms | Dispatches | Threadgroups | Upload bytes | Readback bytes | Tokens/sec |\n|---|---:|---:|---:|---:|---:|---:|---:|");
+        let _ = writeln!(
+            out,
+            "\n## Synchronization\n\n- CPU wait: {:.3} ms\n- Command-buffer idle gaps: {}\n- Command-buffer schedule time: {}\n- GPU waiting for CPU: {}\n- Readback waits: {}\n- Upload waits: {}\n",
+            self.synchronization.cpu_wait_ns as f64 / 1e6,
+            format_optional_ms(self.synchronization.command_buffer_idle_gap_ns),
+            format_optional_ms(self.synchronization.command_buffer_schedule_ns),
+            self.synchronization.gpu_waiting_for_cpu_ns.map_or_else(
+                || "unavailable".into(),
+                |v| format!("{:.3} ms", v as f64 / 1e6)
+            ),
+            format_optional_ms(self.synchronization.readback_wait_ns),
+            format_optional_ms(self.synchronization.upload_wait_ns)
+        );
+        let _ = writeln!(
+            out,
+            "\n## Memory\n\n- Resident: {} bytes\n- Peak: {} bytes\n- KV cache: {} bytes\n- Upload: {} bytes\n- Readback: {} bytes\n- Effective bandwidth: {}\n",
+            self.memory.resident_bytes,
+            self.memory.peak_resident_bytes,
+            self.memory.kv_cache_bytes,
+            self.memory.upload_bytes,
+            self.memory.readback_bytes,
+            self.memory
+                .effective_bandwidth_bytes_per_second
+                .map_or_else(|| "unavailable".into(), |v| format!("{:.3} GB/s", v / 1e9))
+        );
+        let _ = writeln!(
+            out,
+            "## Phases\n\n| Phase | Wall ms | GPU ms | Dispatches | Threadgroups | Upload bytes | Readback bytes | Tokens/sec |\n|---|---:|---:|---:|---:|---:|---:|---:|"
+        );
         for summary in &self.phase_summaries {
             let _ = writeln!(
                 out,
@@ -1188,15 +1330,36 @@ impl ProfileReport {
             );
         }
         if let Some(counters) = &self.gpu_counter_capture {
-            let _ = writeln!(out, "\n## Diagnostic GPU counters\n\n```json\n{}\n```", counters);
+            let _ = writeln!(
+                out,
+                "\n## Diagnostic GPU counters\n\n```json\n{}\n```",
+                counters
+            );
         }
         if !self.attention_dispatches.is_empty() {
-            let _ = writeln!(out, "\n## Attention dispatch attribution\n\n| Layer | Kind | Scan pass | GPU ms | Dispatches | Threadgroups |\n|---:|---|---|---:|---:|---:|");
+            let _ = writeln!(
+                out,
+                "\n## Attention dispatch attribution\n\n| Layer | Kind | Scan pass | GPU ms | Dispatches | Threadgroups |\n|---:|---|---|---:|---:|---:|"
+            );
             for aggregate in &self.attention_dispatches {
-                let _ = writeln!(out, "| {} | {:?} | {:?} | {:.3} | {} | {} |", aggregate.layer_index.map_or_else(|| "unattributed".into(), |layer| layer.to_string()), aggregate.attention_kind, aggregate.attention_scan_pass, aggregate.gpu_ns as f64 / 1e6, aggregate.dispatches, aggregate.threadgroups);
+                let _ = writeln!(
+                    out,
+                    "| {} | {:?} | {:?} | {:.3} | {} | {} |",
+                    aggregate
+                        .layer_index
+                        .map_or_else(|| "unattributed".into(), |layer| layer.to_string()),
+                    aggregate.attention_kind,
+                    aggregate.attention_scan_pass,
+                    aggregate.gpu_ns as f64 / 1e6,
+                    aggregate.dispatches,
+                    aggregate.threadgroups
+                );
             }
         }
-        let _ = writeln!(out, "## Recommendations\n\n| Rank | Scope | Target | Classification | Confidence | GPU ms | Categorized GPU share | Wall share | Dispatch calls | Dispatches/token | Threadgroups |\n|---:|---|---|---|---|---:|---:|---|---:|---:|---:|\n");
+        let _ = writeln!(
+            out,
+            "## Recommendations\n\n| Rank | Scope | Target | Classification | Confidence | GPU ms | Categorized GPU share | Wall share | Dispatch calls | Dispatches/token | Threadgroups |\n|---:|---|---|---|---|---:|---:|---|---:|---:|---:|\n"
+        );
         for r in &self.recommendations {
             let _ = writeln!(
                 out,
@@ -1208,7 +1371,8 @@ impl ProfileReport {
                 r.confidence,
                 r.absolute_ms,
                 r.categorized_gpu_share * 100.0,
-                r.wall_time_share.map_or_else(|| "unavailable".into(), |x| format!("{:.1}%", x * 100.0)),
+                r.wall_time_share
+                    .map_or_else(|| "unavailable".into(), |x| format!("{:.1}%", x * 100.0)),
                 r.dispatch_calls,
                 r.dispatches_per_measured_token,
                 r.threadgroups
@@ -1223,7 +1387,10 @@ impl ProfileReport {
                 &self.hotspots.host_synchronization,
             ),
         ] {
-            let _ = writeln!(out, "\n### {name} hotspots\n\n| Rank | Scope | Target | Classification | Confidence | Absolute ms | GPU share | Wall share | Dispatch calls | Dispatches/token | Threadgroups |\n|---:|---|---|---|---|---:|---:|---|---:|---:|---:|");
+            let _ = writeln!(
+                out,
+                "\n### {name} hotspots\n\n| Rank | Scope | Target | Classification | Confidence | Absolute ms | GPU share | Wall share | Dispatch calls | Dispatches/token | Threadgroups |\n|---:|---|---|---|---|---:|---:|---|---:|---:|---:|"
+            );
             for hotspot in hotspots {
                 let _ = writeln!(
                     out,
@@ -1235,7 +1402,9 @@ impl ProfileReport {
                     hotspot.confidence,
                     hotspot.absolute_ms,
                     hotspot.categorized_gpu_share * 100.0,
-                    hotspot.wall_time_share.map_or_else(|| "unavailable".into(), |x| format!("{:.1}%", x * 100.0)),
+                    hotspot
+                        .wall_time_share
+                        .map_or_else(|| "unavailable".into(), |x| format!("{:.1}%", x * 100.0)),
                     hotspot.dispatch_calls,
                     hotspot.dispatches_per_measured_token,
                     hotspot.threadgroups
@@ -1257,7 +1426,10 @@ pub fn duration_ns(value: Duration) -> u64 {
 }
 
 fn format_optional_ms(value: Option<u64>) -> String {
-    value.map_or_else(|| "unavailable".into(), |ns| format!("{:.3} ms", ns as f64 / 1e6))
+    value.map_or_else(
+        || "unavailable".into(),
+        |ns| format!("{:.3} ms", ns as f64 / 1e6),
+    )
 }
 
 #[cfg(test)]
@@ -1357,7 +1529,10 @@ mod tests {
         });
         let report = profiler.report();
         assert_eq!(report.recommendations.len(), 1);
-        assert_eq!(report.recommendations[0].scope, ProfileScope::DecodeMeasured);
+        assert_eq!(
+            report.recommendations[0].scope,
+            ProfileScope::DecodeMeasured
+        );
         assert_eq!(report.recommendations[0].dispatches_per_measured_token, 1.0);
         assert_eq!(report.hotspots.decode_warmup.len(), 1);
         assert_eq!(report.recommendations[0].categorized_gpu_share, 1.0);
@@ -1411,10 +1586,14 @@ mod tests {
             physical_command_buffer_overlap: true,
             physical_command_buffer_overlap_reason: Some("prefill selects token one".into()),
         });
-        let value: serde_json::Value = serde_json::from_str(&profiler.report().to_json().unwrap()).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&profiler.report().to_json().unwrap()).unwrap();
         assert_eq!(value["schema_version"], 4);
         assert_eq!(value["decode_scope"]["completed_decode_tokens_total"], 160);
-        assert_eq!(value["decode_scope"]["physical_command_buffer_overlap"], true);
+        assert_eq!(
+            value["decode_scope"]["physical_command_buffer_overlap"],
+            true
+        );
     }
 
     #[test]
@@ -1520,7 +1699,12 @@ mod tests {
         let report = profiler.report();
         assert_eq!(report.reconciliation.uncategorized_dispatch_calls, 4);
         assert!(!report.coverage.complete);
-        assert!(report.warnings.iter().any(|warning| warning.contains("incomplete")));
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("incomplete"))
+        );
     }
 
     #[test]
@@ -1590,8 +1774,7 @@ mod tests {
                 production_gpu_elapsed_ns: 100,
                 attributed_gpu_duration_ns: 130,
                 categorized_gpu_ns: 120,
-                gpu_duration_source:
-                    "production_boundary_plus_exact_dispatch_attribution".into(),
+                gpu_duration_source: "production_boundary_plus_exact_dispatch_attribution".into(),
                 ..Default::default()
             },
         )]));
@@ -1608,10 +1791,12 @@ mod tests {
             ..Default::default()
         });
         let report = profiler.report();
-        assert_eq!(report.scope_counters[&ProfileScope::DecodeMeasured].gpu_ns, 100);
         assert_eq!(
-            report.scope_counters[&ProfileScope::DecodeMeasured]
-                .attributed_gpu_duration_ns,
+            report.scope_counters[&ProfileScope::DecodeMeasured].gpu_ns,
+            100
+        );
+        assert_eq!(
+            report.scope_counters[&ProfileScope::DecodeMeasured].attributed_gpu_duration_ns,
             130
         );
         assert_eq!(report.recommendations[0].absolute_ms, 0.00012);

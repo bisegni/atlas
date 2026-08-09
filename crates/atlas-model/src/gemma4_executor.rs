@@ -384,9 +384,7 @@ fn gemma4_q4_two_pass_attention_first_pass_pipeline(
         }
         (Some("2pass_gqa"), false) => "attention_decode_fused_gemma4_simd_q4_0_2pass_1",
         (Some("2pass_simd"), _) => "attention_decode_fused_gemma4_simd_q4_0_2pass_1_simd",
-        (Some("2pass_simd_reg"), _) => {
-            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_simd_reg"
-        }
+        (Some("2pass_simd_reg"), _) => "attention_decode_fused_gemma4_simd_q4_0_2pass_1_simd_reg",
         (Some("2pass_cache"), _) => "attention_decode_fused_gemma4_simd_q4_0_2pass_1_cacheopt",
         (Some("2pass_cache_no_value_barrier"), _) => {
             "attention_decode_fused_gemma4_simd_q4_0_2pass_1_cacheopt_no_value_barrier"
@@ -545,11 +543,14 @@ pub struct Gemma4Metrics {
     pub ffn_gate_up_activation_kernel: &'static str,
     pub ffn_gate_up_scratch_bytes: u64,
     pub ple_composition_kernel: &'static str,
+    pub rms_epilogue_kernel: &'static str,
     pub q4_packed16_layout: &'static str,
     pub q4_batch_projection_kernel: &'static str,
     pub ffn_down_projection_kernel: &'static str,
     pub ple_projection_kernel: &'static str,
     pub rms_norm_kernel: &'static str,
+    pub rms_fused_projection_kernel: &'static str,
+    pub kv_append_kernel: &'static str,
     pub kv_cache_type: Gemma4KvCacheType,
     pub kv_cache_bytes: u64,
     pub quantization_plan_path: Option<String>,
@@ -694,6 +695,7 @@ fn gemma4_kernel_family(kernel: &str) -> &'static str {
         "matmul_q4_0_qkv_16row"
             | "matmul_q4_0_qkv_16row_simdgroup_tiled"
             | "matmul_q4_0_qkv_32row_mv"
+            | "matmul_q4_0_qkv_32row_mv_rms"
     ) {
         "q4_qkv_projection"
     } else if matches!(
@@ -701,10 +703,19 @@ fn gemma4_kernel_family(kernel: &str) -> &'static str {
         "matmul_q4_0_gate_up_16row"
             | "matmul_q4_0_gate_up_16row_simdgroup_tiled"
             | "matmul_q4_0_gate_up_32row_mv"
+            | "matmul_q4_0_gate_up_32row_mv_rms"
             | "matmul_q4_0_gate_up_gelu_16row"
     ) {
         "q4_ffn_gate_up_projection"
-    } else if matches!(kernel, "matvec_q6_k_8row" | "matvec_q6_k_8row_cacheopt") {
+    } else if matches!(
+        kernel,
+        "matvec_q6_k_8row"
+            | "matvec_q6_k_8row_cacheopt"
+            | "matvec_q6_k_32row_mv"
+            | "matvec_q6_k_32row_mv_rms"
+            | "matvec_q6_k_64row_mv"
+            | "matvec_q6_k_64row_mv_rms"
+    ) {
         "q6_lm_head_projection"
     } else if kernel.starts_with("matmul_q4_0_batch") || kernel.starts_with("matmul_q6_k_batch") {
         "batched_projection"
@@ -909,6 +920,7 @@ fn gemma4_qkv_fused_enabled() -> bool {
 fn gemma4_q6_projection_kernel_for(experiment: Option<&str>) -> &'static str {
     match experiment {
         Some("mv_ext") => "matvec_q6_k_32row_mv",
+        Some("mv_ext_64") => "matvec_q6_k_64row_mv",
         Some("cacheopt") => "matvec_q6_k_8row_cacheopt",
         _ => "matvec_q6_k_8row",
     }
@@ -925,6 +937,7 @@ fn gemma4_q6_projection_kernel() -> &'static str {
 fn gemma4_q4_projection_kernel_for(experiment: Option<&str>) -> &'static str {
     match experiment {
         Some("mv_ext") => "matvec_q4_0_32row_mv",
+        Some("mv_ext_64") => "matvec_q4_0_64row_mv",
         Some("simdgroup_tiled") => "matvec_q4_0_16row_simdgroup_tiled",
         Some("shared_input") | Some("on") | Some("1") => "matvec_q4_0_16row_shared_input",
         _ => "matvec_q4_0_16row",
@@ -936,11 +949,23 @@ fn gemma4_q4_simdgroup_tiled_enabled_for(experiment: Option<&str>) -> bool {
 }
 
 fn gemma4_q4_mv_ext_enabled_for(experiment: Option<&str>) -> bool {
-    matches!(experiment, Some("mv_ext"))
+    matches!(experiment, Some("mv_ext") | Some("mv_ext_64"))
+}
+
+fn gemma4_q4_mv_64row_enabled_for(experiment: Option<&str>) -> bool {
+    matches!(experiment, Some("mv_ext_64"))
 }
 
 fn gemma4_q4_mv_ext_enabled() -> bool {
     gemma4_q4_mv_ext_enabled_for(
+        std::env::var("ATLAS_GEMMA4_Q4_MATVEC_EXPERIMENT")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn gemma4_q4_mv_64row_enabled() -> bool {
+    gemma4_q4_mv_64row_enabled_for(
         std::env::var("ATLAS_GEMMA4_Q4_MATVEC_EXPERIMENT")
             .ok()
             .as_deref(),
@@ -952,7 +977,16 @@ fn gemma4_q6_mv_ext_enabled() -> bool {
         std::env::var("ATLAS_GEMMA4_Q6_LM_HEAD_EXPERIMENT")
             .ok()
             .as_deref(),
-        Some("mv_ext")
+        Some("mv_ext") | Some("mv_ext_64")
+    )
+}
+
+fn gemma4_q6_mv_64row_enabled() -> bool {
+    matches!(
+        std::env::var("ATLAS_GEMMA4_Q6_LM_HEAD_EXPERIMENT")
+            .ok()
+            .as_deref(),
+        Some("mv_ext_64")
     )
 }
 
@@ -966,7 +1000,7 @@ fn gemma4_q4_simdgroup_tiled_enabled() -> bool {
 
 fn gemma4_q4_qkv_projection_kernel_for(experiment: Option<&str>) -> &'static str {
     match experiment {
-        Some("mv_ext") => "matmul_q4_0_qkv_32row_mv",
+        Some("mv_ext") | Some("mv_ext_64") => "matmul_q4_0_qkv_32row_mv",
         Some("simdgroup_tiled") => "matmul_q4_0_qkv_16row_simdgroup_tiled",
         _ => "matmul_q4_0_qkv_16row",
     }
@@ -982,7 +1016,7 @@ pub(crate) fn gemma4_q4_qkv_projection_kernel() -> &'static str {
 
 fn gemma4_q4_gate_up_projection_kernel_for(experiment: Option<&str>) -> &'static str {
     match experiment {
-        Some("mv_ext") => "matmul_q4_0_gate_up_32row_mv",
+        Some("mv_ext") | Some("mv_ext_64") => "matmul_q4_0_gate_up_32row_mv",
         Some("simdgroup_tiled") => "matmul_q4_0_gate_up_16row_simdgroup_tiled",
         _ => "matmul_q4_0_gate_up_16row",
     }
@@ -997,19 +1031,34 @@ pub(crate) fn gemma4_q4_gate_up_projection_kernel() -> &'static str {
 }
 
 fn gemma4_q4_batch_projection_kernel_for(experiment: Option<&str>) -> &'static str {
-    if gemma4_q4_simdgroup_tiled_enabled_for(experiment) {
-        "matmul_q4_0_batch_16row_simdgroup_tiled"
-    } else {
-        "matmul_q4_0_batch_16row"
+    match experiment {
+        Some("tiled") => "matmul_q4_0_batch_16row_token_tiled",
+        _ => {
+            if gemma4_q4_simdgroup_tiled_enabled_for(experiment) {
+                "matmul_q4_0_batch_16row_simdgroup_tiled"
+            } else {
+                "matmul_q4_0_batch_16row"
+            }
+        }
     }
 }
 
 fn gemma4_q4_batch_projection_kernel() -> &'static str {
     gemma4_q4_batch_projection_kernel_for(
-        std::env::var("ATLAS_GEMMA4_Q4_MATVEC_EXPERIMENT")
+        std::env::var("ATLAS_GEMMA4_Q4_BATCH_EXPERIMENT")
             .ok()
-            .as_deref(),
+            .as_deref()
+            .or(std::env::var("ATLAS_GEMMA4_Q4_MATVEC_EXPERIMENT")
+                .ok()
+                .as_deref()),
     )
+}
+
+fn gemma4_q4_batch_projection_tiled_enabled() -> bool {
+    std::env::var("ATLAS_GEMMA4_Q4_BATCH_EXPERIMENT")
+        .as_deref()
+        .ok()
+        == Some("tiled")
 }
 
 pub(crate) fn gemma4_q4_projection_kernel() -> &'static str {
@@ -1031,6 +1080,8 @@ pub(crate) fn gemma4_ffn_down_projection_kernel() -> &'static str {
 fn gemma4_ffn_down_projection_kernel_for(experiment: Option<&str>) -> &'static str {
     if gemma4_ffn_down_interleaved_enabled_for(experiment) {
         "matvec_q4_0_16row_ffn_down_interleaved"
+    } else if gemma4_q4_mv_64row_enabled_for(experiment) || gemma4_q4_mv_64row_enabled() {
+        "matvec_q4_0_64row_mv"
     } else if gemma4_q4_mv_ext_enabled_for(experiment) || gemma4_q4_mv_ext_enabled() {
         "matvec_q4_0_32row_mv"
     } else if gemma4_q4_simdgroup_tiled_enabled() {
@@ -1110,6 +1161,38 @@ fn gemma4_rms_epilogue_fused_enabled() -> bool {
     )
 }
 
+/// RMS-input fusion is deliberately opt-in. It folds the attention-input,
+/// FFN-input, and final output norms into the consuming 32-row mv_ext matvec
+/// kernels, removing their standalone dispatches and the normalized-buffer
+/// device round trip. It only applies to the mv_ext kernel family and must be
+/// disabled while stage tracing observes the standalone normalized buffer.
+fn gemma4_rms_matvec_fused_enabled_for(experiment: Option<&str>) -> bool {
+    matches!(experiment, Some("fused") | Some("on") | Some("1"))
+}
+
+/// KV-append + provider V-norm fusion is opt-in (phase 13.0 P2b): it removes
+/// one dispatch per provider layer without changing the quantized cache
+/// bytes, which stay bitwise identical to the unfused path.
+fn gemma4_kv_append_vnorm_fused_enabled_for(experiment: Option<&str>) -> bool {
+    matches!(experiment, Some("fused") | Some("on") | Some("1"))
+}
+
+fn gemma4_kv_append_vnorm_fused_enabled() -> bool {
+    gemma4_kv_append_vnorm_fused_enabled_for(
+        std::env::var("ATLAS_GEMMA4_KV_APPEND_VNORM_EXPERIMENT")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn gemma4_rms_matvec_fused_enabled() -> bool {
+    gemma4_rms_matvec_fused_enabled_for(
+        std::env::var("ATLAS_GEMMA4_RMS_MATVEC_EXPERIMENT")
+            .ok()
+            .as_deref(),
+    )
+}
+
 fn gemma4_rms_norm_decode_kernel_for(hidden_size: usize, experiment: Option<&str>) -> &'static str {
     if matches!(
         experiment,
@@ -1137,6 +1220,14 @@ fn gemma4_kv_append_kernel(cache_type: Gemma4KvCacheType) -> &'static str {
         Gemma4KvCacheType::F32 => "kv_append_decode_f32",
         Gemma4KvCacheType::Q8_0 => "kv_append_decode_q8_0",
         Gemma4KvCacheType::Q4_0 => "kv_append_decode_q4_0",
+    }
+}
+
+fn gemma4_kv_append_vnorm_kernel(cache_type: Gemma4KvCacheType) -> &'static str {
+    match cache_type {
+        Gemma4KvCacheType::F32 => "kv_append_decode_f32_vnorm",
+        Gemma4KvCacheType::Q8_0 => "kv_append_decode_q8_0_vnorm",
+        Gemma4KvCacheType::Q4_0 => "kv_append_decode_q4_0_vnorm",
     }
 }
 
@@ -1831,26 +1922,97 @@ impl<'a> Gemma4E2bExecutor<'a> {
         };
         let buffers = &[input, weight, output, input_width, output_width_buffer];
         if format == GgufTensorType::Q4_0 {
-            let rows_per_group = if gemma4_q4_mv_ext_enabled() { 32 } else { 16 };
+            let rows_per_group = if gemma4_q4_mv_64row_enabled() {
+                64
+            } else if gemma4_q4_mv_ext_enabled() {
+                32
+            } else {
+                16
+            };
+            let threads = if gemma4_q4_mv_64row_enabled() {
+                256
+            } else {
+                128
+            };
             command.dispatch_threadgroups_1d_labeled(
                 kernel,
                 profiling_label,
                 buffers,
                 output_width.div_ceil(rows_per_group),
-                128,
+                threads,
             )?;
         } else if format == GgufTensorType::Q6K {
-            let rows_per_group = if gemma4_q6_mv_ext_enabled() { 32 } else { 8 };
+            let rows_per_group = if gemma4_q6_mv_64row_enabled() {
+                64
+            } else if gemma4_q6_mv_ext_enabled() {
+                32
+            } else {
+                8
+            };
+            let threads = if gemma4_q6_mv_64row_enabled() {
+                256
+            } else {
+                128
+            };
             command.dispatch_threadgroups_1d_labeled(
                 kernel,
                 profiling_label,
                 buffers,
                 output_width.div_ceil(rows_per_group),
-                128,
+                threads,
             )?;
         } else {
             command.dispatch_1d_labeled(kernel, profiling_label, buffers, output_width)?;
         }
+        Ok(())
+    }
+
+    /// Matvec over an input that is normalized in-kernel by the RMS-input
+    /// variants of the mv_ext kernels. Only the vocabulary output projection
+    /// consumes this path; the attention-input and FFN-input norms ride the
+    /// fused qkv/gate-up dispatches instead.
+    fn matvec_rms_labeled(
+        &self,
+        command: &mut atlas_metal::ResidentCommand<'_>,
+        profiling_label: Option<&'static str>,
+        input: &GpuBuffer,
+        weight: &GpuBuffer,
+        output: &GpuBuffer,
+        input_width: &GpuBuffer,
+        output_width_buffer: &GpuBuffer,
+        output_width: usize,
+        format: GgufTensorType,
+        rms_weight: &GpuBuffer,
+    ) -> Result<()> {
+        let (kernel, rows_per_group): (&'static str, usize) = match format {
+            GgufTensorType::Q4_0 if gemma4_q4_mv_ext_enabled() && gemma4_q4_mv_64row_enabled() => {
+                ("matvec_q4_0_64row_mv_rms", 64)
+            }
+            GgufTensorType::Q4_0 if gemma4_q4_mv_ext_enabled() => ("matvec_q4_0_32row_mv_rms", 32),
+            GgufTensorType::Q6K if gemma4_q6_mv_ext_enabled() && gemma4_q6_mv_64row_enabled() => {
+                ("matvec_q6_k_64row_mv_rms", 64)
+            }
+            GgufTensorType::Q6K if gemma4_q6_mv_ext_enabled() => ("matvec_q6_k_32row_mv_rms", 32),
+            _ => anyhow::bail!(
+                "RMS-input matvec requires the mv_ext kernel family for format {format:?}"
+            ),
+        };
+        let buffers = &[
+            input,
+            weight,
+            output,
+            input_width,
+            output_width_buffer,
+            rms_weight,
+            &self.epsilon,
+        ];
+        command.dispatch_threadgroups_1d_labeled(
+            kernel,
+            profiling_label,
+            buffers,
+            output_width.div_ceil(rows_per_group),
+            if rows_per_group == 64 { 256 } else { 128 },
+        )?;
         Ok(())
     }
 
@@ -1872,8 +2034,18 @@ impl<'a> Gemma4E2bExecutor<'a> {
             },
             Some("ffn_down_projection"),
             &[input, weight, output, input_width, output_width],
-            output_width_value.div_ceil(if gemma4_q4_mv_ext_enabled() { 32 } else { 16 }),
-            128,
+            output_width_value.div_ceil(if gemma4_q4_mv_64row_enabled() {
+                64
+            } else if gemma4_q4_mv_ext_enabled() {
+                32
+            } else {
+                16
+            }),
+            if gemma4_q4_mv_64row_enabled() {
+                256
+            } else {
+                128
+            },
         )?;
         Ok(())
     }
@@ -1930,7 +2102,11 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 kernel,
                 Some("layer_major_batched_projection"),
                 buffers,
-                batch_value * output_width_value.div_ceil(16),
+                if gemma4_q4_batch_projection_tiled_enabled() {
+                    batch_value.div_ceil(8) * output_width_value.div_ceil(16)
+                } else {
+                    batch_value * output_width_value.div_ceil(16)
+                },
                 128,
             )?,
             GgufTensorType::Q6K => command.dispatch_threadgroups_1d_labeled(
@@ -1974,7 +2150,11 @@ impl<'a> Gemma4E2bExecutor<'a> {
             kernel,
             Some("layer_major_batched_ffn_down_projection"),
             &[input, weight, output, input_width, output_width, batch],
-            batch_value * output_width_value.div_ceil(16),
+            if gemma4_q4_batch_projection_tiled_enabled() {
+                batch_value.div_ceil(8) * output_width_value.div_ceil(16)
+            } else {
+                batch_value * output_width_value.div_ceil(16)
+            },
             128,
         )?;
         Ok(())
@@ -2040,23 +2220,46 @@ impl<'a> Gemma4E2bExecutor<'a> {
         kv_width: &GpuBuffer,
         q_width_value: usize,
         kv_width_value: usize,
+        rms_weight: Option<&GpuBuffer>,
     ) -> Result<()> {
-        let buffers = &[
-            input,
-            q_weight,
-            k_weight,
-            v_weight,
-            q_output,
-            k_output,
-            v_output,
-            &self.hidden,
-            q_width,
-            kv_width,
-        ];
+        let (kernel, buffers): (&'static str, Vec<&GpuBuffer>) = match rms_weight {
+            Some(rms_weight) if gemma4_q4_mv_ext_enabled() => (
+                "matmul_q4_0_qkv_32row_mv_rms",
+                vec![
+                    input,
+                    q_weight,
+                    k_weight,
+                    v_weight,
+                    q_output,
+                    k_output,
+                    v_output,
+                    &self.hidden,
+                    q_width,
+                    kv_width,
+                    rms_weight,
+                    &self.epsilon,
+                ],
+            ),
+            _ => (
+                gemma4_q4_qkv_projection_kernel(),
+                vec![
+                    input,
+                    q_weight,
+                    k_weight,
+                    v_weight,
+                    q_output,
+                    k_output,
+                    v_output,
+                    &self.hidden,
+                    q_width,
+                    kv_width,
+                ],
+            ),
+        };
         command.dispatch_threadgroups_1d_labeled(
-            gemma4_q4_qkv_projection_kernel(),
+            kernel,
             Some("qkv_projection"),
-            buffers,
+            &buffers,
             if gemma4_q4_mv_ext_enabled() {
                 q_width_value.div_ceil(32) + 2 * kv_width_value.div_ceil(32)
             } else {
@@ -2077,19 +2280,40 @@ impl<'a> Gemma4E2bExecutor<'a> {
         up_output: &GpuBuffer,
         output_width: &GpuBuffer,
         output_width_value: usize,
+        rms_weight: Option<&GpuBuffer>,
     ) -> Result<()> {
+        let (kernel, buffers): (&'static str, Vec<&GpuBuffer>) = match rms_weight {
+            Some(rms_weight) if gemma4_q4_mv_ext_enabled() => (
+                "matmul_q4_0_gate_up_32row_mv_rms",
+                vec![
+                    input,
+                    gate_weight,
+                    up_weight,
+                    gate_output,
+                    up_output,
+                    &self.hidden,
+                    output_width,
+                    rms_weight,
+                    &self.epsilon,
+                ],
+            ),
+            _ => (
+                gemma4_q4_gate_up_projection_kernel(),
+                vec![
+                    input,
+                    gate_weight,
+                    up_weight,
+                    gate_output,
+                    up_output,
+                    &self.hidden,
+                    output_width,
+                ],
+            ),
+        };
         command.dispatch_threadgroups_1d_labeled(
-            gemma4_q4_gate_up_projection_kernel(),
+            kernel,
             Some("ffn_gate_up_projection"),
-            &[
-                input,
-                gate_weight,
-                up_weight,
-                gate_output,
-                up_output,
-                &self.hidden,
-                output_width,
-            ],
+            &buffers,
             if gemma4_q4_mv_ext_enabled() {
                 2 * output_width_value.div_ceil(32)
             } else {
@@ -2647,6 +2871,11 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 } else {
                     "gelu_f32+vector_multiply_offset_f32"
                 },
+                rms_epilogue_kernel: if gemma4_rms_epilogue_fused_enabled() {
+                    "gemma4_rms_residual_f32"
+                } else {
+                    "rms_norm_decode_f32+vector_add_f32"
+                },
                 q4_packed16_layout: match (self.ffn_down_packed16, self.ple_projection_packed16) {
                     (false, false) => "baseline",
                     (true, false) => "ffn_down",
@@ -2665,6 +2894,16 @@ impl<'a> Gemma4E2bExecutor<'a> {
                     gemma4_q4_projection_kernel()
                 },
                 rms_norm_kernel: gemma4_rms_norm_decode_kernel(self.model.config.hidden_size),
+                rms_fused_projection_kernel: if gemma4_rms_matvec_fused_enabled() {
+                    "rms_input_matvec_fused"
+                } else {
+                    "none"
+                },
+                kv_append_kernel: if gemma4_kv_append_vnorm_fused_enabled() {
+                    "kv_append_decode_fused_vnorm"
+                } else {
+                    gemma4_kv_append_kernel(self.kv_cache_type)
+                },
                 kv_cache_type: self.kv_cache_type,
                 kv_cache_bytes: self.kv_cache_bytes(),
                 quantization_plan_path: self.quantization_plan_path.clone(),
@@ -3280,9 +3519,9 @@ impl<'a> Gemma4E2bExecutor<'a> {
                     (&self.capacity, 0),
                     (key_counts, controls_offset),
                 ],
-                    c.attention_heads,
-                    usize::try_from(attention_threads).expect("attention threadgroup size"),
-                )?;
+                c.attention_heads,
+                usize::try_from(attention_threads).expect("attention threadgroup size"),
+            )?;
         }
         let wo = self.weight(&format!("{p}.attn_output.weight"), GgufTensorType::Q4_0)?;
         self.matmul_batch(
@@ -3755,15 +3994,18 @@ impl<'a> Gemma4E2bExecutor<'a> {
             let attn_norm = self.weight(&format!("{p}.attn_norm.weight"), GgufTensorType::F32)?;
             let wq = self.weight(&format!("{p}.attn_q.weight"), GgufTensorType::Q4_0)?;
             let q_norm = self.weight(&format!("{p}.attn_q_norm.weight"), GgufTensorType::F32)?;
-            self.rms_norm_decode_labeled(
-                &mut command,
-                Some("attention_input_norm"),
-                &self.state,
-                &attn_norm,
-                &self.norm,
-                trace_stages,
-            )?;
             let fused_qkv = source == layer && gemma4_qkv_fused_enabled();
+            let fused_rms_qkv = !trace_stages && gemma4_rms_matvec_fused_enabled() && fused_qkv;
+            if !fused_rms_qkv {
+                self.rms_norm_decode_labeled(
+                    &mut command,
+                    Some("attention_input_norm"),
+                    &self.state,
+                    &attn_norm,
+                    &self.norm,
+                    trace_stages,
+                )?;
+            }
             let fused_qk_norm_rope = gemma4_qk_norm_rope_fused_enabled();
             let (wk, wv, k_norm) = if source == layer {
                 (
@@ -3777,7 +4019,11 @@ impl<'a> Gemma4E2bExecutor<'a> {
             if fused_qkv {
                 self.matmul_q4_0_qkv(
                     &mut command,
-                    &self.norm,
+                    if fused_rms_qkv {
+                        &self.state
+                    } else {
+                        &self.norm
+                    },
                     &wq,
                     wk.as_ref().expect("provider layer has K weight"),
                     wv.as_ref().expect("provider layer has V weight"),
@@ -3788,6 +4034,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
                     head_width,
                     q_width,
                     head,
+                    fused_rms_qkv.then_some(&attn_norm),
                 )?;
             } else {
                 self.matvec_labeled(
@@ -3879,12 +4126,6 @@ impl<'a> Gemma4E2bExecutor<'a> {
                         head,
                     )?;
                 }
-                command.dispatch_1d_labeled(
-                    "rms_norm_groups_in_place_unweighted_f32",
-                    Some("provider_kv_value_norm"),
-                    &[&self.v, head_width, &self.one, &self.epsilon],
-                    head,
-                )?;
                 if !fused_qk_norm_rope {
                     command.dispatch_1d(
                         "rope_half_to_interleaved_f32",
@@ -3914,18 +4155,43 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 } else {
                     head / 32
                 };
-                command.dispatch_1d(
-                    gemma4_kv_append_kernel(self.kv_cache_type),
-                    &[
-                        &self.k_rot,
-                        &self.v,
-                        cache,
-                        head_width,
-                        &self.capacity,
-                        &self.position_buffer,
-                    ],
-                    append_count,
-                )?;
+                let fused_append_vnorm = !trace_stages && gemma4_kv_append_vnorm_fused_enabled();
+                if !fused_append_vnorm {
+                    command.dispatch_1d_labeled(
+                        "rms_norm_groups_in_place_unweighted_f32",
+                        Some("provider_kv_value_norm"),
+                        &[&self.v, head_width, &self.one, &self.epsilon],
+                        head,
+                    )?;
+                }
+                if fused_append_vnorm {
+                    command.dispatch_1d(
+                        gemma4_kv_append_vnorm_kernel(self.kv_cache_type),
+                        &[
+                            &self.k_rot,
+                            &self.v,
+                            cache,
+                            head_width,
+                            &self.capacity,
+                            &self.position_buffer,
+                            &self.epsilon,
+                        ],
+                        append_count,
+                    )?;
+                } else {
+                    command.dispatch_1d(
+                        gemma4_kv_append_kernel(self.kv_cache_type),
+                        &[
+                            &self.k_rot,
+                            &self.v,
+                            cache,
+                            head_width,
+                            &self.capacity,
+                            &self.position_buffer,
+                        ],
+                        append_count,
+                    )?;
+                }
             }
             // Gemma's cache source is explicit and observable through kv_sources; the existing resident attention kernel remains valid for one KV head.
             let cache = self.kv[source].as_ref().expect("Gemma KV source has cache");
@@ -4128,14 +4394,6 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 )?;
             }
             let ffn_norm = self.weight(&format!("{p}.ffn_norm.weight"), GgufTensorType::F32)?;
-            self.rms_norm_decode_labeled(
-                &mut command,
-                Some("ffn_input_norm"),
-                &self.residual,
-                &ffn_norm,
-                &self.norm,
-                trace_stages,
-            )?;
             let ffn = c.feed_forward_sizes[layer];
             let ffn_buffer = &self.ffn_widths[layer];
             let gate = self.weight(&format!("{p}.ffn_gate.weight"), GgufTensorType::Q4_0)?;
@@ -4143,6 +4401,20 @@ impl<'a> Gemma4E2bExecutor<'a> {
             let down = self.weight(&format!("{p}.ffn_down.weight"), GgufTensorType::Q4_0)?;
             let fused_ffn_gate_up = gemma4_ffn_gate_up_fused_enabled();
             let fused_ffn_gate_up_activation = self.ffn_gate_up_activation_fused;
+            let fused_rms_gate_up = !trace_stages
+                && gemma4_rms_matvec_fused_enabled()
+                && fused_ffn_gate_up
+                && !fused_ffn_gate_up_activation;
+            if !fused_rms_gate_up {
+                self.rms_norm_decode_labeled(
+                    &mut command,
+                    Some("ffn_input_norm"),
+                    &self.residual,
+                    &ffn_norm,
+                    &self.norm,
+                    trace_stages,
+                )?;
+            }
             if fused_ffn_gate_up_activation {
                 self.matmul_q4_0_gate_up_gelu(
                     &mut command,
@@ -4156,7 +4428,11 @@ impl<'a> Gemma4E2bExecutor<'a> {
             } else if fused_ffn_gate_up {
                 self.matmul_q4_0_gate_up(
                     &mut command,
-                    &self.norm,
+                    if fused_rms_gate_up {
+                        &self.residual
+                    } else {
+                        &self.norm
+                    },
                     &gate,
                     &up,
                     &self.gate,
@@ -4165,6 +4441,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
                         .context("Gemma baseline FFN Up buffer is unavailable")?,
                     ffn_buffer,
                     ffn,
+                    fused_rms_gate_up.then_some(&ffn_norm),
                 )?;
             } else {
                 self.matvec_labeled(
@@ -4337,28 +4614,46 @@ impl<'a> Gemma4E2bExecutor<'a> {
             )?;
             let post_ffn =
                 self.weight(&format!("{p}.post_ffw_norm.weight"), GgufTensorType::F32)?;
-            self.rms_norm_decode_labeled(
-                &mut command,
-                Some("post_ffn_norm"),
-                &self.work,
-                &post_ffn,
-                &self.work,
-                trace_stages,
-            )?;
-            if trace_stages {
-                let slot =
-                    runtime.upload_u32(&[u32::try_from(gemma4_trace_layer_slot(layer, 6))?])?;
-                command.dispatch_1d(
-                    "first_nonfinite_f32",
-                    &[&self.work, &self.validity, &self.hidden, &slot],
+            if gemma4_rms_epilogue_fused_enabled() && !trace_stages {
+                command.dispatch_threadgroups_1d_labeled(
+                    "gemma4_rms_residual_f32",
+                    Some("post_ffn_norm_residual"),
+                    &[
+                        &self.work,
+                        &post_ffn,
+                        &self.residual,
+                        &self.work,
+                        &self.state,
+                        &self.hidden,
+                        &self.epsilon,
+                    ],
                     1,
+                    32,
+                )?;
+            } else {
+                self.rms_norm_decode_labeled(
+                    &mut command,
+                    Some("post_ffn_norm"),
+                    &self.work,
+                    &post_ffn,
+                    &self.work,
+                    trace_stages,
+                )?;
+                if trace_stages {
+                    let slot =
+                        runtime.upload_u32(&[u32::try_from(gemma4_trace_layer_slot(layer, 6))?])?;
+                    command.dispatch_1d(
+                        "first_nonfinite_f32",
+                        &[&self.work, &self.validity, &self.hidden, &slot],
+                        1,
+                    )?;
+                }
+                command.dispatch_1d(
+                    "vector_add_f32",
+                    &[&self.residual, &self.work, &self.state, &self.hidden],
+                    h,
                 )?;
             }
-            command.dispatch_1d(
-                "vector_add_f32",
-                &[&self.residual, &self.work, &self.state, &self.hidden],
-                h,
-            )?;
             if trace_stages {
                 let slot =
                     runtime.upload_u32(&[u32::try_from(gemma4_trace_layer_slot(layer, 7))?])?;
@@ -4526,25 +4821,43 @@ impl<'a> Gemma4E2bExecutor<'a> {
             return Ok(());
         }
         let output_norm = self.weight("output_norm.weight", GgufTensorType::F32)?;
-        self.rms_norm_decode_labeled(
-            &mut command,
-            Some("final_output_norm"),
-            &self.state,
-            &output_norm,
-            &self.norm,
-            trace_stages,
-        )?;
-        self.matvec_labeled(
-            &mut command,
-            Some("output_projection"),
-            &self.norm,
-            &self.output_projection,
-            &self.logits,
-            &self.hidden,
-            &self.vocab,
-            c.vocab_size,
-            self.weight_format.output_format(),
-        )?;
+        let fused_rms_output = !trace_stages && gemma4_rms_matvec_fused_enabled();
+        if !fused_rms_output {
+            self.rms_norm_decode_labeled(
+                &mut command,
+                Some("final_output_norm"),
+                &self.state,
+                &output_norm,
+                &self.norm,
+                trace_stages,
+            )?;
+        }
+        if fused_rms_output {
+            self.matvec_rms_labeled(
+                &mut command,
+                Some("output_projection"),
+                &self.state,
+                &self.output_projection,
+                &self.logits,
+                &self.hidden,
+                &self.vocab,
+                c.vocab_size,
+                self.weight_format.output_format(),
+                &output_norm,
+            )?;
+        } else {
+            self.matvec_labeled(
+                &mut command,
+                Some("output_projection"),
+                &self.norm,
+                &self.output_projection,
+                &self.logits,
+                &self.hidden,
+                &self.vocab,
+                c.vocab_size,
+                self.weight_format.output_format(),
+            )?;
+        }
         command.dispatch_1d(
             "softcap_f32",
             &[&self.logits, &self.final_softcap, &self.vocab],
@@ -4661,17 +4974,17 @@ mod tests {
         gemma4_attention_key_count, gemma4_attention_key_count_table,
         gemma4_decode_profile_targets, gemma4_ffn_down_projection_kernel_for,
         gemma4_ffn_gate_up_activation_fused_enabled_for, gemma4_ffn_gate_up_fused_enabled_for,
-        gemma4_ffn_gelu_multiply_fused_enabled_for,
-        gemma4_kernel_family, gemma4_ple_composition_fused_enabled_for, gemma4_prefill_path,
-        gemma4_profile_family, gemma4_q4_batch_projection_kernel_for,
+        gemma4_ffn_gelu_multiply_fused_enabled_for, gemma4_kernel_family,
+        gemma4_kv_append_vnorm_fused_enabled_for, gemma4_ple_composition_fused_enabled_for,
+        gemma4_prefill_path, gemma4_profile_family, gemma4_q4_batch_projection_kernel_for,
         gemma4_q4_gate_up_projection_kernel_for, gemma4_q4_projection_kernel_for,
         gemma4_q4_qkv_projection_kernel_for, gemma4_q4_shared_kv_scan_supported,
-        gemma4_q4_two_pass_attention_eligible,
-        gemma4_q4_two_pass_attention_first_pass_pipeline, gemma4_q4_two_pass_attention_threshold,
-        gemma4_q6_k_to_q4_0,
+        gemma4_q4_two_pass_attention_eligible, gemma4_q4_two_pass_attention_first_pass_pipeline,
+        gemma4_q4_two_pass_attention_threshold, gemma4_q6_k_to_q4_0,
         gemma4_q6_projection_kernel_for, gemma4_rms_epilogue_fused_enabled_for,
-        gemma4_rms_norm_decode_kernel_for, gemma4_rope_angle, gemma4_selected_group_formats,
-        gemma4_should_finish, gemma4_two_pass_attention_ranges, gemma4_weight_format_with_plan,
+        gemma4_rms_matvec_fused_enabled_for, gemma4_rms_norm_decode_kernel_for, gemma4_rope_angle,
+        gemma4_selected_group_formats, gemma4_should_finish, gemma4_two_pass_attention_ranges,
+        gemma4_weight_format_with_plan,
     };
     use atlas_core::{GgufTensorType, dequantize_block};
 
@@ -5061,7 +5374,15 @@ mod tests {
             "matvec_q4_0_32row_mv"
         );
         assert_eq!(
+            gemma4_q4_projection_kernel_for(Some("mv_ext_64")),
+            "matvec_q4_0_64row_mv"
+        );
+        assert_eq!(
             gemma4_q4_qkv_projection_kernel_for(Some("mv_ext")),
+            "matmul_q4_0_qkv_32row_mv"
+        );
+        assert_eq!(
+            gemma4_q4_qkv_projection_kernel_for(Some("mv_ext_64")),
             "matmul_q4_0_qkv_32row_mv"
         );
         assert_eq!(
@@ -5070,6 +5391,10 @@ mod tests {
         );
         assert_eq!(
             gemma4_q4_gate_up_projection_kernel_for(Some("mv_ext")),
+            "matmul_q4_0_gate_up_32row_mv"
+        );
+        assert_eq!(
+            gemma4_q4_gate_up_projection_kernel_for(Some("mv_ext_64")),
             "matmul_q4_0_gate_up_32row_mv"
         );
         assert_eq!(
@@ -5087,6 +5412,14 @@ mod tests {
         assert_eq!(
             gemma4_q4_batch_projection_kernel_for(Some("simdgroup_tiled")),
             "matmul_q4_0_batch_16row_simdgroup_tiled"
+        );
+        assert_eq!(
+            gemma4_q4_batch_projection_kernel_for(Some("tiled")),
+            "matmul_q4_0_batch_16row_token_tiled"
+        );
+        assert_eq!(
+            gemma4_q4_batch_projection_kernel_for(None),
+            "matmul_q4_0_batch_16row"
         );
     }
 
@@ -5234,6 +5567,10 @@ mod tests {
             gemma4_q6_projection_kernel_for(Some("mv_ext")),
             "matvec_q6_k_32row_mv"
         );
+        assert_eq!(
+            gemma4_q6_projection_kernel_for(Some("mv_ext_64")),
+            "matvec_q6_k_64row_mv"
+        );
     }
 
     #[test]
@@ -5253,6 +5590,10 @@ mod tests {
         assert_eq!(
             gemma4_ffn_down_projection_kernel_for(Some("mv_ext")),
             "matvec_q4_0_32row_mv"
+        );
+        assert_eq!(
+            gemma4_ffn_down_projection_kernel_for(Some("mv_ext_64")),
+            "matvec_q4_0_64row_mv"
         );
     }
 
@@ -5411,6 +5752,7 @@ mod tests {
             "ple_input_gate",
             "output_projection",
             "post_attention_norm_residual",
+            "post_ffn_norm_residual",
             "gemma_attention_global_split_scan",
             "gemma_attention_global_split_combine",
         ] {
@@ -5436,6 +5778,66 @@ mod tests {
         assert!(!gemma4_rms_epilogue_fused_enabled_for(Some("off")));
         assert!(gemma4_rms_epilogue_fused_enabled_for(Some("fused")));
         assert!(gemma4_rms_epilogue_fused_enabled_for(Some("1")));
+    }
+
+    #[test]
+    fn kv_append_vnorm_fusion_is_opt_in_with_a_baseline_default() {
+        assert!(!gemma4_kv_append_vnorm_fused_enabled_for(None));
+        assert!(!gemma4_kv_append_vnorm_fused_enabled_for(Some("baseline")));
+        assert!(!gemma4_kv_append_vnorm_fused_enabled_for(Some("off")));
+        assert!(!gemma4_kv_append_vnorm_fused_enabled_for(Some("0")));
+        assert!(!gemma4_kv_append_vnorm_fused_enabled_for(Some("")));
+        assert!(gemma4_kv_append_vnorm_fused_enabled_for(Some("fused")));
+        assert!(gemma4_kv_append_vnorm_fused_enabled_for(Some("on")));
+        assert!(gemma4_kv_append_vnorm_fused_enabled_for(Some("1")));
+    }
+
+    #[test]
+    fn rms_matvec_fusion_is_opt_in_with_a_baseline_default() {
+        assert!(!gemma4_rms_matvec_fused_enabled_for(None));
+        assert!(!gemma4_rms_matvec_fused_enabled_for(Some("baseline")));
+        assert!(!gemma4_rms_matvec_fused_enabled_for(Some("off")));
+        assert!(!gemma4_rms_matvec_fused_enabled_for(Some("0")));
+        assert!(!gemma4_rms_matvec_fused_enabled_for(Some("")));
+        assert!(gemma4_rms_matvec_fused_enabled_for(Some("fused")));
+        assert!(gemma4_rms_matvec_fused_enabled_for(Some("on")));
+        assert!(gemma4_rms_matvec_fused_enabled_for(Some("1")));
+    }
+
+    #[test]
+    fn rms_matvec_kernels_map_into_their_projection_families() {
+        for kernel in [
+            "matvec_q4_0_32row_mv_rms",
+            "matvec_q4_0_32row_mv",
+            "matvec_q4_0_64row_mv_rms",
+            "matvec_q4_0_64row_mv",
+            "matvec_q4_0_16row",
+        ] {
+            assert_eq!(gemma4_kernel_family(kernel), "q4_projection_other");
+        }
+        for kernel in [
+            "matmul_q4_0_qkv_32row_mv_rms",
+            "matmul_q4_0_qkv_32row_mv",
+            "matmul_q4_0_qkv_16row",
+        ] {
+            assert_eq!(gemma4_kernel_family(kernel), "q4_qkv_projection");
+        }
+        for kernel in [
+            "matmul_q4_0_gate_up_32row_mv_rms",
+            "matmul_q4_0_gate_up_32row_mv",
+            "matmul_q4_0_gate_up_16row",
+        ] {
+            assert_eq!(gemma4_kernel_family(kernel), "q4_ffn_gate_up_projection");
+        }
+        for kernel in [
+            "matvec_q6_k_32row_mv_rms",
+            "matvec_q6_k_32row_mv",
+            "matvec_q6_k_64row_mv_rms",
+            "matvec_q6_k_64row_mv",
+            "matvec_q6_k_8row",
+        ] {
+            assert_eq!(gemma4_kernel_family(kernel), "q6_lm_head_projection");
+        }
     }
 
     #[test]

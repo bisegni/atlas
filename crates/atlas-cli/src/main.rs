@@ -10,27 +10,28 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use atlas_core::{GgufModel, GgufTensorType};
 use atlas_metal::MetalRuntime;
 use atlas_model::{
+    Gemma4ChatMessage, Gemma4ChatRole, Gemma4E2bModel,
     gemma4_executor::{
         Gemma4E2bExecutor, Gemma4FinishReason, Gemma4Generation, Gemma4KvCacheType,
         Gemma4SelectedGroupFormat,
     },
     gemma4_quantization_preflight::{
-        run_gemma4_quantization_preflight, Gemma4QuantizationPreflightInvocation,
+        Gemma4QuantizationPreflightInvocation, run_gemma4_quantization_preflight,
     },
     quantization_plan::default_sidecar_path,
-    render_gemma4_chat, Gemma4ChatMessage, Gemma4ChatRole, Gemma4E2bModel,
+    render_gemma4_chat,
 };
 use atlas_profiler::{
-    AttentionKind, AttentionScanPass, BenchmarkCompatibility, ClockDomain, DecodeScope, MeasuredWindow, OperationFamily,
-    PhaseSummary, ProfileCounters, ProfileEvent, ProfileMode, ProfilePhase, ProfileScope,
-    ProfileWorkload,
-    Profiler, ScopeContract, TimingBoundary, TimingKind,
+    AttentionKind, AttentionScanPass, BenchmarkCompatibility, ClockDomain, DecodeScope,
+    MeasuredWindow, OperationFamily, PhaseSummary, ProfileCounters, ProfileEvent, ProfileMode,
+    ProfilePhase, ProfileScope, ProfileWorkload, Profiler, ScopeContract, TimingBoundary,
+    TimingKind,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 mod providers;
@@ -52,11 +53,18 @@ struct GemmaProfileArgs {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GpuCountersMode { Auto, Required }
+enum GpuCountersMode {
+    Auto,
+    Required,
+}
 
 impl GpuCountersMode {
     fn parse(value: &str) -> Result<Self> {
-        match value { "auto" => Ok(Self::Auto), "required" => Ok(Self::Required), _ => bail!("unknown GPU counter mode `{value}`; expected auto or required") }
+        match value {
+            "auto" => Ok(Self::Auto),
+            "required" => Ok(Self::Required),
+            _ => bail!("unknown GPU counter mode `{value}`; expected auto or required"),
+        }
     }
 }
 
@@ -622,7 +630,9 @@ fn profile_bottlenecks(args: &[String]) -> Result<()> {
             }
             "--gpu-counters" => {
                 i += 1;
-                gpu_counters = Some(GpuCountersMode::parse(args.get(i).context("--gpu-counters needs a value")?)?);
+                gpu_counters = Some(GpuCountersMode::parse(
+                    args.get(i).context("--gpu-counters needs a value")?,
+                )?);
             }
             flag => {
                 profile_args.push(flag.to_owned());
@@ -784,30 +794,45 @@ fn profile_bottlenecks(args: &[String]) -> Result<()> {
                     kernel.cpu_encode_nanos.min(u64::MAX as u128) as u64,
                 )
             })
-            .chain(profile.samples.iter().filter(move |sample| {
-                matches!(
-                    (scope, sample.scope),
-                    (ProfileScope::DecodeWarmup, "decode_warmup")
-                        | (ProfileScope::DecodeMeasured, "decode_measured")
-                        | (ProfileScope::DecodeComplete, "decode_warmup")
-                        | (ProfileScope::DecodeComplete, "decode_measured")
-                )
-            }).flat_map(|sample| sample.kernels.iter()).map(|kernel| {
-                (
-                    profiler_operation_family(kernel.family),
-                    kernel.dispatches,
-                    kernel.gpu_nanos.min(u64::MAX as u128) as u64,
-                    kernel.cpu_encode_nanos.min(u64::MAX as u128) as u64,
-                )
-            }))
+            .chain(
+                profile
+                    .samples
+                    .iter()
+                    .filter(move |sample| {
+                        matches!(
+                            (scope, sample.scope),
+                            (ProfileScope::DecodeWarmup, "decode_warmup")
+                                | (ProfileScope::DecodeMeasured, "decode_measured")
+                                | (ProfileScope::DecodeComplete, "decode_warmup")
+                                | (ProfileScope::DecodeComplete, "decode_measured")
+                        )
+                    })
+                    .flat_map(|sample| sample.kernels.iter())
+                    .map(|kernel| {
+                        (
+                            profiler_operation_family(kernel.family),
+                            kernel.dispatches,
+                            kernel.gpu_nanos.min(u64::MAX as u128) as u64,
+                            kernel.cpu_encode_nanos.min(u64::MAX as u128) as u64,
+                        )
+                    }),
+            )
             .collect::<Vec<_>>()
     };
     let scope_event_stats = |scope: ProfileScope| {
         let events = scope_events(scope);
         (
             events.iter().map(|x| x.1).sum::<u64>(),
-            events.iter().filter(|x| x.0 != OperationFamily::Other).map(|x| x.1).sum::<u64>(),
-            events.iter().filter(|x| x.0 != OperationFamily::Other).map(|x| x.2).sum::<u64>(),
+            events
+                .iter()
+                .filter(|x| x.0 != OperationFamily::Other)
+                .map(|x| x.1)
+                .sum::<u64>(),
+            events
+                .iter()
+                .filter(|x| x.0 != OperationFamily::Other)
+                .map(|x| x.2)
+                .sum::<u64>(),
             events.iter().map(|x| x.2).sum::<u64>(),
             events.iter().map(|x| x.3).sum::<u64>(),
         )
@@ -815,45 +840,61 @@ fn profile_bottlenecks(args: &[String]) -> Result<()> {
     let production_scopes = [
         (ProfileScope::Prefill, production.metrics.prefill_scope),
         (ProfileScope::DecodeWarmup, production.metrics.warmup_scope),
-        (ProfileScope::DecodeMeasured, production.metrics.measured_scope),
-        (ProfileScope::DecodeComplete, production.metrics.complete_decode_scope),
+        (
+            ProfileScope::DecodeMeasured,
+            production.metrics.measured_scope,
+        ),
+        (
+            ProfileScope::DecodeComplete,
+            production.metrics.complete_decode_scope,
+        ),
     ];
     let mut scope_counters = BTreeMap::new();
     for (scope, measured) in production_scopes {
         let (_, categorized, categorized_gpu, attributed_gpu, host_encode) =
             scope_event_stats(scope);
-        scope_counters.insert(scope, ProfileCounters {
-            host_wall_ns: atlas_profiler::duration_ns(measured.wall_time),
-            gpu_ns: measured.telemetry.gpu_execution_nanos,
-            production_gpu_elapsed_ns: measured.telemetry.gpu_execution_nanos,
-            attributed_gpu_duration_ns: attributed_gpu,
-            gpu_duration_source: "production_boundary_plus_exact_dispatch_attribution".into(),
-            categorized_gpu_ns: categorized_gpu,
-            cpu_wait_ns: measured.telemetry.cpu_wait_nanos,
-            host_encode_ns: host_encode,
-            command_buffers: measured.telemetry.command_buffers,
-            dispatches: measured.telemetry.dispatches,
-            threadgroups_dispatched: measured.telemetry.threadgroups_dispatched,
-            threads_dispatched: measured.telemetry.threads_dispatched,
-            timed_dispatches: measured.telemetry.timed_dispatches,
-            categorized_dispatches: categorized,
-            upload_bytes: measured.telemetry.upload_bytes,
-            readback_bytes: measured.telemetry.readback_bytes,
-            allocations: measured.telemetry.buffer_allocations,
-            resident_bytes: measured.telemetry.resident_bytes,
-            peak_resident_bytes: measured.telemetry.peak_resident_bytes,
-            kv_cache_bytes: executor.kv_cache_bytes(),
-            upload_time_ns: measured.telemetry.upload_time_nanos,
-            readback_time_ns: measured.telemetry.readback_time_nanos,
-            memory_operation_time_ns: measured.telemetry.upload_time_nanos.saturating_add(measured.telemetry.readback_time_nanos),
-            ..Default::default()
-        });
+        scope_counters.insert(
+            scope,
+            ProfileCounters {
+                host_wall_ns: atlas_profiler::duration_ns(measured.wall_time),
+                gpu_ns: measured.telemetry.gpu_execution_nanos,
+                production_gpu_elapsed_ns: measured.telemetry.gpu_execution_nanos,
+                attributed_gpu_duration_ns: attributed_gpu,
+                gpu_duration_source: "production_boundary_plus_exact_dispatch_attribution".into(),
+                categorized_gpu_ns: categorized_gpu,
+                cpu_wait_ns: measured.telemetry.cpu_wait_nanos,
+                host_encode_ns: host_encode,
+                command_buffers: measured.telemetry.command_buffers,
+                dispatches: measured.telemetry.dispatches,
+                threadgroups_dispatched: measured.telemetry.threadgroups_dispatched,
+                threads_dispatched: measured.telemetry.threads_dispatched,
+                timed_dispatches: measured.telemetry.timed_dispatches,
+                categorized_dispatches: categorized,
+                upload_bytes: measured.telemetry.upload_bytes,
+                readback_bytes: measured.telemetry.readback_bytes,
+                allocations: measured.telemetry.buffer_allocations,
+                resident_bytes: measured.telemetry.resident_bytes,
+                peak_resident_bytes: measured.telemetry.peak_resident_bytes,
+                kv_cache_bytes: executor.kv_cache_bytes(),
+                upload_time_ns: measured.telemetry.upload_time_nanos,
+                readback_time_ns: measured.telemetry.readback_time_nanos,
+                memory_operation_time_ns: measured
+                    .telemetry
+                    .upload_time_nanos
+                    .saturating_add(measured.telemetry.readback_time_nanos),
+                ..Default::default()
+            },
+        );
     }
     profiler.set_scope_counters(scope_counters);
     if let Some(requested) = gpu_counters {
         let metadata = executor.diagnostic_counter_metadata();
-        if requested == GpuCountersMode::Required && !metadata.dispatch_boundary_sampling_supported {
-            bail!("GPU counter sampling at dispatch boundaries is required but unsupported by {}", metadata.device_name);
+        if requested == GpuCountersMode::Required && !metadata.dispatch_boundary_sampling_supported
+        {
+            bail!(
+                "GPU counter sampling at dispatch boundaries is required but unsupported by {}",
+                metadata.device_name
+            );
         }
         profiler.set_gpu_counter_capture(Some(json!({
             "requested": match requested { GpuCountersMode::Auto => "auto", GpuCountersMode::Required => "required" },
@@ -882,33 +923,55 @@ fn profile_bottlenecks(args: &[String]) -> Result<()> {
         completed_decode_tokens_total: production.metrics.completed_decode_tokens as u64,
         hotspot_scope: ProfileScope::DecodeMeasured,
         physical_command_buffer_overlap: production.metrics.physical_command_buffer_overlap,
-        physical_command_buffer_overlap_reason: production.metrics.physical_command_buffer_overlap_reason.clone(),
+        physical_command_buffer_overlap_reason: production
+            .metrics
+            .physical_command_buffer_overlap_reason
+            .clone(),
     });
     let mut windows = BTreeMap::new();
     for (scope, measured, tokens) in [
-        (ProfileScope::Prefill, production.metrics.prefill_scope, profile.prompt_tokens),
-        (ProfileScope::DecodeWarmup, production.metrics.warmup_scope, args.warmup_decode_tokens),
-        (ProfileScope::DecodeMeasured, production.metrics.measured_scope, args.decode_tokens),
-        (ProfileScope::DecodeComplete, production.metrics.complete_decode_scope, production.metrics.completed_decode_tokens),
+        (
+            ProfileScope::Prefill,
+            production.metrics.prefill_scope,
+            profile.prompt_tokens,
+        ),
+        (
+            ProfileScope::DecodeWarmup,
+            production.metrics.warmup_scope,
+            args.warmup_decode_tokens,
+        ),
+        (
+            ProfileScope::DecodeMeasured,
+            production.metrics.measured_scope,
+            args.decode_tokens,
+        ),
+        (
+            ProfileScope::DecodeComplete,
+            production.metrics.complete_decode_scope,
+            production.metrics.completed_decode_tokens,
+        ),
     ] {
-        windows.insert(scope, MeasuredWindow {
+        windows.insert(
             scope,
-            host_start_ns: Some(measured.host_start_ns),
-            host_end_ns: Some(measured.host_end_ns),
-            wall_time_ms: Some(measured.wall_time.as_secs_f64() * 1000.0),
-            tokens: tokens as u64,
-            token_selection_included: true,
-            readback_included: true,
-            timing: TimingBoundary {
-                clock_domain: ClockDomain::HostMonotonic,
-                timing_kind: TimingKind::HostWall,
-                start_ns: Some(measured.host_start_ns),
-                end_ns: Some(measured.host_end_ns),
-                intervals_may_overlap: false,
-                status: "relative_boundary_recorded_by_resident_executor".into(),
-                ..Default::default()
+            MeasuredWindow {
+                scope,
+                host_start_ns: Some(measured.host_start_ns),
+                host_end_ns: Some(measured.host_end_ns),
+                wall_time_ms: Some(measured.wall_time.as_secs_f64() * 1000.0),
+                tokens: tokens as u64,
+                token_selection_included: true,
+                readback_included: true,
+                timing: TimingBoundary {
+                    clock_domain: ClockDomain::HostMonotonic,
+                    timing_kind: TimingKind::HostWall,
+                    start_ns: Some(measured.host_start_ns),
+                    end_ns: Some(measured.host_end_ns),
+                    intervals_may_overlap: false,
+                    status: "relative_boundary_recorded_by_resident_executor".into(),
+                    ..Default::default()
+                },
             },
-        });
+        );
     }
     profiler.set_measured_windows(windows);
     let mut compatibility_warnings = Vec::new();
@@ -923,19 +986,20 @@ fn profile_bottlenecks(args: &[String]) -> Result<()> {
     }
     profiler.set_benchmark_compatibility(BenchmarkCompatibility {
         scope_matches_normal_benchmark: true,
-        token_window_matches: production.generation.generated_token_ids.len() == profile.completed_decode_tokens,
+        token_window_matches: production.generation.generated_token_ids.len()
+            == profile.completed_decode_tokens,
         executor_matches: true,
         kernel_plan_matches: true,
         token_sha_matches: production.generation.generated_token_ids == profile.generated_token_ids,
         eos_matches: production.first_eos_position == profile.first_eos_position,
         prompt_token_sha256: Some(token_ids_sha256(&production.generation.prompt_token_ids)),
-        generated_token_sha256: Some(token_ids_sha256(
-            &production.generation.generated_token_ids,
-        )),
+        generated_token_sha256: Some(token_ids_sha256(&production.generation.generated_token_ids)),
         measured_generated_token_sha256: Some(token_ids_sha256(
             &production.generation.generated_token_ids[args.warmup_decode_tokens..],
         )),
-        first_eos_position: production.first_eos_position.map(|position| position as u64),
+        first_eos_position: production
+            .first_eos_position
+            .map(|position| position as u64),
         executor: Some("resident".into()),
         kv_cache_type: Some(production.metrics.kv_cache_type.as_str().into()),
         quantization_plan: production.metrics.quantization_plan_path.clone(),
@@ -961,11 +1025,17 @@ fn profile_bottlenecks(args: &[String]) -> Result<()> {
         threadgroups_dispatched: measured.telemetry.threadgroups_dispatched,
         threads_dispatched: measured.telemetry.threads_dispatched,
         timed_dispatches: measured.telemetry.timed_dispatches,
-        untimed_dispatches: measured.telemetry.dispatches.saturating_sub(measured.telemetry.timed_dispatches),
+        untimed_dispatches: measured
+            .telemetry
+            .dispatches
+            .saturating_sub(measured.telemetry.timed_dispatches),
         categorized_dispatches: categorized,
         uncategorized_dispatches: measured.telemetry.dispatches.saturating_sub(categorized),
         categorized_gpu_ns: categorized_gpu,
-        uncategorized_gpu_ns: measured.telemetry.gpu_execution_nanos.saturating_sub(categorized_gpu),
+        uncategorized_gpu_ns: measured
+            .telemetry
+            .gpu_execution_nanos
+            .saturating_sub(categorized_gpu),
         host_encode_ns: host_encode,
         upload_time_ns: measured.telemetry.upload_time_nanos,
         readback_time_ns: measured.telemetry.readback_time_nanos,
@@ -1026,10 +1096,14 @@ fn profile_bottlenecks(args: &[String]) -> Result<()> {
             ProfileScope::DecodeComplete,
             production.metrics.complete_decode_scope,
             production.metrics.completed_decode_tokens as u64,
-            scope_event_stats(ProfileScope::DecodeWarmup).1 + scope_event_stats(ProfileScope::DecodeMeasured).1,
-            scope_event_stats(ProfileScope::DecodeWarmup).2 + scope_event_stats(ProfileScope::DecodeMeasured).2,
-            scope_event_stats(ProfileScope::DecodeWarmup).3 + scope_event_stats(ProfileScope::DecodeMeasured).3,
-            scope_event_stats(ProfileScope::DecodeWarmup).4 + scope_event_stats(ProfileScope::DecodeMeasured).4,
+            scope_event_stats(ProfileScope::DecodeWarmup).1
+                + scope_event_stats(ProfileScope::DecodeMeasured).1,
+            scope_event_stats(ProfileScope::DecodeWarmup).2
+                + scope_event_stats(ProfileScope::DecodeMeasured).2,
+            scope_event_stats(ProfileScope::DecodeWarmup).3
+                + scope_event_stats(ProfileScope::DecodeMeasured).3,
+            scope_event_stats(ProfileScope::DecodeWarmup).4
+                + scope_event_stats(ProfileScope::DecodeMeasured).4,
         ),
         PhaseSummary {
             phase: ProfilePhase::HostSynchronization,
@@ -1120,10 +1194,15 @@ fn profiler_operation_family(family: &str) -> OperationFamily {
         "qkv_projection" => OperationFamily::QkvProjection,
         "ffn_gate_up_projection" => OperationFamily::FfnGateUp,
         "output_projection" => OperationFamily::OutputProjection,
-        "gemma_attention_global_split_scan"
-        | "gemma_attention_sliding_split_scan" => OperationFamily::AttentionScore,
-        "gemma_attention_global_split_combine" | "gemma_attention_sliding_split_combine" => OperationFamily::AttentionValue,
-        "gemma_attention_flash16" | "gemma_attention_flash16_swa" => OperationFamily::AttentionScore,
+        "gemma_attention_global_split_scan" | "gemma_attention_sliding_split_scan" => {
+            OperationFamily::AttentionScore
+        }
+        "gemma_attention_global_split_combine" | "gemma_attention_sliding_split_combine" => {
+            OperationFamily::AttentionValue
+        }
+        "gemma_attention_flash16" | "gemma_attention_flash16_swa" => {
+            OperationFamily::AttentionScore
+        }
 
         // Exact fallback families emitted when a dispatch has no explicit
         // profiling label. Ambiguous projection families remain conservative.
@@ -1140,19 +1219,27 @@ fn profiler_operation_family(family: &str) -> OperationFamily {
         "argmax" => OperationFamily::ArgmaxOrTokenSelection,
         "conversion" => OperationFamily::Conversion,
         "q4_projection_other" | "q6_projection_other" => OperationFamily::Other,
-        "batched_projection" | "rope_rotation" | "rope_layout" | "other" => {
-            OperationFamily::Other
-        }
+        "batched_projection" | "rope_rotation" | "rope_layout" | "other" => OperationFamily::Other,
         _ => OperationFamily::Other,
     }
 }
 
 fn attention_dimensions(family: &str) -> (Option<AttentionKind>, Option<AttentionScanPass>) {
     match family {
-        "gemma_attention_global_split_scan" => (Some(AttentionKind::Global), Some(AttentionScanPass::Scan)),
-        "gemma_attention_global_split_combine" => (Some(AttentionKind::Global), Some(AttentionScanPass::Combine)),
-        "gemma_attention_sliding_split_scan" => (Some(AttentionKind::Sliding), Some(AttentionScanPass::Scan)),
-        "gemma_attention_sliding_split_combine" => (Some(AttentionKind::Sliding), Some(AttentionScanPass::Combine)),
+        "gemma_attention_global_split_scan" => {
+            (Some(AttentionKind::Global), Some(AttentionScanPass::Scan))
+        }
+        "gemma_attention_global_split_combine" => (
+            Some(AttentionKind::Global),
+            Some(AttentionScanPass::Combine),
+        ),
+        "gemma_attention_sliding_split_scan" => {
+            (Some(AttentionKind::Sliding), Some(AttentionScanPass::Scan))
+        }
+        "gemma_attention_sliding_split_combine" => (
+            Some(AttentionKind::Sliding),
+            Some(AttentionScanPass::Combine),
+        ),
         _ => (None, None),
     }
 }
@@ -1194,13 +1281,11 @@ fn benchmark(args: &[String]) -> Result<()> {
         "ple_projection": generation.metrics.ple_projection_kernel,
         "q6_projection": generation.metrics.q6_projection_kernel,
         "rms_norm": generation.metrics.rms_norm_kernel,
+        "rms_fused_projection": generation.metrics.rms_fused_projection_kernel,
+        "rms_epilogue": generation.metrics.rms_epilogue_kernel,
         "embedding": generation.metrics.embedding_kernel,
         "output_projection": generation.metrics.output_projection_kernel,
-        "kv_append": match generation.metrics.kv_cache_type {
-            Gemma4KvCacheType::F32 => "kv_append_decode_f32",
-            Gemma4KvCacheType::Q8_0 => "kv_append_decode_q8_0",
-            Gemma4KvCacheType::Q4_0 => "kv_append_decode_q4_0",
-        },
+        "kv_append": generation.metrics.kv_append_kernel,
     });
     let record = json!({
         "event": "gemma4_fixed_workload_benchmark",
@@ -1214,6 +1299,7 @@ fn benchmark(args: &[String]) -> Result<()> {
         "q4_projection_kernel": generation.metrics.q4_projection_kernel,
         "ffn_down_projection_kernel": generation.metrics.ffn_down_projection_kernel,
         "rms_norm_kernel": generation.metrics.rms_norm_kernel,
+        "rms_fused_projection_kernel": generation.metrics.rms_fused_projection_kernel,
         "prompt_template": "gemma4_chat",
         "prompt_token_sha256": prompt_token_digest,
         "kv_cache_type": generation.metrics.kv_cache_type.as_str(),
@@ -1291,27 +1377,51 @@ fn selected_kernels_map(
     let mut kernels = BTreeMap::from([
         ("attention".into(), metrics.attention_kernel.into()),
         ("q4_projection".into(), metrics.q4_projection_kernel.into()),
-        ("q4_qkv_projection".into(), metrics.q4_qkv_projection_kernel.into()),
-        ("q4_gate_up_projection".into(), metrics.q4_gate_up_projection_kernel.into()),
-        ("ffn_gate_up_activation".into(), metrics.ffn_gate_up_activation_kernel.into()),
-        ("ple_composition".into(), metrics.ple_composition_kernel.into()),
-        ("q4_packed16_layout".into(), metrics.q4_packed16_layout.into()),
-        ("q4_batch_projection".into(), metrics.q4_batch_projection_kernel.into()),
-        ("ffn_down_projection".into(), metrics.ffn_down_projection_kernel.into()),
-        ("ple_projection".into(), metrics.ple_projection_kernel.into()),
+        (
+            "q4_qkv_projection".into(),
+            metrics.q4_qkv_projection_kernel.into(),
+        ),
+        (
+            "q4_gate_up_projection".into(),
+            metrics.q4_gate_up_projection_kernel.into(),
+        ),
+        (
+            "ffn_gate_up_activation".into(),
+            metrics.ffn_gate_up_activation_kernel.into(),
+        ),
+        (
+            "ple_composition".into(),
+            metrics.ple_composition_kernel.into(),
+        ),
+        ("rms_epilogue".into(), metrics.rms_epilogue_kernel.into()),
+        (
+            "q4_packed16_layout".into(),
+            metrics.q4_packed16_layout.into(),
+        ),
+        (
+            "q4_batch_projection".into(),
+            metrics.q4_batch_projection_kernel.into(),
+        ),
+        (
+            "ffn_down_projection".into(),
+            metrics.ffn_down_projection_kernel.into(),
+        ),
+        (
+            "ple_projection".into(),
+            metrics.ple_projection_kernel.into(),
+        ),
         ("q6_projection".into(), metrics.q6_projection_kernel.into()),
         ("rms_norm".into(), metrics.rms_norm_kernel.into()),
-        ("embedding".into(), metrics.embedding_kernel.into()),
-        ("output_projection".into(), metrics.output_projection_kernel.into()),
         (
-            "kv_append".into(),
-            match metrics.kv_cache_type {
-                Gemma4KvCacheType::F32 => "kv_append_decode_f32",
-                Gemma4KvCacheType::Q8_0 => "kv_append_decode_q8_0",
-                Gemma4KvCacheType::Q4_0 => "kv_append_decode_q4_0",
-            }
-            .into(),
+            "rms_fused_projection".into(),
+            metrics.rms_fused_projection_kernel.into(),
         ),
+        ("embedding".into(), metrics.embedding_kernel.into()),
+        (
+            "output_projection".into(),
+            metrics.output_projection_kernel.into(),
+        ),
+        ("kv_append".into(), metrics.kv_append_kernel.into()),
     ]);
     if let Some(plan) = &metrics.quantization_plan_path {
         kernels.insert("quantization_plan".into(), plan.clone());
@@ -1798,8 +1908,9 @@ fn metal_info() -> Result<()> {
 #[cfg(test)]
 mod kv_cache_cli_tests {
     use super::{
-        attention_dimensions, parse_benchmark_args, parse_chat_args, parse_profile_args, token_ids_sha256,
-        profiler_operation_family, Gemma4KvCacheType, GpuCountersMode, ThoughtFilter,
+        Gemma4KvCacheType, GpuCountersMode, ThoughtFilter, attention_dimensions,
+        parse_benchmark_args, parse_chat_args, parse_profile_args, profiler_operation_family,
+        token_ids_sha256,
     };
     use atlas_profiler::{AttentionKind, AttentionScanPass, OperationFamily};
 
@@ -1828,7 +1939,10 @@ mod kv_cache_cli_tests {
             ("qkv_projection", OperationFamily::QkvProjection),
             ("ffn_gate_up_projection", OperationFamily::FfnGateUp),
             ("output_projection", OperationFamily::OutputProjection),
-            ("gemma_attention_global_split_scan", OperationFamily::AttentionScore),
+            (
+                "gemma_attention_global_split_scan",
+                OperationFamily::AttentionScore,
+            ),
             (
                 "gemma_attention_global_split_combine",
                 OperationFamily::AttentionValue,
@@ -1851,15 +1965,30 @@ mod kv_cache_cli_tests {
 
     #[test]
     fn attention_semantic_labels_preserve_kind_and_pass() {
-        assert_eq!(attention_dimensions("gemma_attention_global_split_scan"), (Some(AttentionKind::Global), Some(AttentionScanPass::Scan)));
-        assert_eq!(attention_dimensions("gemma_attention_sliding_split_combine"), (Some(AttentionKind::Sliding), Some(AttentionScanPass::Combine)));
+        assert_eq!(
+            attention_dimensions("gemma_attention_global_split_scan"),
+            (Some(AttentionKind::Global), Some(AttentionScanPass::Scan))
+        );
+        assert_eq!(
+            attention_dimensions("gemma_attention_sliding_split_combine"),
+            (
+                Some(AttentionKind::Sliding),
+                Some(AttentionScanPass::Combine)
+            )
+        );
         assert_eq!(attention_dimensions("ffn_down_projection"), (None, None));
     }
 
     #[test]
     fn gpu_counter_mode_accepts_only_explicit_diagnostic_modes() {
-        assert_eq!(GpuCountersMode::parse("auto").unwrap(), GpuCountersMode::Auto);
-        assert_eq!(GpuCountersMode::parse("required").unwrap(), GpuCountersMode::Required);
+        assert_eq!(
+            GpuCountersMode::parse("auto").unwrap(),
+            GpuCountersMode::Auto
+        );
+        assert_eq!(
+            GpuCountersMode::parse("required").unwrap(),
+            GpuCountersMode::Required
+        );
         assert!(GpuCountersMode::parse("always").is_err());
     }
 
