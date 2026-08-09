@@ -300,12 +300,14 @@ fn gemma4_q4_two_pass_attention_threshold(experiment: Option<&str>) -> Option<us
         Some("2pass_cache_no_value_barrier") => {
             Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
         }
+        Some("2pass_key_blockvec") => Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD),
         Some("2pass_unroll2_no_value_barrier") => {
             Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
         }
         Some("2pass_gqa") => Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD),
         Some("2pass_mqa_tiled") => Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD),
         Some("2pass_simd") => Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD),
+        Some("2pass_simd_reg") => Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD),
         Some("2pass_no_value_barrier") => Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD),
         _ => None,
     }
@@ -313,6 +315,59 @@ fn gemma4_q4_two_pass_attention_threshold(experiment: Option<&str>) -> Option<us
 
 fn gemma4_q4_shared_kv_scan_supported(attention_heads: usize, head_dim: usize) -> bool {
     attention_heads == GEMMA4_Q4_SHARED_KV_QUERY_HEADS && head_dim == GEMMA4_Q4_SHARED_KV_HEAD_DIM
+}
+
+fn gemma4_q4_flash16_supported(attention_heads: usize, head_dim: usize) -> bool {
+    attention_heads == 8 && (head_dim == 512 || head_dim == 256)
+}
+
+fn gemma4_q4_flash16_binding(
+    sliding: bool,
+    experiment: Option<&str>,
+) -> Option<(&'static str, &'static str, u32)> {
+    let (kernel, label, threads) = match experiment {
+        Some("flash16_u") => (
+            if sliding {
+                "attention_decode_gemma4_simd_q4_0_flash16_swa_u"
+            } else {
+                "attention_decode_gemma4_simd_q4_0_flash16_u"
+            },
+            if sliding {
+                "gemma_attention_flash16_swa"
+            } else {
+                "gemma_attention_flash16"
+            },
+            if sliding { 512 } else { 256 },
+        ),
+        Some("flash16_uw") => (
+            if sliding {
+                "attention_decode_gemma4_simd_q4_0_flash16_swa_uw"
+            } else {
+                "attention_decode_gemma4_simd_q4_0_flash16_uw"
+            },
+            if sliding {
+                "gemma_attention_flash16_swa"
+            } else {
+                "gemma_attention_flash16"
+            },
+            if sliding { 768 } else { 384 },
+        ),
+        Some("flash16") => (
+            if sliding {
+                "attention_decode_gemma4_simd_q4_0_flash16_swa"
+            } else {
+                "attention_decode_gemma4_simd_q4_0_flash16"
+            },
+            if sliding {
+                "gemma_attention_flash16_swa"
+            } else {
+                "gemma_attention_flash16"
+            },
+            if sliding { 512 } else { 256 },
+        ),
+        _ => return None,
+    };
+    Some((kernel, label, threads))
 }
 
 fn gemma4_q4_two_pass_attention_first_pass_pipeline(
@@ -329,9 +384,15 @@ fn gemma4_q4_two_pass_attention_first_pass_pipeline(
         }
         (Some("2pass_gqa"), false) => "attention_decode_fused_gemma4_simd_q4_0_2pass_1",
         (Some("2pass_simd"), _) => "attention_decode_fused_gemma4_simd_q4_0_2pass_1_simd",
+        (Some("2pass_simd_reg"), _) => {
+            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_simd_reg"
+        }
         (Some("2pass_cache"), _) => "attention_decode_fused_gemma4_simd_q4_0_2pass_1_cacheopt",
         (Some("2pass_cache_no_value_barrier"), _) => {
             "attention_decode_fused_gemma4_simd_q4_0_2pass_1_cacheopt_no_value_barrier"
+        }
+        (Some("2pass_key_blockvec"), _) => {
+            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_key_blockvec"
         }
         (Some("2pass_unroll2_no_value_barrier"), _) => {
             "attention_decode_fused_gemma4_simd_q4_0_2pass_1_unroll2_no_value_barrier"
@@ -630,13 +691,16 @@ pub struct Gemma4DecodeProfile {
 fn gemma4_kernel_family(kernel: &str) -> &'static str {
     if matches!(
         kernel,
-        "matmul_q4_0_qkv_16row" | "matmul_q4_0_qkv_16row_simdgroup_tiled"
+        "matmul_q4_0_qkv_16row"
+            | "matmul_q4_0_qkv_16row_simdgroup_tiled"
+            | "matmul_q4_0_qkv_32row_mv"
     ) {
         "q4_qkv_projection"
     } else if matches!(
         kernel,
         "matmul_q4_0_gate_up_16row"
             | "matmul_q4_0_gate_up_16row_simdgroup_tiled"
+            | "matmul_q4_0_gate_up_32row_mv"
             | "matmul_q4_0_gate_up_gelu_16row"
     ) {
         "q4_ffn_gate_up_projection"
@@ -779,6 +843,11 @@ fn gemma4_attention_kernel(
         let experiment = std::env::var("ATLAS_GEMMA4_Q4_ATTENTION_EXPERIMENT");
         let experiment = experiment.ok();
         let experiment = experiment.as_deref();
+        if gemma4_q4_flash16_supported(attention_heads, full_head_dim) {
+            if let Some((kernel, _, _)) = gemma4_q4_flash16_binding(false, experiment) {
+                return kernel;
+            }
+        }
         return match gemma4_q4_two_pass_attention_threshold(experiment) {
             Some(_)
                 if matches!(experiment, Some("2pass_gqa"))
@@ -798,11 +867,17 @@ fn gemma4_attention_kernel(
             Some(_) if matches!(experiment, Some("2pass_cache_no_value_barrier")) => {
                 "attention_decode_fused_gemma4_simd_q4_0_2pass_cache_no_value_barrier"
             }
+            Some(_) if matches!(experiment, Some("2pass_key_blockvec")) => {
+                "attention_decode_fused_gemma4_simd_q4_0_2pass_1_key_blockvec"
+            }
             Some(_) if matches!(experiment, Some("2pass_unroll2_no_value_barrier")) => {
                 "attention_decode_fused_gemma4_simd_q4_0_2pass_unroll2_no_value_barrier"
             }
             Some(_) if matches!(experiment, Some("2pass_simd")) => {
                 "attention_decode_fused_gemma4_simd_q4_0_2pass_simd"
+            }
+            Some(_) if matches!(experiment, Some("2pass_simd_reg")) => {
+                "attention_decode_fused_gemma4_simd_q4_0_2pass_simd_reg"
             }
             Some(_)
                 if experiment.is_none()
@@ -833,6 +908,7 @@ fn gemma4_qkv_fused_enabled() -> bool {
 
 fn gemma4_q6_projection_kernel_for(experiment: Option<&str>) -> &'static str {
     match experiment {
+        Some("mv_ext") => "matvec_q6_k_32row_mv",
         Some("cacheopt") => "matvec_q6_k_8row_cacheopt",
         _ => "matvec_q6_k_8row",
     }
@@ -848,6 +924,7 @@ fn gemma4_q6_projection_kernel() -> &'static str {
 
 fn gemma4_q4_projection_kernel_for(experiment: Option<&str>) -> &'static str {
     match experiment {
+        Some("mv_ext") => "matvec_q4_0_32row_mv",
         Some("simdgroup_tiled") => "matvec_q4_0_16row_simdgroup_tiled",
         Some("shared_input") | Some("on") | Some("1") => "matvec_q4_0_16row_shared_input",
         _ => "matvec_q4_0_16row",
@@ -856,6 +933,27 @@ fn gemma4_q4_projection_kernel_for(experiment: Option<&str>) -> &'static str {
 
 fn gemma4_q4_simdgroup_tiled_enabled_for(experiment: Option<&str>) -> bool {
     matches!(experiment, Some("simdgroup_tiled"))
+}
+
+fn gemma4_q4_mv_ext_enabled_for(experiment: Option<&str>) -> bool {
+    matches!(experiment, Some("mv_ext"))
+}
+
+fn gemma4_q4_mv_ext_enabled() -> bool {
+    gemma4_q4_mv_ext_enabled_for(
+        std::env::var("ATLAS_GEMMA4_Q4_MATVEC_EXPERIMENT")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn gemma4_q6_mv_ext_enabled() -> bool {
+    matches!(
+        std::env::var("ATLAS_GEMMA4_Q6_LM_HEAD_EXPERIMENT")
+            .ok()
+            .as_deref(),
+        Some("mv_ext")
+    )
 }
 
 fn gemma4_q4_simdgroup_tiled_enabled() -> bool {
@@ -867,10 +965,10 @@ fn gemma4_q4_simdgroup_tiled_enabled() -> bool {
 }
 
 fn gemma4_q4_qkv_projection_kernel_for(experiment: Option<&str>) -> &'static str {
-    if gemma4_q4_simdgroup_tiled_enabled_for(experiment) {
-        "matmul_q4_0_qkv_16row_simdgroup_tiled"
-    } else {
-        "matmul_q4_0_qkv_16row"
+    match experiment {
+        Some("mv_ext") => "matmul_q4_0_qkv_32row_mv",
+        Some("simdgroup_tiled") => "matmul_q4_0_qkv_16row_simdgroup_tiled",
+        _ => "matmul_q4_0_qkv_16row",
     }
 }
 
@@ -884,6 +982,7 @@ pub(crate) fn gemma4_q4_qkv_projection_kernel() -> &'static str {
 
 fn gemma4_q4_gate_up_projection_kernel_for(experiment: Option<&str>) -> &'static str {
     match experiment {
+        Some("mv_ext") => "matmul_q4_0_gate_up_32row_mv",
         Some("simdgroup_tiled") => "matmul_q4_0_gate_up_16row_simdgroup_tiled",
         _ => "matmul_q4_0_gate_up_16row",
     }
@@ -932,6 +1031,8 @@ pub(crate) fn gemma4_ffn_down_projection_kernel() -> &'static str {
 fn gemma4_ffn_down_projection_kernel_for(experiment: Option<&str>) -> &'static str {
     if gemma4_ffn_down_interleaved_enabled_for(experiment) {
         "matvec_q4_0_16row_ffn_down_interleaved"
+    } else if gemma4_q4_mv_ext_enabled_for(experiment) || gemma4_q4_mv_ext_enabled() {
+        "matvec_q4_0_32row_mv"
     } else if gemma4_q4_simdgroup_tiled_enabled() {
         "matvec_q4_0_16row_simdgroup_tiled"
     } else {
@@ -965,6 +1066,18 @@ fn gemma4_ffn_gate_up_activation_fused_enabled_for(experiment: Option<&str>) -> 
 fn gemma4_ffn_gate_up_activation_fused_enabled() -> bool {
     gemma4_ffn_gate_up_activation_fused_enabled_for(
         std::env::var("ATLAS_GEMMA4_FFN_GATE_UP_ACTIVATION_EXPERIMENT")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn gemma4_ffn_gelu_multiply_fused_enabled_for(experiment: Option<&str>) -> bool {
+    matches!(experiment, Some("fused"))
+}
+
+fn gemma4_ffn_gelu_multiply_fused_enabled() -> bool {
+    gemma4_ffn_gelu_multiply_fused_enabled_for(
+        std::env::var("ATLAS_GEMMA4_FFN_GELU_MULTIPLY_EXPERIMENT")
             .ok()
             .as_deref(),
     )
@@ -1101,6 +1214,7 @@ pub struct Gemma4E2bExecutor<'a> {
     activated: GpuBuffer,
     product: GpuBuffer,
     ffn_gate_up_activation_fused: bool,
+    gelu_multiply_fused: bool,
     ple_composition_fused: bool,
     ffn_down_packed16: bool,
     ple_projection_packed16: bool,
@@ -1213,7 +1327,9 @@ impl<'a> Gemma4E2bExecutor<'a> {
             .max()
             .context("Gemma E2B has no FFN size")?;
         let trace_stages = std::env::var_os("ATLAS_GEMMA4_TRACE_STAGES").is_some();
+        let trace_gelu = trace_stages && std::env::var_os("ATLAS_GEMMA4_TRACE_GELU").is_some();
         let ffn_gate_up_activation_fused = gemma4_ffn_gate_up_activation_fused_enabled();
+        let gelu_multiply_fused = gemma4_ffn_gelu_multiply_fused_enabled();
         let ple_composition_fused = gemma4_ple_composition_fused_enabled();
         let ffn_down_packed16 = gemma4_q4_packed16_ffn_down_enabled();
         let ple_projection_packed16 = gemma4_q4_packed16_ple_projection_enabled();
@@ -1222,15 +1338,29 @@ impl<'a> Gemma4E2bExecutor<'a> {
             "ATLAS_GEMMA4_FFN_GATE_UP_ACTIVATION_EXPERIMENT=fused requires the fused Gate/Up projection path"
         );
         ensure!(
+            !gelu_multiply_fused || gemma4_ffn_gate_up_fused_enabled(),
+            "ATLAS_GEMMA4_FFN_GELU_MULTIPLY_EXPERIMENT=fused requires the fused Gate/Up projection path"
+        );
+        ensure!(
+            !gelu_multiply_fused || !ffn_gate_up_activation_fused,
+            "ATLAS_GEMMA4_FFN_GELU_MULTIPLY_EXPERIMENT=fused is incompatible with ATLAS_GEMMA4_FFN_GATE_UP_ACTIVATION_EXPERIMENT=fused"
+        );
+        ensure!(
             !ffn_gate_up_activation_fused || !trace_stages,
             "ATLAS_GEMMA4_FFN_GATE_UP_ACTIVATION_EXPERIMENT=fused is unavailable while ATLAS_GEMMA4_TRACE_STAGES is enabled"
+        );
+        ensure!(
+            !gelu_multiply_fused || !trace_stages,
+            "ATLAS_GEMMA4_FFN_GELU_MULTIPLY_EXPERIMENT=fused is unavailable while ATLAS_GEMMA4_TRACE_STAGES is enabled"
+        );
+        ensure!(
+            !gelu_multiply_fused || !trace_gelu,
+            "ATLAS_GEMMA4_FFN_GELU_MULTIPLY_EXPERIMENT=fused is unavailable while GELU tracing is enabled"
         );
         ensure!(
             !ple_composition_fused || !trace_stages,
             "ATLAS_GEMMA4_PLE_COMPOSITION_EXPERIMENT=fused is unavailable while ATLAS_GEMMA4_TRACE_STAGES is enabled"
         );
-        let trace_gelu = std::env::var_os("ATLAS_GEMMA4_TRACE_STAGES").is_some()
-            && std::env::var_os("ATLAS_GEMMA4_TRACE_GELU").is_some();
         let rope_freqs = model
             .gguf()
             .tensors
@@ -1470,6 +1600,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
             activated: allocate(max_ffn)?,
             product: allocate(max_ffn)?,
             ffn_gate_up_activation_fused,
+            gelu_multiply_fused,
             ple_composition_fused,
             ffn_down_packed16,
             ple_projection_packed16,
@@ -1700,19 +1831,21 @@ impl<'a> Gemma4E2bExecutor<'a> {
         };
         let buffers = &[input, weight, output, input_width, output_width_buffer];
         if format == GgufTensorType::Q4_0 {
+            let rows_per_group = if gemma4_q4_mv_ext_enabled() { 32 } else { 16 };
             command.dispatch_threadgroups_1d_labeled(
                 kernel,
                 profiling_label,
                 buffers,
-                output_width.div_ceil(16),
+                output_width.div_ceil(rows_per_group),
                 128,
             )?;
         } else if format == GgufTensorType::Q6K {
+            let rows_per_group = if gemma4_q6_mv_ext_enabled() { 32 } else { 8 };
             command.dispatch_threadgroups_1d_labeled(
                 kernel,
                 profiling_label,
                 buffers,
-                output_width.div_ceil(8),
+                output_width.div_ceil(rows_per_group),
                 128,
             )?;
         } else {
@@ -1739,7 +1872,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
             },
             Some("ffn_down_projection"),
             &[input, weight, output, input_width, output_width],
-            output_width_value.div_ceil(16),
+            output_width_value.div_ceil(if gemma4_q4_mv_ext_enabled() { 32 } else { 16 }),
             128,
         )?;
         Ok(())
@@ -1924,7 +2057,11 @@ impl<'a> Gemma4E2bExecutor<'a> {
             gemma4_q4_qkv_projection_kernel(),
             Some("qkv_projection"),
             buffers,
-            q_width_value.div_ceil(16) + 2 * kv_width_value.div_ceil(16),
+            if gemma4_q4_mv_ext_enabled() {
+                q_width_value.div_ceil(32) + 2 * kv_width_value.div_ceil(32)
+            } else {
+                q_width_value.div_ceil(16) + 2 * kv_width_value.div_ceil(16)
+            },
             128,
         )?;
         Ok(())
@@ -1953,7 +2090,11 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 &self.hidden,
                 output_width,
             ],
-            2 * output_width_value.div_ceil(16),
+            if gemma4_q4_mv_ext_enabled() {
+                2 * output_width_value.div_ceil(32)
+            } else {
+                2 * output_width_value.div_ceil(16)
+            },
             128,
         )?;
         Ok(())
@@ -2492,6 +2633,8 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 },
                 ffn_gate_up_activation_kernel: if self.ffn_gate_up_activation_fused {
                     "matmul_q4_0_gate_up_gelu_16row"
+                } else if self.gelu_multiply_fused {
+                    "gelu_multiply_f32"
                 } else {
                     "gelu_f32+vector_multiply_f32"
                 },
@@ -3137,9 +3280,9 @@ impl<'a> Gemma4E2bExecutor<'a> {
                     (&self.capacity, 0),
                     (key_counts, controls_offset),
                 ],
-                c.attention_heads,
-                attention_threads,
-            )?;
+                    c.attention_heads,
+                    usize::try_from(attention_threads).expect("attention threadgroup size"),
+                )?;
         }
         let wo = self.weight(&format!("{p}.attn_output.weight"), GgufTensorType::Q4_0)?;
         self.matmul_batch(
@@ -3800,9 +3943,30 @@ impl<'a> Gemma4E2bExecutor<'a> {
             );
             let (attention_kernel, attention_threads) =
                 gemma4_attention_binding(self.kv_cache_type);
-            let attention_experiment =
-                std::env::var("ATLAS_GEMMA4_Q4_ATTENTION_EXPERIMENT").ok();
-            if gemma4_q4_two_pass_attention_eligible(
+            let attention_experiment = std::env::var("ATLAS_GEMMA4_Q4_ATTENTION_EXPERIMENT").ok();
+            let flash16_binding = if gemma4_q4_flash16_supported(c.attention_heads, head) {
+                gemma4_q4_flash16_binding(sliding, attention_experiment.as_deref())
+            } else {
+                None
+            };
+            if let Some((attention_kernel, attention_label, attention_threads)) = flash16_binding {
+                command.dispatch_threadgroups_1d_at_labeled(
+                    attention_kernel,
+                    Some(attention_label),
+                    &[
+                        (&self.q_rot, 0),
+                        (cache, 0),
+                        (&self.attention, 0),
+                        (&self.heads, 0),
+                        (&self.kv_heads, 0),
+                        (head_width, 0),
+                        (&self.capacity, 0),
+                        (key_counts, key_count_offset),
+                    ],
+                    c.attention_heads,
+                    usize::try_from(attention_threads).expect("attention threadgroup size"),
+                )?;
+            } else if gemma4_q4_two_pass_attention_eligible(
                 self.kv_cache_type,
                 attention_key_count,
                 attention_experiment.as_deref(),
@@ -4057,8 +4221,10 @@ impl<'a> Gemma4E2bExecutor<'a> {
                     GgufTensorType::Q4_0,
                 )?;
             }
-            // Keep GELU out-of-place in the baseline. The fused candidate has
-            // already produced `product` without materializing FFN intermediates.
+            // Keep GELU out-of-place in the baseline. The fused candidates
+            // have already produced `product` without materializing FFN
+            // intermediates.
+            let fused_ffn_gelu_multiply = self.gelu_multiply_fused;
             if !fused_ffn_gate_up_activation && trace_gelu {
                 let trace_offset = layer
                     .checked_mul(self.ffn_trace_width)
@@ -4086,6 +4252,16 @@ impl<'a> Gemma4E2bExecutor<'a> {
                         (tanh, trace_offset),
                         (&ffn_buffer, 0),
                     ],
+                    ffn,
+                )?;
+            } else if fused_ffn_gelu_multiply {
+                let up = self
+                    .up
+                    .as_ref()
+                    .context("Gemma fused FFN Up buffer is unavailable")?;
+                command.dispatch_1d(
+                    "gelu_multiply_f32",
+                    &[&self.gate, up, &self.product, ffn_buffer],
                     ffn,
                 )?;
             } else if !fused_ffn_gate_up_activation {
@@ -4122,7 +4298,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
                     1,
                 )?;
             }
-            if !fused_ffn_gate_up_activation {
+            if !fused_ffn_gate_up_activation && !fused_ffn_gelu_multiply {
                 command.dispatch_1d(
                     "vector_multiply_f32",
                     &[
@@ -4485,6 +4661,7 @@ mod tests {
         gemma4_attention_key_count, gemma4_attention_key_count_table,
         gemma4_decode_profile_targets, gemma4_ffn_down_projection_kernel_for,
         gemma4_ffn_gate_up_activation_fused_enabled_for, gemma4_ffn_gate_up_fused_enabled_for,
+        gemma4_ffn_gelu_multiply_fused_enabled_for,
         gemma4_kernel_family, gemma4_ple_composition_fused_enabled_for, gemma4_prefill_path,
         gemma4_profile_family, gemma4_q4_batch_projection_kernel_for,
         gemma4_q4_gate_up_projection_kernel_for, gemma4_q4_projection_kernel_for,
@@ -4638,6 +4815,10 @@ mod tests {
             Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
         );
         assert_eq!(
+            gemma4_q4_two_pass_attention_threshold(Some("2pass_key_blockvec")),
+            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
+        );
+        assert_eq!(
             gemma4_q4_two_pass_attention_threshold(Some("2pass_unroll2_no_value_barrier")),
             Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
         );
@@ -4654,6 +4835,14 @@ mod tests {
             Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
         );
         assert_eq!(
+            gemma4_q4_two_pass_attention_threshold(Some("2pass_simd_reg")),
+            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
+        );
+        assert_eq!(
+            gemma4_q4_two_pass_attention_first_pass_pipeline(Some("2pass_simd_reg"), false),
+            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_simd_reg"
+        );
+        assert_eq!(
             gemma4_q4_two_pass_attention_first_pass_pipeline(Some("2pass_cache"), false),
             "attention_decode_fused_gemma4_simd_q4_0_2pass_1_cacheopt"
         );
@@ -4663,6 +4852,10 @@ mod tests {
                 false
             ),
             "attention_decode_fused_gemma4_simd_q4_0_2pass_1_cacheopt_no_value_barrier"
+        );
+        assert_eq!(
+            gemma4_q4_two_pass_attention_first_pass_pipeline(Some("2pass_key_blockvec"), false),
+            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_key_blockvec"
         );
         assert_eq!(
             gemma4_q4_two_pass_attention_first_pass_pipeline(
@@ -4864,8 +5057,20 @@ mod tests {
             "matvec_q4_0_16row_simdgroup_tiled"
         );
         assert_eq!(
+            gemma4_q4_projection_kernel_for(Some("mv_ext")),
+            "matvec_q4_0_32row_mv"
+        );
+        assert_eq!(
+            gemma4_q4_qkv_projection_kernel_for(Some("mv_ext")),
+            "matmul_q4_0_qkv_32row_mv"
+        );
+        assert_eq!(
             gemma4_q4_qkv_projection_kernel_for(Some("simdgroup_tiled")),
             "matmul_q4_0_qkv_16row_simdgroup_tiled"
+        );
+        assert_eq!(
+            gemma4_q4_gate_up_projection_kernel_for(Some("mv_ext")),
+            "matmul_q4_0_gate_up_32row_mv"
         );
         assert_eq!(
             gemma4_q4_gate_up_projection_kernel_for(None),
@@ -5025,6 +5230,10 @@ mod tests {
             gemma4_q6_projection_kernel_for(Some("cacheopt")),
             "matvec_q6_k_8row_cacheopt"
         );
+        assert_eq!(
+            gemma4_q6_projection_kernel_for(Some("mv_ext")),
+            "matvec_q6_k_32row_mv"
+        );
     }
 
     #[test]
@@ -5040,6 +5249,10 @@ mod tests {
         assert_eq!(
             gemma4_ffn_down_projection_kernel_for(Some("interleaved16")),
             "matvec_q4_0_16row_ffn_down_interleaved"
+        );
+        assert_eq!(
+            gemma4_ffn_down_projection_kernel_for(Some("mv_ext")),
+            "matvec_q4_0_32row_mv"
         );
     }
 
@@ -5164,6 +5377,18 @@ mod tests {
             "fused"
         )));
         assert!(!gemma4_ffn_gate_up_activation_fused_enabled_for(Some(
+            "simdgroup_tiled"
+        )));
+    }
+
+    #[test]
+    fn gemma4_ffn_gelu_multiply_fusion_is_opt_in() {
+        assert!(!gemma4_ffn_gelu_multiply_fused_enabled_for(None));
+        assert!(!gemma4_ffn_gelu_multiply_fused_enabled_for(Some(
+            "baseline"
+        )));
+        assert!(gemma4_ffn_gelu_multiply_fused_enabled_for(Some("fused")));
+        assert!(!gemma4_ffn_gelu_multiply_fused_enabled_for(Some(
             "simdgroup_tiled"
         )));
     }

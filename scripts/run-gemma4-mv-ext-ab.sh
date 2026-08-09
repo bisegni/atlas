@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+# llama.cpp-style 32-row mv_ext Q4 matvec + Q6 LM-head A/B vs the production
+# 16-row/8-row kernels (on top of the flash16 attention default). The Q4
+# matvec parity gate is superseded per phase 12.3: stream hashes are recorded
+# as diagnostics and correctness is proven by the kernel-level tolerance test
+# crates/atlas-metal/tests/matvec_mv_ext_parity.rs. --screen uses two runs and
+# is not eligible for promotion.
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$repo_root"
+
+runs=5
+promotion=true
+compose_rms=false
+compose_flash16_uw=false
+while (($#)); do
+    case "$1" in
+        --screen) runs=2; promotion=false ;;
+        --with-rms-vec4) compose_rms=true ;;
+        --with-flash16-uw) compose_flash16_uw=true ;;
+        *) echo "usage: $0 [--screen] [--with-rms-vec4] [--with-flash16-uw]" >&2; exit 2 ;;
+    esac
+    shift
+done
+
+model_id=gemma4-e2b-q4_0
+fixture=models/gguf/gemma-4-e2b-it-q4_0/gemma-4-E2B_q4_0-it.gguf
+prompt='Explain why batching prompt tokens improves transformer prefill performance on a unified-memory GPU. Compare command scheduling, matrix projection reuse, causal attention, key-value cache updates, synchronization, and readback. Keep the answer concise and use one paragraph.'
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+artifact_dir="artifacts/phase-12.3-q4-matvec-mv-ext-ab/${stamp}"
+mkdir -p "$artifact_dir/baseline" "$artifact_dir/candidate"
+
+[[ -f "$fixture" ]] || { echo "missing Gemma fixture: $fixture" >&2; exit 2; }
+
+clean_env=(
+    -u ATLAS_GEMMA4_Q4_ATTENTION_EXPERIMENT
+    -u ATLAS_GEMMA4_QKV_EXPERIMENT
+    -u ATLAS_GEMMA4_Q4_MATVEC_EXPERIMENT
+    -u ATLAS_GEMMA4_FFN_DOWN_EXPERIMENT
+    -u ATLAS_GEMMA4_Q4_PACKED16_EXPERIMENT
+    -u ATLAS_GEMMA4_FFN_GATE_UP_EXPERIMENT
+    -u ATLAS_GEMMA4_FFN_GATE_UP_KERNEL_EXPERIMENT
+    -u ATLAS_GEMMA4_FFN_GATE_UP_ACTIVATION_EXPERIMENT
+    -u ATLAS_GEMMA4_PLE_COMPOSITION_EXPERIMENT
+    -u ATLAS_GEMMA4_QK_NORM_ROPE_EXPERIMENT
+    -u ATLAS_GEMMA4_RMS_EPILOGUE_EXPERIMENT
+    -u ATLAS_GEMMA4_RMS_NORM_EXPERIMENT
+    -u ATLAS_GEMMA4_Q6_LM_HEAD_EXPERIMENT
+    -u ATLAS_GEMMA4_WEIGHT_FORMAT
+    -u ATLAS_GEMMA4_TRACE_STAGES
+    -u ATLAS_GEMMA4_TRACE_GELU
+    ATLAS_GEMMA4_QUANTIZATION_PREFLIGHT=disabled
+    ATLAS_GEMMA4_FFN_GATE_UP_KERNEL_EXPERIMENT=baseline
+    ATLAS_GEMMA4_FFN_GATE_UP_ACTIVATION_EXPERIMENT=baseline
+    ATLAS_GEMMA4_PLE_COMPOSITION_EXPERIMENT=baseline
+    ATLAS_GEMMA4_FFN_DOWN_EXPERIMENT=baseline
+    ATLAS_GEMMA4_Q6_LM_HEAD_EXPERIMENT=baseline
+    ATLAS_GEMMA4_Q4_MATVEC_EXPERIMENT=baseline
+)
+
+run_mode() {
+    local label=$1
+    local q4_matvec_selector=$2
+    local q6_selector=$3
+    local gate_up_selector=$4
+    local rms_selector=$5
+    local attention_selector=$6
+    local expected_attention=$7
+    local mode_dir="$artifact_dir/$label"
+
+    for workload in short long; do
+        local warmup=0
+        local measured=128
+        local context=4096
+        if [[ "$workload" == long ]]; then
+            warmup=1024
+            measured=512
+            context=2048
+        fi
+
+        echo "Running ${runs} ${label} ${workload}-context Resident windows..."
+        for run in $(seq 1 "$runs"); do
+            if ! env "${clean_env[@]}" \
+                "ATLAS_GEMMA4_Q4_ATTENTION_EXPERIMENT=$attention_selector" \
+                "ATLAS_GEMMA4_Q4_MATVEC_EXPERIMENT=$q4_matvec_selector" \
+                "ATLAS_GEMMA4_Q6_LM_HEAD_EXPERIMENT=$q6_selector" \
+                "ATLAS_GEMMA4_FFN_GATE_UP_KERNEL_EXPERIMENT=$gate_up_selector" \
+                "ATLAS_GEMMA4_RMS_NORM_EXPERIMENT=$rms_selector" \
+                cargo run --release -p atlas-cli -- benchmark \
+                    --model "$model_id" \
+                    --kv-cache-type q4_0 \
+                    --prompt "$prompt" \
+                    --warmup-decode-tokens "$warmup" \
+                    --decode-tokens "$measured" \
+                    --max-context "$context" \
+                    > "$mode_dir/$workload-$run.json" \
+                    2> "$mode_dir/$workload-$run.log"; then
+                echo "${label} ${workload} run ${run} failed; log follows:" >&2
+                cat "$mode_dir/$workload-$run.log" >&2
+                exit 1
+            fi
+        done
+
+        jq -s --arg workload "$workload" --argjson runs "$runs" \
+            --arg expected_q4 "$q4_matvec_selector" --arg expected_q6 "$q6_selector" \
+            --arg expected_gate_up "$gate_up_selector" --arg expected_rms "$rms_selector" \
+            --arg expected_attention "$expected_attention" '
+            def median: sort | .[length / 2 | floor];
+            . as $records |
+            {
+              workload: $workload,
+              records: $records,
+              median: {
+                decode_tok_s: ($records | map(.decode_tok_s) | median),
+                measured_decode_gpu_ms: ($records | map(.measured_decode_gpu_ms) | median),
+                dispatches_per_measured_token: ($records | map(.measured_decode_dispatch_calls / .measured_decode_tokens) | median)
+              },
+              checks: {
+                expected_runs: ($records | length == $runs),
+                resident: all($records[]; .executor == "resident"),
+                mixed_weights: all($records[]; .weight_format == "mixed_q4_q6"),
+                q4_kv: all($records[]; .kv_cache_type == "q4_0"),
+                selected_attention_kernel: all($records[]; .selected_kernels.attention == $expected_attention),
+                selected_matvec_kernel: all($records[]; .selected_kernels.q4_projection == ($expected_q4 | if . == "mv_ext" then "matvec_q4_0_32row_mv" else "matvec_q4_0_16row" end) and .selected_kernels.ffn_down_projection == ($expected_q4 | if . == "mv_ext" then "matvec_q4_0_32row_mv" else "matvec_q4_0_16row" end)),
+                selected_qkv_kernel: all($records[]; .selected_kernels.q4_qkv_projection == ($expected_q4 | if . == "mv_ext" then "matmul_q4_0_qkv_32row_mv" else "matmul_q4_0_qkv_16row" end)),
+                selected_gate_up_kernel: all($records[]; .selected_kernels.q4_gate_up_projection == ($expected_gate_up | if . == "mv_ext" then "matmul_q4_0_gate_up_32row_mv" else "matmul_q4_0_gate_up_16row" end)),
+                selected_q6_kernel: all($records[]; .selected_kernels.output_projection == ($expected_q6 | if . == "mv_ext" then "matvec_q6_k_32row_mv" else "matvec_q6_k_8row" end)),
+                selected_rms_kernel: all($records[]; .selected_kernels.rms_norm == ($expected_rms | if . == "vec4" then "rms_norm_decode_f32_vec4" else "rms_norm_decode_f32" end)),
+                deterministic_stream: (($records | map(.generated_token_sha256) | unique | length) == 1),
+                deterministic_eos: (($records | map(.first_eos_position) | unique | length) == 1),
+                stable_resident: (($records | map(.resident_bytes) | unique | length) == 1),
+                stable_kv: (($records | map(.kv_cache_bytes) | unique | length) == 1),
+                stable_upload: (($records | map(.weight_upload_bytes) | unique | length) == 1),
+                stable_readback: (($records | map(.readback_bytes) | unique | length) == 1)
+              }
+            }
+            | .pass = all(.checks[]; . == true)
+        ' "$mode_dir"/"$workload"-*.json > "$mode_dir/$workload-summary.json"
+    done
+}
+
+echo "Running mv_ext kernel-level tolerance parity tests..."
+cargo test --release -p atlas-metal --test matvec_mv_ext_parity \
+    > "$artifact_dir/matvec-mv-ext-parity.log" 2>&1
+parity_pass=false
+grep -q "4 passed; 0 failed" "$artifact_dir/matvec-mv-ext-parity.log" && parity_pass=true
+[[ "$parity_pass" == true ]] || { echo "mv_ext parity tests failed; log:" >&2; cat "$artifact_dir/matvec-mv-ext-parity.log" >&2; exit 1; }
+
+echo "Verifying pinned Gemma fixture..."
+cargo run --release -p atlas-cli -- model verify --model "$model_id" \
+    | tee "$artifact_dir/model-verify.json"
+shasum -a 256 "$fixture" | tee "$artifact_dir/fixture-sha256.txt"
+
+candidate_rms=baseline
+[[ "$compose_rms" == true ]] && candidate_rms=vec4
+candidate_attention=flash16
+candidate_attention_kernel=attention_decode_gemma4_simd_q4_0_flash16
+[[ "$compose_flash16_uw" == true ]] && candidate_attention=flash16_uw && candidate_attention_kernel=attention_decode_gemma4_simd_q4_0_flash16_uw
+run_mode baseline baseline baseline baseline baseline flash16 attention_decode_gemma4_simd_q4_0_flash16
+run_mode candidate mv_ext mv_ext mv_ext "$candidate_rms" "$candidate_attention" "$candidate_attention_kernel"
+
+candidate_env_str="$candidate_attention + ATLAS_GEMMA4_Q4_MATVEC_EXPERIMENT=mv_ext + ATLAS_GEMMA4_Q6_LM_HEAD_EXPERIMENT=mv_ext + ATLAS_GEMMA4_FFN_GATE_UP_KERNEL_EXPERIMENT=mv_ext"
+[[ "$compose_rms" == true ]] && candidate_env_str="$candidate_env_str + ATLAS_GEMMA4_RMS_NORM_EXPERIMENT=vec4"
+[[ "$compose_flash16_uw" == true ]] && candidate_env_str="$candidate_env_str + ATLAS_GEMMA4_Q4_ATTENTION_EXPERIMENT=flash16_uw"
+
+jq -n \
+    --arg baseline_env "flash16 + production 16row/8row kernels" \
+    --arg candidate_env "$candidate_env_str" \
+    --arg parity_log "$artifact_dir/matvec-mv-ext-parity.log" \
+    --argjson promotion "$promotion" \
+    --argjson attention_changed "$compose_flash16_uw" \
+    --slurpfile baseline_short "$artifact_dir/baseline/short-summary.json" \
+    --slurpfile baseline_long "$artifact_dir/baseline/long-summary.json" \
+    --slurpfile candidate_short "$artifact_dir/candidate/short-summary.json" \
+    --slurpfile candidate_long "$artifact_dir/candidate/long-summary.json" '
+    ($baseline_short[0]) as $bs | ($baseline_long[0]) as $bl |
+    ($candidate_short[0]) as $cs | ($candidate_long[0]) as $cl |
+    {
+      baseline_environment: $baseline_env, candidate_environment: $candidate_env,
+      kernel_parity_test: "matvec_mv_ext_parity: 4 passed; 0 failed (max-abs < 1e-3)",
+      baseline: {long: $bl, short: $bs}, candidate: {long: $cl, short: $cs},
+      comparison: {
+        stream_drift_long: ($bl.records[0].generated_token_sha256 != $cl.records[0].generated_token_sha256),
+        stream_drift_short: ($bs.records[0].generated_token_sha256 != $cs.records[0].generated_token_sha256),
+        exact_long: ($bl.records[0].generated_token_sha256 == $cl.records[0].generated_token_sha256 and $bl.records[0].measured_generated_token_sha256 == $cl.records[0].measured_generated_token_sha256 and $bl.records[0].first_eos_position == $cl.records[0].first_eos_position),
+        exact_short: ($bs.records[0].generated_token_sha256 == $cs.records[0].generated_token_sha256 and $bs.records[0].measured_generated_token_sha256 == $cs.records[0].measured_generated_token_sha256 and $bs.records[0].first_eos_position == $cs.records[0].first_eos_position),
+        stable_long_accounting: ($bl.records[0].resident_bytes == $cl.records[0].resident_bytes and $bl.records[0].kv_cache_bytes == $cl.records[0].kv_cache_bytes and $bl.records[0].weight_upload_bytes == $cl.records[0].weight_upload_bytes and $bl.records[0].readback_bytes == $cl.records[0].readback_bytes),
+        stable_short_accounting: ($bs.records[0].resident_bytes == $cs.records[0].resident_bytes and $bs.records[0].kv_cache_bytes == $cs.records[0].kv_cache_bytes and $bs.records[0].weight_upload_bytes == $cs.records[0].weight_upload_bytes and $bs.records[0].readback_bytes == $cs.records[0].readback_bytes),
+        identical_attention_kernel: ($bl.records[0].selected_kernels.attention == $cl.records[0].selected_kernels.attention),
+        candidate_attention_kernel_selected: ($bl.records[0].selected_kernels.attention != $cl.records[0].selected_kernels.attention and $cl.checks.selected_attention_kernel),
+        baseline_long_tok_s: $bl.median.decode_tok_s, candidate_long_tok_s: $cl.median.decode_tok_s,
+        baseline_short_tok_s: $bs.median.decode_tok_s, candidate_short_tok_s: $cs.median.decode_tok_s,
+        promotion_eligible: $promotion
+      }
+    }
+    | .comparison.long_speedup_percent = ((.comparison.candidate_long_tok_s / .comparison.baseline_long_tok_s - 1) * 100)
+    | .comparison.short_speedup_percent = ((.comparison.candidate_short_tok_s / .comparison.baseline_short_tok_s - 1) * 100)
+    | .comparison.long_improved = (.comparison.long_speedup_percent >= 3)
+    | .comparison.short_not_regressed = (.comparison.short_speedup_percent >= 0)
+    | .pass = (all(.baseline[]; .pass) and all(.candidate[]; .pass) and all(.comparison["stable_long_accounting","stable_short_accounting","short_not_regressed"]; . == true) and ((if $attention_changed then .comparison.candidate_attention_kernel_selected else .comparison.identical_attention_kernel end)) and (if .comparison.promotion_eligible then .comparison.long_improved else (.comparison.long_speedup_percent >= 0) end))
+  ' | tee "$artifact_dir/q4-matvec-mv-ext-ab-summary.json"
+
+echo "Q4 matvec mv_ext A/B: $artifact_dir/q4-matvec-mv-ext-ab-summary.json"
+if jq -e '.pass == true' "$artifact_dir/q4-matvec-mv-ext-ab-summary.json" >/dev/null; then
+    [[ "$promotion" == true ]] && echo "MV_EXT A/B: PASS" || echo "MV_EXT SCREEN: PASS (not eligible for promotion)"
+else
+    echo "MV_EXT A/B: NO PROMOTION" >&2
+    exit 1
+fi

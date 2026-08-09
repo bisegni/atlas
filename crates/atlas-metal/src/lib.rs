@@ -56,6 +56,8 @@ mod macos {
     pub struct DeviceInfo {
         pub name: String,
         pub registry_id: u64,
+        pub max_threadgroup_memory_bytes: u64,
+        pub max_total_threads_per_threadgroup: u64,
     }
 
     /// Static diagnostic data. It is collected outside production command
@@ -920,10 +922,28 @@ mod macos {
                 "attention_decode_fused_gemma4_simd_q4_0_2pass_1_gqa",
                 "attention_decode_fused_gemma4_simd_q4_0_2pass_1_mqa_tiled",
                 "attention_decode_fused_gemma4_simd_q4_0_2pass_1_simd",
+                "attention_decode_fused_gemma4_simd_q4_0_2pass_1_simd_reg",
+                "attention_decode_fused_gemma4_simd_q4_0_2pass_1_key_blockvec",
                 "attention_decode_fused_gemma4_simd_q4_0_2pass_2",
                 "attention_decode_fused_gemma4_simd_q4_0_32",
                 "attention_decode_fused_gemma4_simd_q4_0_64",
                 "attention_decode_fused_gemma4_simd_q4_0_cacheopt",
+                "attention_decode_gemma4_simd_q4_0_flash16",
+                "attention_decode_gemma4_simd_q4_0_flash16_swa",
+                "attention_decode_gemma4_simd_q4_0_flash16_u",
+                "attention_decode_gemma4_simd_q4_0_flash16_swa_u",
+                "attention_decode_gemma4_simd_q4_0_flash16_uw",
+                "attention_decode_gemma4_simd_q4_0_flash16_swa_uw",
+                "gelu_multiply_f32",
+                "matmul_q4_0_gate_up_gelu_16row_dump_sums",
+                "matmul_q4_0_gate_up_gelu_16row_exp_fma",
+                "matmul_q4_0_gate_up_gelu_16row_exp_nogelu",
+                "matmul_q4_0_gate_up_gelu_16row_inline_loads",
+                "matmul_q4_0_gate_up_gelu_16row_split_loops",
+                "matvec_q4_0_32row_mv",
+                "matmul_q4_0_qkv_32row_mv",
+                "matmul_q4_0_gate_up_32row_mv",
+                "matvec_q6_k_32row_mv",
                 "attention_scores_resident_f32",
                 "masked_softmax_resident_f32",
                 "attention_values_resident_f32",
@@ -966,6 +986,9 @@ mod macos {
             DeviceInfo {
                 name: self.device.name().to_string(),
                 registry_id: self.device.registryID(),
+                max_threadgroup_memory_bytes: self.device.maxThreadgroupMemoryLength() as u64,
+                max_total_threads_per_threadgroup: self.device.maxThreadsPerThreadgroup().width
+                    as u64,
             }
         }
 

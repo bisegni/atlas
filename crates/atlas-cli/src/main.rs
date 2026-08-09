@@ -1123,6 +1123,7 @@ fn profiler_operation_family(family: &str) -> OperationFamily {
         "gemma_attention_global_split_scan"
         | "gemma_attention_sliding_split_scan" => OperationFamily::AttentionScore,
         "gemma_attention_global_split_combine" | "gemma_attention_sliding_split_combine" => OperationFamily::AttentionValue,
+        "gemma_attention_flash16" | "gemma_attention_flash16_swa" => OperationFamily::AttentionScore,
 
         // Exact fallback families emitted when a dispatch has no explicit
         // profiling label. Ambiguous projection families remain conservative.
@@ -1784,7 +1785,13 @@ fn append_jsonl_at(path: &str, value: &Value) -> Result<()> {
 fn metal_info() -> Result<()> {
     let runtime = MetalRuntime::new()?;
     let info = runtime.device_info();
-    println!("device: {}\nregistry_id: {}", info.name, info.registry_id);
+    println!(
+        "device: {}\nregistry_id: {}\nmax_threadgroup_memory_bytes: {}\nmax_total_threads_per_threadgroup: {}",
+        info.name,
+        info.registry_id,
+        info.max_threadgroup_memory_bytes,
+        info.max_total_threads_per_threadgroup
+    );
     Ok(())
 }
 
