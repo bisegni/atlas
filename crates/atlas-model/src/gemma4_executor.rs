@@ -3149,7 +3149,9 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 .context("Gemma attention control-table offset overflows")?;
             let (attention_kernel, attention_threads) =
                 gemma4_attention_binding(self.kv_cache_type);
-            let flash16_binding = if gemma4_q4_flash16_supported(c.attention_heads, head) {
+            let flash16_binding = if self.kv_cache_type == Gemma4KvCacheType::Q4_0
+                && gemma4_q4_flash16_supported(c.attention_heads, head)
+            {
                 Some(gemma4_q4_flash16_binding(sliding))
             } else {
                 None
