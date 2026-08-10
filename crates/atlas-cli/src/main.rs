@@ -397,7 +397,6 @@ fn emit_metrics(
         "ffn_gate_up_activation_kernel": generation.metrics.ffn_gate_up_activation_kernel,
         "ffn_gate_up_scratch_bytes": generation.metrics.ffn_gate_up_scratch_bytes,
         "ple_composition_kernel": generation.metrics.ple_composition_kernel,
-        "q4_packed16_layout": generation.metrics.q4_packed16_layout,
         "q4_batch_projection_kernel": generation.metrics.q4_batch_projection_kernel,
         "ffn_down_projection_kernel": generation.metrics.ffn_down_projection_kernel,
         "ple_projection_kernel": generation.metrics.ple_projection_kernel,
@@ -1274,7 +1273,6 @@ fn benchmark(args: &[String]) -> Result<()> {
         "q4_gate_up_projection": generation.metrics.q4_gate_up_projection_kernel,
         "ffn_gate_up_activation": generation.metrics.ffn_gate_up_activation_kernel,
         "ple_composition": generation.metrics.ple_composition_kernel,
-        "q4_packed16_layout": generation.metrics.q4_packed16_layout,
         "q4_batch_projection": generation.metrics.q4_batch_projection_kernel,
         "quantization_plan": generation.metrics.quantization_plan_path,
         "ffn_down_projection": generation.metrics.ffn_down_projection_kernel,
@@ -1394,10 +1392,6 @@ fn selected_kernels_map(
             metrics.ple_composition_kernel.into(),
         ),
         ("rms_epilogue".into(), metrics.rms_epilogue_kernel.into()),
-        (
-            "q4_packed16_layout".into(),
-            metrics.q4_packed16_layout.into(),
-        ),
         (
             "q4_batch_projection".into(),
             metrics.q4_batch_projection_kernel.into(),

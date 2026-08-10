@@ -44,26 +44,8 @@ mkdir -p "$artifact_dir/runs"
 [[ -f "$fixture" ]] || { echo "missing Gemma fixture: $fixture" >&2; exit 2; }
 
 baseline_env=(
-    -u ATLAS_GEMMA4_Q4_ATTENTION_EXPERIMENT
-    -u ATLAS_GEMMA4_QKV_EXPERIMENT
-    -u ATLAS_GEMMA4_Q4_MATVEC_EXPERIMENT
-    -u ATLAS_GEMMA4_FFN_DOWN_EXPERIMENT
-    -u ATLAS_GEMMA4_Q4_PACKED16_EXPERIMENT
-    -u ATLAS_GEMMA4_FFN_GATE_UP_EXPERIMENT
-    -u ATLAS_GEMMA4_FFN_GATE_UP_KERNEL_EXPERIMENT
-    -u ATLAS_GEMMA4_FFN_GATE_UP_ACTIVATION_EXPERIMENT
-    -u ATLAS_GEMMA4_PLE_COMPOSITION_EXPERIMENT
-    -u ATLAS_GEMMA4_QK_NORM_ROPE_EXPERIMENT
-    -u ATLAS_GEMMA4_RMS_EPILOGUE_EXPERIMENT
-    -u ATLAS_GEMMA4_RMS_NORM_EXPERIMENT
-    -u ATLAS_GEMMA4_Q6_LM_HEAD_EXPERIMENT
     -u ATLAS_GEMMA4_WEIGHT_FORMAT
     ATLAS_GEMMA4_QUANTIZATION_PREFLIGHT=disabled
-    ATLAS_GEMMA4_FFN_GATE_UP_KERNEL_EXPERIMENT=baseline
-    ATLAS_GEMMA4_FFN_GATE_UP_ACTIVATION_EXPERIMENT=baseline
-    ATLAS_GEMMA4_PLE_COMPOSITION_EXPERIMENT=baseline
-    ATLAS_GEMMA4_FFN_DOWN_EXPERIMENT=baseline
-    ATLAS_GEMMA4_Q6_LM_HEAD_EXPERIMENT=baseline
 )
 
 echo "Verifying pinned Gemma fixture..."
@@ -109,7 +91,7 @@ jq -s --argjson expected_runs "$runs" --argjson contexts "$(printf '%s\n' "${con
             expected_runs: ($records | length == $expected_runs),
             resident: all($records[]; .executor == "resident"),
             q4_kv: all($records[]; .kv_cache_type == "q4_0"),
-            baseline_attention: all($records[]; .selected_kernels.attention == "attention_decode_fused_gemma4_simd_q4_0_2pass_no_value_barrier"),
+            baseline_attention: all($records[]; .selected_kernels.attention == "attention_decode_gemma4_simd_q4_0_flash16_uw"),
             deterministic_stream: (($records | map(.measured_generated_token_sha256) | unique | length) == 1),
             stable_resident: (($records | map(.resident_bytes) | unique | length) == 1),
             stable_kv: (($records | map(.kv_cache_bytes) | unique | length) == 1),

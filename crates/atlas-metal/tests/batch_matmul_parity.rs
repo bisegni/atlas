@@ -1,13 +1,13 @@
-//! Tolerance-based correctness check for the token-tiled batched Q4_0
-//! projection kernel (`matmul_q4_0_batch_16row_token_tiled`) against the
-//! proven per-token 16-row batch kernel (`matmul_q4_0_batch_16row`). The
-//! tiled kernel stages the input tile and a 16-row weight block in
-//! threadgroup memory and reuses them across eight prompt tokens, changing
-//! the accumulation order (per-token accumulators instead of one sequential
-//! pass), so this asserts a small max-absolute-difference (same contract as
-//! `matvec_mv_ext_parity.rs`). Covers the Gemma4 E2B geometries (q/k/v,
-//! gate/up, ffn-down, PLE) plus partial batches and partial-width rows.
+//! Tolerance-based correctness check for the production batched Q4_0
+//! prefill projection kernel (`matmul_q4_0_batch_16row`) against an
+//! independent CPU oracle: `dequantize_block` from atlas-core plus a plain
+//! per-token dot product. The kernel reduces each output row across a
+//! simdgroup with shuffle reductions, so this asserts a small
+//! max-absolute-difference (same contract as `matvec_mv_ext_parity.rs`).
+//! Covers the Gemma4 E2B geometries (q/k/v, gate/up, ffn-down, PLE) plus
+//! partial batches and partial-width rows.
 
+use atlas_core::{GgufTensorType, dequantize_block};
 use atlas_metal::{MetalError, MetalRuntime};
 
 const THREADS: usize = 128;
@@ -42,6 +42,27 @@ fn build_q4_weights(rows: usize, blocks: usize, state: &mut u32) -> Vec<u8> {
     weights
 }
 
+fn cpu_batch_matmul(input: &[f32], weights: &[u8], rows: usize, batch: usize) -> Vec<f32> {
+    let blocks = (input.len() / batch) / 32;
+    let mut block = vec![0.0f32; 32];
+    let mut out = vec![0.0f32; batch * rows];
+    for token in 0..batch {
+        let token_input = &input[token * blocks * 32..(token + 1) * blocks * 32];
+        for row in 0..rows {
+            let mut acc = 0.0f32;
+            for b in 0..blocks {
+                let chunk = &weights[(row * blocks + b) * 18..(row * blocks + b + 1) * 18];
+                dequantize_block(GgufTensorType::Q4_0, chunk, &mut block).unwrap();
+                for lane in 0..32 {
+                    acc += token_input[b * 32 + lane] * block[lane];
+                }
+            }
+            out[token * rows + row] = acc;
+        }
+    }
+    out
+}
+
 fn compare(label: &str, reference: &[f32], candidate: &[f32]) {
     assert_eq!(reference.len(), candidate.len());
     let mut max_abs = 0.0f32;
@@ -55,25 +76,12 @@ fn compare(label: &str, reference: &[f32], candidate: &[f32]) {
     eprintln!("{label}: max_abs={max_abs:.3e} mean_abs={mean_abs:.3e}");
     assert!(
         max_abs < 1e-3,
-        "{label}: token-tiled batch output diverges from the production batch kernel (max_abs={max_abs:.3e})"
+        "{label}: batch output diverges from the CPU oracle (max_abs={max_abs:.3e})"
     );
 }
 
-fn dispatch(
-    runtime: &MetalRuntime,
-    kernel: &'static str,
-    buffers: &[(&atlas_metal::GpuBuffer, usize)],
-    groups: usize,
-) {
-    let mut command = runtime.begin_resident_command().unwrap();
-    command
-        .dispatch_threadgroups_1d_at(kernel, buffers, groups, THREADS)
-        .unwrap();
-    command.finish().unwrap();
-}
-
 #[test]
-fn token_tiled_batch_matches_16row() {
+fn batch_16row_matches_cpu_oracle() {
     let runtime = match MetalRuntime::new() {
         Ok(runtime) => runtime,
         Err(MetalError::NoDevice) => {
@@ -82,30 +90,39 @@ fn token_tiled_batch_matches_16row() {
         }
         Err(error) => panic!("Metal runtime should initialize: {error}"),
     };
-    let mut state = 0x243f_6a88u32;
-    for (input_width, output_width) in [
-        (2048u32, 2304u32),
-        (2048u32, 14336u32),
-        (2048u32, 2048u32),
-        (256u32, 137u32),
+    let mut state = 0x9e37_79b9u32;
+    // (batch, input_width, output_width) covering the Gemma4 E2B
+    // projections: q/k/v, gate/up, ffn-down, PLE, plus partial batches and
+    // partial-width rows.
+    for (batch, input_width, output_width) in [
+        (8u32, 128u32, 128u32),
+        (8u32, 256u32, 512u32),
+        (8u32, 2048u32, 128u32),
+        (16u32, 2048u32, 2304u32),
+        (2u32, 2304u32, 2048u32),
+        (3u32, 2048u32, 137u32),
+        (1u32, 512u32, 96u32),
+        (8u32, 256u32, 129u32),
     ] {
         let blocks = (input_width / 32) as usize;
-        let rows = output_width as usize;
-        let weights = build_q4_weights(rows, blocks, &mut state);
+        let mut input = vec![0.0f32; (batch * input_width) as usize];
+        fill_f32(&mut input, &mut state);
+        let weights = build_q4_weights(output_width as usize, blocks, &mut state);
+        let reference = cpu_batch_matmul(&input, &weights, output_width as usize, batch as usize);
+
+        let input_buf = runtime.upload_f32(&input).unwrap();
+        let weights_buf = runtime.upload_bytes(&weights).unwrap();
+        let out_buf = runtime
+            .upload_f32(&vec![0.0f32; (batch * output_width) as usize])
+            .unwrap();
         let input_width_buf = runtime.upload_u32(&[input_width]).unwrap();
         let output_width_buf = runtime.upload_u32(&[output_width]).unwrap();
-        for batch in [1usize, 8, 17, 25, 59] {
-            let mut input = vec![0.0f32; batch * input_width as usize];
-            fill_f32(&mut input, &mut state);
-            let input_buf = runtime.upload_f32(&input).unwrap();
-            let weights_buf = runtime.upload_bytes(&weights).unwrap();
-            let batch_buf = runtime.upload_u32(&[batch as u32]).unwrap();
-            let output = vec![0.0f32; batch * rows];
-
-            let out_buf = runtime.upload_f32(&output).unwrap();
-            let groups = batch * (rows + 15) / 16;
-            dispatch(
-                &runtime,
+        let batch_buf = runtime.upload_u32(&[batch]).unwrap();
+        let rows_per_batch = ((output_width + 15) / 16) as usize;
+        let groups = batch as usize * rows_per_batch;
+        let mut command = runtime.begin_resident_command().unwrap();
+        command
+            .dispatch_threadgroups_1d_at(
                 "matmul_q4_0_batch_16row",
                 &[
                     (&input_buf, 0),
@@ -116,30 +133,17 @@ fn token_tiled_batch_matches_16row() {
                     (&batch_buf, 0),
                 ],
                 groups,
-            );
-            let reference = runtime.read_f32(&out_buf, batch * rows).unwrap();
-
-            let out_buf = runtime.upload_f32(&output).unwrap();
-            let groups = (batch + 7) / 8 * (rows + 15) / 16;
-            dispatch(
-                &runtime,
-                "matmul_q4_0_batch_16row_token_tiled",
-                &[
-                    (&input_buf, 0),
-                    (&weights_buf, 0),
-                    (&out_buf, 0),
-                    (&input_width_buf, 0),
-                    (&output_width_buf, 0),
-                    (&batch_buf, 0),
-                ],
-                groups,
-            );
-            let candidate = runtime.read_f32(&out_buf, batch * rows).unwrap();
-            compare(
-                &format!("batch_tiled input={input_width} output={output_width} batch={batch}"),
-                &reference,
-                &candidate,
-            );
-        }
+                THREADS,
+            )
+            .unwrap();
+        command.finish().unwrap();
+        let candidate = runtime
+            .read_f32(&out_buf, (batch * output_width) as usize)
+            .unwrap();
+        compare(
+            &format!("batch_16row batch={batch} input={input_width} output={output_width}"),
+            &reference,
+            &candidate,
+        );
     }
 }

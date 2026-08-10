@@ -197,34 +197,6 @@ fn q4_packed_matvec_uses_llama_cpp_half_block_nibble_order() {
 }
 
 #[test]
-fn q4_16row_shared_input_matches_the_proven_16row_kernel() {
-    let runtime = match MetalRuntime::new() {
-        Ok(runtime) => runtime,
-        Err(MetalError::NoDevice) => return,
-        Err(error) => panic!("Metal runtime should initialize: {error}"),
-    };
-    let input: Vec<f32> = (0..64).map(|value| value as f32 * 0.03125 - 0.75).collect();
-    let low = std::array::from_fn(|index| index as u8);
-    let high = std::array::from_fn(|index| (15 - index) as u8);
-    let block = llama_cpp_q4_0_block(0x3c00, &low, &high);
-    let weights = block.repeat(34); // 17 output rows × two 32-value blocks.
-    let (baseline, baseline_timing) = runtime
-        .matvec_q4_0_16row_packed(&input, &weights, 64, 17, false)
-        .expect("run baseline 16-row Q4_0 matvec");
-    let (candidate, candidate_timing) = runtime
-        .matvec_q4_0_16row_packed(&input, &weights, 64, 17, true)
-        .expect("run shared-input 16-row Q4_0 matvec");
-    let (simdgroup_tiled, simdgroup_tiled_timing) = runtime
-        .matvec_q4_0_16row_simdgroup_tiled_packed(&input, &weights, 64, 17)
-        .expect("run SIMD-group-tiled 16-row Q4_0 matvec");
-    assert!(baseline_timing.gpu_time.is_some());
-    assert!(candidate_timing.gpu_time.is_some());
-    assert!(simdgroup_tiled_timing.gpu_time.is_some());
-    assert_eq!(candidate, baseline);
-    assert_eq!(simdgroup_tiled, baseline);
-}
-
-#[test]
 #[ignore = "requires local Metal and models/gguf/small-q8-gpu-20260719124407/model.gguf"]
 fn q8_fixture_projection_samples_match_the_cpu_packed_block_oracle() {
     let runtime = match MetalRuntime::new() {

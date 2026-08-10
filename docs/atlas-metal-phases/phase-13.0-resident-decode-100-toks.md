@@ -257,6 +257,28 @@ phase's work items (matvec family bandwidth, attention scan, prefill).
 - evidence recorded under `artifacts/phase-13.0*/` with the exact commands
   and environment.
 
+## Production cleanup (20260809)
+
+The promoted composed stack is now the only execution path. All experiment
+plumbing that selected between losing kernels or legacy variants has been
+removed: the `ATLAS_GEMMA4_*_EXPERIMENT` selectors, attention-baseline and
+prefill-token-major switches, trace-stage instrumentation, the 16-row /
+packed16 / interleaved / two-pass / cacheopt / token-tiled / q6 matvec
+variants, and the main A/B runner script `run-gemma4-mv-ext-ab.sh`.
+
+The MSL kernel set is trimmed to the kernels the codebase dispatches: the
+64-entry pipeline list (`lib.rs`) matches `kernels.metal` exactly, and a
+repo-wide scan of `dispatch*` call sites confirms no referenced kernel is
+missing. The surviving set keeps the reference/parity oracle kernels
+(`matmul_f32`, `masked_softmax_f32`, `attention_scores_f32`,
+`attention_values_f32`, `logits_process_f32`) because `AtlasModel` remains
+the parity oracle for the fixture-gated phase-06 gates. Experiment-era
+parity tests that compared losing variants against each other were replaced
+by CPU-oracle tolerance tests against the production kernels
+(`attention_flash_correctness.rs`, `matvec_mv_ext_parity.rs`,
+`matvec_rms_fused_parity.rs`, `batch_matmul_parity.rs`); variant-to-variant
+parity tests for deleted kernels were removed.
+
 ## Command book
 
 ```zsh
@@ -264,10 +286,11 @@ phase's work items (matvec family bandwidth, attention scan, prefill).
 cargo test --workspace
 cargo run -p atlas-cli -- metal-info
 cargo run -p atlas-cli -- fixture verify --model small   # SmolLM2 fixture sanity
-# Composed-stack benchmark (phase-13 baseline)
-bash scripts/run-gemma4-mv-ext-ab.sh --with-rms-vec4 --with-flash16-uw
-# P1 screen: composed stack + RMS-matvec fusion
-bash scripts/run-gemma4-mv-ext-ab.sh --screen --with-rms-vec4 --with-flash16-uw --with-rms-fused
-# P1 kernel-level parity
+# Composed-stack benchmark (phase-13 baseline, no A/B selectors)
+bash scripts/run-gemma4-performance-acceptance.sh
+# CPU-oracle kernel correctness (production kernels)
+cargo test -p atlas-metal --test attention_flash_correctness
+cargo test -p atlas-metal --test matvec_mv_ext_parity
 cargo test -p atlas-metal --test matvec_rms_fused_parity
+cargo test -p atlas-metal --test batch_matmul_parity
 ```

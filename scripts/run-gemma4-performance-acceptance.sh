@@ -22,9 +22,6 @@ if [[ ! -f "$fixture" ]]; then
     exit 2
 fi
 
-# The old F32 attention pipeline is diagnostic-only, never an acceptance mode.
-unset ATLAS_GEMMA4_ATTENTION_BASELINE
-
 echo "Verifying the pinned Gemma fixture..."
 cargo run --release -p atlas-cli -- model verify --model "$model_id" \
     2>&1 | tee "$artifact_dir/model-verify.log"

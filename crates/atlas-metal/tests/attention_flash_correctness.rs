@@ -1,15 +1,17 @@
-//! Tolerance-based correctness check for the single-dispatch flash16
-//! attention kernels against the production two-pass pipeline. The speed-first
-//! policy replaced the bitwise parity gate, so this asserts a small
+//! Tolerance-based correctness check for the production flash16 unweighted
+//! attention kernels (`flash16_uw`, `flash16_swa_uw`) against an independent
+//! CPU oracle: Q4_0-dequantized dot-product scores, exact softmax, weighted
+//! sum of dequantized values. The kernels use flash-style per-slice rescaling
+//! that changes the accumulation order, so this asserts a small
 //! max-absolute-difference instead of byte equality. Covers the Gemma4 E2B
 //! geometries: 512-wide full-context heads and 256-wide sliding-window heads.
 
+use atlas_core::{GgufTensorType, dequantize_block};
 use atlas_metal::{MetalError, MetalRuntime};
 
 const HEADS: u32 = 8;
 const KV_HEADS: u32 = 1;
 const CAPACITY: u32 = 2048;
-const BLOCKS: u32 = 4;
 
 fn half_f32(value: f32) -> u16 {
     let bits = value.to_bits();
@@ -61,75 +63,57 @@ fn build_query(head_dim: u32) -> Vec<f32> {
     query
 }
 
-fn run_production(
-    runtime: &MetalRuntime,
-    query: &[f32],
-    cache: &[u8],
-    head_dim: u32,
-    key_count: u32,
-) -> Vec<f32> {
-    let partial_count = (BLOCKS * HEADS * head_dim) as usize;
-    let slot_count = (BLOCKS * HEADS) as usize;
-    let partials = vec![0.0f32; partial_count];
-    let maxima = vec![0.0f32; slot_count];
-    let sums = vec![0.0f32; slot_count];
-    let mut output = vec![0.0f32; (HEADS * head_dim) as usize];
-
-    let query_buf = runtime.upload_f32(query).unwrap();
-    let cache_buf = runtime.upload_bytes(cache).unwrap();
-    let partials_buf = runtime.upload_f32(&partials).unwrap();
-    let maxima_buf = runtime.upload_f32(&maxima).unwrap();
-    let sums_buf = runtime.upload_f32(&sums).unwrap();
-    let heads_buf = runtime.upload_u32(&[HEADS]).unwrap();
-    let kv_heads_buf = runtime.upload_u32(&[KV_HEADS]).unwrap();
-    let head_dim_buf = runtime.upload_u32(&[head_dim]).unwrap();
-    let capacity_buf = runtime.upload_u32(&[CAPACITY]).unwrap();
-    let key_count_buf = runtime.upload_u32(&[key_count]).unwrap();
-    let blocks_buf = runtime.upload_u32(&[BLOCKS]).unwrap();
-
-    let mut command = runtime.begin_resident_command().unwrap();
-    command
-        .dispatch_threadgroups_1d_at(
-            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_no_value_barrier",
-            &[
-                (&query_buf, 0),
-                (&cache_buf, 0),
-                (&partials_buf, 0),
-                (&maxima_buf, 0),
-                (&sums_buf, 0),
-                (&heads_buf, 0),
-                (&kv_heads_buf, 0),
-                (&head_dim_buf, 0),
-                (&capacity_buf, 0),
-                (&key_count_buf, 0),
-                (&blocks_buf, 0),
-            ],
-            (HEADS * BLOCKS) as usize,
-            128,
-        )
-        .unwrap();
-    let output_buf = runtime.upload_f32(&output).unwrap();
-    command
-        .dispatch_threadgroups_1d_at(
-            "attention_decode_fused_gemma4_simd_q4_0_2pass_2",
-            &[
-                (&partials_buf, 0),
-                (&maxima_buf, 0),
-                (&sums_buf, 0),
-                (&output_buf, 0),
-                (&heads_buf, 0),
-                (&head_dim_buf, 0),
-                (&blocks_buf, 0),
-            ],
-            HEADS as usize,
-            128,
-        )
-        .unwrap();
-    command.finish().unwrap();
-
-    let got = runtime.read_f32(&output_buf, output.len()).unwrap();
-    output.copy_from_slice(&got);
-    output
+fn cpu_attention(query: &[f32], cache: &[u8], head_dim: u32, key_count: u32) -> Vec<f32> {
+    let blocks_per_position = (KV_HEADS * head_dim) / 32;
+    let value_base = (CAPACITY * blocks_per_position * 18) as usize;
+    let mut block = vec![0.0f32; 32];
+    let mut out = vec![0.0f32; (HEADS * head_dim) as usize];
+    for h in 0..HEADS {
+        let kv_head = h / (HEADS / KV_HEADS);
+        let mut scores = vec![0.0f32; key_count as usize];
+        for t in 0..key_count {
+            let mut score = 0.0f32;
+            for b in 0..blocks_per_position {
+                let block_off =
+                    (((t * KV_HEADS + kv_head) * blocks_per_position + b) * 18) as usize;
+                dequantize_block(
+                    GgufTensorType::Q4_0,
+                    &cache[block_off..block_off + 18],
+                    &mut block,
+                )
+                .unwrap();
+                for lane in 0..32 {
+                    score += query[(h * head_dim + b * 32 + lane) as usize] * block[lane as usize];
+                }
+            }
+            scores[t as usize] = score;
+        }
+        let maximum = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut weights = vec![0.0f32; key_count as usize];
+        let mut denominator = 0.0f32;
+        for t in 0..key_count as usize {
+            weights[t] = (scores[t] - maximum).exp();
+            denominator += weights[t];
+        }
+        for b in 0..blocks_per_position {
+            for lane in 0..32 {
+                let mut acc = 0.0f32;
+                for t in 0..key_count {
+                    let block_off = value_base
+                        + ((t * KV_HEADS + kv_head) * blocks_per_position + b) as usize * 18;
+                    dequantize_block(
+                        GgufTensorType::Q4_0,
+                        &cache[block_off..block_off + 18],
+                        &mut block,
+                    )
+                    .unwrap();
+                    acc += weights[t as usize] * block[lane as usize];
+                }
+                out[(h * head_dim + b * 32 + lane) as usize] = acc / denominator;
+            }
+        }
+    }
+    out
 }
 
 fn run_flash16(
@@ -188,12 +172,12 @@ fn compare(label: &str, reference: &[f32], candidate: &[f32]) {
     eprintln!("{label}: max_abs={max_abs:.3e} mean_abs={mean_abs:.3e}");
     assert!(
         max_abs < 1e-3,
-        "{label}: flash16 output diverges from the production pipeline (max_abs={max_abs:.3e})"
+        "{label}: flash16 output diverges from the CPU oracle (max_abs={max_abs:.3e})"
     );
 }
 
 #[test]
-fn flash16_matches_production_pipeline() {
+fn flash16_uw_matches_cpu_oracle() {
     let runtime = match MetalRuntime::new() {
         Ok(runtime) => runtime,
         Err(MetalError::NoDevice) => {
@@ -204,30 +188,6 @@ fn flash16_matches_production_pipeline() {
     };
 
     let scenarios = [
-        (
-            "full-512",
-            512u32,
-            256usize,
-            "attention_decode_gemma4_simd_q4_0_flash16",
-        ),
-        (
-            "swa-256",
-            256u32,
-            512usize,
-            "attention_decode_gemma4_simd_q4_0_flash16_swa",
-        ),
-        (
-            "full-512-u",
-            512u32,
-            256usize,
-            "attention_decode_gemma4_simd_q4_0_flash16_u",
-        ),
-        (
-            "swa-256-u",
-            256u32,
-            512usize,
-            "attention_decode_gemma4_simd_q4_0_flash16_swa_u",
-        ),
         (
             "full-512-uw",
             512u32,
@@ -243,10 +203,17 @@ fn flash16_matches_production_pipeline() {
     ];
     for (label, head_dim, threads, kernel) in scenarios {
         let query = build_query(head_dim);
-        for key_count in [48u32, 256u32, 1024u32, 2048u32] {
+        // The swa kernel is window-agnostic: the executor clamps key_count
+        // for sliding-window heads, so exercise the same key counts here.
+        let key_counts: &[u32] = if label.starts_with("swa") {
+            &[48, 128, 256]
+        } else {
+            &[48, 256, 1024, 2048]
+        };
+        for &key_count in key_counts {
             for rising in [false, true] {
                 let cache = build_cache(key_count, head_dim, rising);
-                let reference = run_production(&runtime, &query, &cache, head_dim, key_count);
+                let reference = cpu_attention(&query, &cache, head_dim, key_count);
                 let candidate = run_flash16(
                     &runtime, kernel, threads, &query, &cache, head_dim, key_count,
                 );

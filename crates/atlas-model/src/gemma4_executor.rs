@@ -15,19 +15,10 @@ use atlas_core::{GgufTensorType, dequantize_block, quantize_q4_0};
 use atlas_metal::GpuBuffer;
 
 use crate::{
-    Gemma4E2bModel, Generation, LayerTrace, gemma4_ffn_down_interleaved_enabled,
-    gemma4_ffn_down_interleaved_enabled_for, gemma4_q4_packed16_ffn_down_enabled,
-    gemma4_q4_packed16_ple_projection_enabled, gemma4_shared_kv_sources,
+    Gemma4E2bModel, Generation, LayerTrace, gemma4_shared_kv_sources,
     quantization_plan::QuantizationPlan,
 };
 
-const GEMMA4_TRACE_STAGES_PER_LAYER: usize = 13;
-const GEMMA4_TRACE_GLOBAL_STAGES: usize = 6;
-const GEMMA4_Q4_TWO_PASS_ATTENTION_BLOCKS: usize = 4;
-const GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD: usize = 64;
-const GEMMA4_Q4_TWO_PASS_ATTENTION_LEGACY_THRESHOLD: usize = 96;
-const GEMMA4_Q4_SHARED_KV_QUERY_HEADS: usize = 8;
-const GEMMA4_Q4_SHARED_KV_HEAD_DIM: usize = 512;
 const GEMMA4_PREFILL_BATCH_CAPACITY: usize = 128;
 #[cfg(test)]
 const GEMMA4_DECODE_PROFILE_TARGETS: [usize; 9] = [1, 32, 64, 128, 256, 512, 1024, 2048, 4096];
@@ -206,11 +197,7 @@ pub(crate) fn gemma4_selected_group_formats(
         group: GEMMA4_SELECTED_GROUP_GATE_UP,
         source_format: GgufTensorType::Q4_0,
         selected_format: GgufTensorType::Q4_0,
-        selected_kernel: if gemma4_ffn_gate_up_activation_fused_enabled() {
-            "matmul_q4_0_gate_up_gelu_16row"
-        } else {
-            gemma4_q4_gate_up_projection_kernel()
-        },
+        selected_kernel: gemma4_q4_gate_up_projection_kernel(),
         rejection_reason: None,
     });
     formats.insert(Gemma4SelectedGroupFormat {
@@ -286,119 +273,27 @@ fn gemma4_decode_profile_targets(decode_tokens: usize) -> Vec<usize> {
         .collect()
 }
 
-fn gemma4_q4_two_pass_attention_threshold(experiment: Option<&str>) -> Option<usize> {
-    match experiment {
-        // The promoted production path and its scalar diagnostic oracle have
-        // the same split threshold; only their first-pass pipelines differ.
-        None | Some("default") | Some("baseline") | Some("2pass64") => {
-            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
-        }
-        // Keep the original experiment spelling stable for existing scripts.
-        Some("2pass") | Some("2pass96") => Some(GEMMA4_Q4_TWO_PASS_ATTENTION_LEGACY_THRESHOLD),
-        Some("2pass80") => Some(80),
-        Some("2pass_cache") => Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD),
-        Some("2pass_cache_no_value_barrier") => {
-            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
-        }
-        Some("2pass_key_blockvec") => Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD),
-        Some("2pass_unroll2_no_value_barrier") => {
-            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
-        }
-        Some("2pass_gqa") => Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD),
-        Some("2pass_mqa_tiled") => Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD),
-        Some("2pass_simd") => Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD),
-        Some("2pass_simd_reg") => Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD),
-        Some("2pass_no_value_barrier") => Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD),
-        _ => None,
-    }
-}
-
-fn gemma4_q4_shared_kv_scan_supported(attention_heads: usize, head_dim: usize) -> bool {
-    attention_heads == GEMMA4_Q4_SHARED_KV_QUERY_HEADS && head_dim == GEMMA4_Q4_SHARED_KV_HEAD_DIM
-}
-
 fn gemma4_q4_flash16_supported(attention_heads: usize, head_dim: usize) -> bool {
     attention_heads == 8 && (head_dim == 512 || head_dim == 256)
 }
 
-fn gemma4_q4_flash16_binding(
-    sliding: bool,
-    experiment: Option<&str>,
-) -> Option<(&'static str, &'static str, u32)> {
-    let (kernel, label, threads) = match experiment {
-        Some("flash16_u") => (
-            if sliding {
-                "attention_decode_gemma4_simd_q4_0_flash16_swa_u"
-            } else {
-                "attention_decode_gemma4_simd_q4_0_flash16_u"
-            },
-            if sliding {
-                "gemma_attention_flash16_swa"
-            } else {
-                "gemma_attention_flash16"
-            },
-            if sliding { 512 } else { 256 },
-        ),
-        Some("flash16_uw") => (
-            if sliding {
-                "attention_decode_gemma4_simd_q4_0_flash16_swa_uw"
-            } else {
-                "attention_decode_gemma4_simd_q4_0_flash16_uw"
-            },
-            if sliding {
-                "gemma_attention_flash16_swa"
-            } else {
-                "gemma_attention_flash16"
-            },
-            if sliding { 768 } else { 384 },
-        ),
-        Some("flash16") => (
-            if sliding {
-                "attention_decode_gemma4_simd_q4_0_flash16_swa"
-            } else {
-                "attention_decode_gemma4_simd_q4_0_flash16"
-            },
-            if sliding {
-                "gemma_attention_flash16_swa"
-            } else {
-                "gemma_attention_flash16"
-            },
-            if sliding { 512 } else { 256 },
-        ),
-        _ => return None,
-    };
-    Some((kernel, label, threads))
-}
-
-fn gemma4_q4_two_pass_attention_first_pass_pipeline(
-    experiment: Option<&str>,
-    shared_kv_scan_supported: bool,
-) -> &'static str {
-    match (experiment, shared_kv_scan_supported) {
-        (Some("baseline") | Some("2pass64"), _) => {
-            "attention_decode_fused_gemma4_simd_q4_0_2pass_1"
-        }
-        (Some("2pass_gqa"), true) => "attention_decode_fused_gemma4_simd_q4_0_2pass_1_gqa",
-        (Some("2pass_mqa_tiled"), true) => {
-            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_mqa_tiled"
-        }
-        (Some("2pass_gqa"), false) => "attention_decode_fused_gemma4_simd_q4_0_2pass_1",
-        (Some("2pass_simd"), _) => "attention_decode_fused_gemma4_simd_q4_0_2pass_1_simd",
-        (Some("2pass_simd_reg"), _) => "attention_decode_fused_gemma4_simd_q4_0_2pass_1_simd_reg",
-        (Some("2pass_cache"), _) => "attention_decode_fused_gemma4_simd_q4_0_2pass_1_cacheopt",
-        (Some("2pass_cache_no_value_barrier"), _) => {
-            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_cacheopt_no_value_barrier"
-        }
-        (Some("2pass_key_blockvec"), _) => {
-            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_key_blockvec"
-        }
-        (Some("2pass_unroll2_no_value_barrier"), _) => {
-            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_unroll2_no_value_barrier"
-        }
-        (Some("2pass_no_value_barrier"), _) => {
-            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_no_value_barrier"
-        }
-        _ => "attention_decode_fused_gemma4_simd_q4_0_2pass_1_no_value_barrier",
+/// The promoted production attention binding: the flash16 unweighted
+/// two-tile attention kernel (with the sliding-window variant for sliding
+/// layers). Sliding layers keep their own kernel and label but share the
+/// same pipeline, buffers, and reduction order.
+fn gemma4_q4_flash16_binding(sliding: bool) -> (&'static str, &'static str, u32) {
+    if sliding {
+        (
+            "attention_decode_gemma4_simd_q4_0_flash16_swa_uw",
+            "gemma_attention_flash16_swa",
+            768,
+        )
+    } else {
+        (
+            "attention_decode_gemma4_simd_q4_0_flash16_uw",
+            "gemma_attention_flash16",
+            384,
+        )
     }
 }
 
@@ -445,10 +340,6 @@ impl Gemma4KvCacheType {
             .and_then(|blocks| blocks.checked_mul(self.bytes_per_block()))
             .context("Gemma KV cache allocation overflows")
     }
-}
-
-fn gemma4_trace_layer_slot(layer: usize, stage: usize) -> usize {
-    GEMMA4_TRACE_GLOBAL_STAGES + layer * GEMMA4_TRACE_STAGES_PER_LAYER + stage
 }
 
 fn gemma4_rope_angle(
@@ -544,7 +435,6 @@ pub struct Gemma4Metrics {
     pub ffn_gate_up_scratch_bytes: u64,
     pub ple_composition_kernel: &'static str,
     pub rms_epilogue_kernel: &'static str,
-    pub q4_packed16_layout: &'static str,
     pub q4_batch_projection_kernel: &'static str,
     pub ffn_down_projection_kernel: &'static str,
     pub ple_projection_kernel: &'static str,
@@ -600,19 +490,9 @@ impl Gemma4PrefillPlan {
     }
 }
 
-fn gemma4_token_major_prefill_requested() -> bool {
-    std::env::var_os("ATLAS_GEMMA4_PREFILL_TOKEN_MAJOR").is_some()
-}
-
-fn gemma4_prefill_path(
-    prompt_tokens: usize,
-    stage_tracing: bool,
-    token_major_override: bool,
-) -> &'static str {
-    if prompt_tokens > 1 && !stage_tracing && !token_major_override {
+fn gemma4_prefill_path(prompt_tokens: usize) -> &'static str {
+    if prompt_tokens > 1 {
         "resident_layer_major"
-    } else if token_major_override {
-        "resident_token_major_command"
     } else {
         "resident_chunked_command"
     }
@@ -692,26 +572,17 @@ pub struct Gemma4DecodeProfile {
 fn gemma4_kernel_family(kernel: &str) -> &'static str {
     if matches!(
         kernel,
-        "matmul_q4_0_qkv_16row"
-            | "matmul_q4_0_qkv_16row_simdgroup_tiled"
-            | "matmul_q4_0_qkv_32row_mv"
-            | "matmul_q4_0_qkv_32row_mv_rms"
+        "matmul_q4_0_qkv_32row_mv" | "matmul_q4_0_qkv_32row_mv_rms"
     ) {
         "q4_qkv_projection"
     } else if matches!(
         kernel,
-        "matmul_q4_0_gate_up_16row"
-            | "matmul_q4_0_gate_up_16row_simdgroup_tiled"
-            | "matmul_q4_0_gate_up_32row_mv"
-            | "matmul_q4_0_gate_up_32row_mv_rms"
-            | "matmul_q4_0_gate_up_gelu_16row"
+        "matmul_q4_0_gate_up_32row_mv" | "matmul_q4_0_gate_up_32row_mv_rms"
     ) {
         "q4_ffn_gate_up_projection"
     } else if matches!(
         kernel,
-        "matvec_q6_k_8row"
-            | "matvec_q6_k_8row_cacheopt"
-            | "matvec_q6_k_32row_mv"
+        "matvec_q6_k_32row_mv"
             | "matvec_q6_k_32row_mv_rms"
             | "matvec_q6_k_64row_mv"
             | "matvec_q6_k_64row_mv_rms"
@@ -804,44 +675,11 @@ fn aggregate_profile_timings(
     kernels.into_values().collect()
 }
 
-fn gemma4_q4_two_pass_attention_eligible(
-    cache_type: Gemma4KvCacheType,
-    key_count: usize,
-    experiment: Option<&str>,
-) -> bool {
-    cache_type == Gemma4KvCacheType::Q4_0
-        && gemma4_q4_two_pass_attention_threshold(experiment)
-            .is_some_and(|threshold| key_count >= threshold)
-}
-
-#[cfg(test)]
-fn gemma4_two_pass_attention_ranges(key_count: usize) -> [(usize, usize); 4] {
-    std::array::from_fn(|block| {
-        (
-            block * key_count / GEMMA4_Q4_TWO_PASS_ATTENTION_BLOCKS,
-            (block + 1) * key_count / GEMMA4_Q4_TWO_PASS_ATTENTION_BLOCKS,
-        )
-    })
-}
-
 fn gemma4_attention_binding(cache_type: Gemma4KvCacheType) -> (&'static str, usize) {
-    if cache_type == Gemma4KvCacheType::F32
-        && std::env::var_os("ATLAS_GEMMA4_ATTENTION_BASELINE").is_some()
-    {
-        ("attention_decode_fused_gemma4_f32", 128)
-    } else {
-        match cache_type {
-            Gemma4KvCacheType::F32 => ("attention_decode_fused_gemma4_simd_f32", 128),
-            Gemma4KvCacheType::Q8_0 => ("attention_decode_fused_gemma4_simd_q8_0", 128),
-            Gemma4KvCacheType::Q4_0 => {
-                match std::env::var("ATLAS_GEMMA4_Q4_ATTENTION_EXPERIMENT").as_deref() {
-                    Ok("32") => ("attention_decode_fused_gemma4_simd_q4_0_32", 32),
-                    Ok("64") => ("attention_decode_fused_gemma4_simd_q4_0_64", 64),
-                    Ok("cache") => ("attention_decode_fused_gemma4_simd_q4_0_cacheopt", 128),
-                    _ => ("attention_decode_fused_gemma4_simd_q4_0", 128),
-                }
-            }
-        }
+    match cache_type {
+        Gemma4KvCacheType::F32 => ("attention_decode_fused_gemma4_simd_f32", 128),
+        Gemma4KvCacheType::Q8_0 => ("attention_decode_fused_gemma4_simd_q8_0", 128),
+        Gemma4KvCacheType::Q4_0 => ("attention_decode_fused_gemma4_simd_q4_0", 128),
     }
 }
 
@@ -849,370 +687,46 @@ fn gemma4_attention_kernel(
     cache_type: Gemma4KvCacheType,
     attention_heads: usize,
     full_head_dim: usize,
+    sliding: bool,
 ) -> &'static str {
-    if cache_type == Gemma4KvCacheType::Q4_0 {
-        let experiment = std::env::var("ATLAS_GEMMA4_Q4_ATTENTION_EXPERIMENT");
-        let experiment = experiment.ok();
-        let experiment = experiment.as_deref();
-        if gemma4_q4_flash16_supported(attention_heads, full_head_dim) {
-            if let Some((kernel, _, _)) = gemma4_q4_flash16_binding(false, experiment) {
-                return kernel;
-            }
-        }
-        return match gemma4_q4_two_pass_attention_threshold(experiment) {
-            Some(_)
-                if matches!(experiment, Some("2pass_gqa"))
-                    && gemma4_q4_shared_kv_scan_supported(attention_heads, full_head_dim) =>
-            {
-                "attention_decode_fused_gemma4_simd_q4_0_2pass_gqa"
-            }
-            Some(_)
-                if matches!(experiment, Some("2pass_mqa_tiled"))
-                    && gemma4_q4_shared_kv_scan_supported(attention_heads, full_head_dim) =>
-            {
-                "attention_decode_fused_gemma4_simd_q4_0_2pass_mqa_tiled"
-            }
-            Some(_) if matches!(experiment, Some("2pass_cache")) => {
-                "attention_decode_fused_gemma4_simd_q4_0_2pass_cache"
-            }
-            Some(_) if matches!(experiment, Some("2pass_cache_no_value_barrier")) => {
-                "attention_decode_fused_gemma4_simd_q4_0_2pass_cache_no_value_barrier"
-            }
-            Some(_) if matches!(experiment, Some("2pass_key_blockvec")) => {
-                "attention_decode_fused_gemma4_simd_q4_0_2pass_1_key_blockvec"
-            }
-            Some(_) if matches!(experiment, Some("2pass_unroll2_no_value_barrier")) => {
-                "attention_decode_fused_gemma4_simd_q4_0_2pass_unroll2_no_value_barrier"
-            }
-            Some(_) if matches!(experiment, Some("2pass_simd")) => {
-                "attention_decode_fused_gemma4_simd_q4_0_2pass_simd"
-            }
-            Some(_) if matches!(experiment, Some("2pass_simd_reg")) => {
-                "attention_decode_fused_gemma4_simd_q4_0_2pass_simd_reg"
-            }
-            Some(_)
-                if experiment.is_none()
-                    || matches!(experiment, Some("default") | Some("2pass_no_value_barrier")) =>
-            {
-                "attention_decode_fused_gemma4_simd_q4_0_2pass_no_value_barrier"
-            }
-            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD) => {
-                "attention_decode_fused_gemma4_simd_q4_0_2pass_64"
-            }
-            Some(80) => "attention_decode_fused_gemma4_simd_q4_0_2pass_80",
-            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_LEGACY_THRESHOLD) => {
-                "attention_decode_fused_gemma4_simd_q4_0_2pass_96"
-            }
-            Some(_) => unreachable!("unsupported Gemma Q4 two-pass attention threshold"),
-            None => gemma4_attention_binding(cache_type).0,
-        };
+    if cache_type == Gemma4KvCacheType::Q4_0
+        && gemma4_q4_flash16_supported(attention_heads, full_head_dim)
+    {
+        return gemma4_q4_flash16_binding(sliding).0;
     }
     gemma4_attention_binding(cache_type).0
 }
 
-fn gemma4_qkv_fused_enabled() -> bool {
-    !matches!(
-        std::env::var("ATLAS_GEMMA4_QKV_EXPERIMENT").as_deref(),
-        Ok("baseline") | Ok("off") | Ok("0")
-    )
-}
-
-fn gemma4_q6_projection_kernel_for(experiment: Option<&str>) -> &'static str {
-    match experiment {
-        Some("mv_ext") => "matvec_q6_k_32row_mv",
-        Some("mv_ext_64") => "matvec_q6_k_64row_mv",
-        Some("cacheopt") => "matvec_q6_k_8row_cacheopt",
-        _ => "matvec_q6_k_8row",
-    }
-}
-
 fn gemma4_q6_projection_kernel() -> &'static str {
-    gemma4_q6_projection_kernel_for(
-        std::env::var("ATLAS_GEMMA4_Q6_LM_HEAD_EXPERIMENT")
-            .ok()
-            .as_deref(),
-    )
-}
-
-fn gemma4_q4_projection_kernel_for(experiment: Option<&str>) -> &'static str {
-    match experiment {
-        Some("mv_ext") => "matvec_q4_0_32row_mv",
-        Some("mv_ext_64") => "matvec_q4_0_64row_mv",
-        Some("simdgroup_tiled") => "matvec_q4_0_16row_simdgroup_tiled",
-        Some("shared_input") | Some("on") | Some("1") => "matvec_q4_0_16row_shared_input",
-        _ => "matvec_q4_0_16row",
-    }
-}
-
-fn gemma4_q4_simdgroup_tiled_enabled_for(experiment: Option<&str>) -> bool {
-    matches!(experiment, Some("simdgroup_tiled"))
-}
-
-fn gemma4_q4_mv_ext_enabled_for(experiment: Option<&str>) -> bool {
-    matches!(experiment, Some("mv_ext") | Some("mv_ext_64"))
-}
-
-fn gemma4_q4_mv_64row_enabled_for(experiment: Option<&str>) -> bool {
-    matches!(experiment, Some("mv_ext_64"))
-}
-
-fn gemma4_q4_mv_ext_enabled() -> bool {
-    gemma4_q4_mv_ext_enabled_for(
-        std::env::var("ATLAS_GEMMA4_Q4_MATVEC_EXPERIMENT")
-            .ok()
-            .as_deref(),
-    )
-}
-
-fn gemma4_q4_mv_64row_enabled() -> bool {
-    gemma4_q4_mv_64row_enabled_for(
-        std::env::var("ATLAS_GEMMA4_Q4_MATVEC_EXPERIMENT")
-            .ok()
-            .as_deref(),
-    )
-}
-
-fn gemma4_q6_mv_ext_enabled() -> bool {
-    matches!(
-        std::env::var("ATLAS_GEMMA4_Q6_LM_HEAD_EXPERIMENT")
-            .ok()
-            .as_deref(),
-        Some("mv_ext") | Some("mv_ext_64")
-    )
-}
-
-fn gemma4_q6_mv_64row_enabled() -> bool {
-    matches!(
-        std::env::var("ATLAS_GEMMA4_Q6_LM_HEAD_EXPERIMENT")
-            .ok()
-            .as_deref(),
-        Some("mv_ext_64")
-    )
-}
-
-fn gemma4_q4_simdgroup_tiled_enabled() -> bool {
-    gemma4_q4_simdgroup_tiled_enabled_for(
-        std::env::var("ATLAS_GEMMA4_Q4_MATVEC_EXPERIMENT")
-            .ok()
-            .as_deref(),
-    )
-}
-
-fn gemma4_q4_qkv_projection_kernel_for(experiment: Option<&str>) -> &'static str {
-    match experiment {
-        Some("mv_ext") | Some("mv_ext_64") => "matmul_q4_0_qkv_32row_mv",
-        Some("simdgroup_tiled") => "matmul_q4_0_qkv_16row_simdgroup_tiled",
-        _ => "matmul_q4_0_qkv_16row",
-    }
-}
-
-pub(crate) fn gemma4_q4_qkv_projection_kernel() -> &'static str {
-    gemma4_q4_qkv_projection_kernel_for(
-        std::env::var("ATLAS_GEMMA4_Q4_MATVEC_EXPERIMENT")
-            .ok()
-            .as_deref(),
-    )
-}
-
-fn gemma4_q4_gate_up_projection_kernel_for(experiment: Option<&str>) -> &'static str {
-    match experiment {
-        Some("mv_ext") | Some("mv_ext_64") => "matmul_q4_0_gate_up_32row_mv",
-        Some("simdgroup_tiled") => "matmul_q4_0_gate_up_16row_simdgroup_tiled",
-        _ => "matmul_q4_0_gate_up_16row",
-    }
-}
-
-pub(crate) fn gemma4_q4_gate_up_projection_kernel() -> &'static str {
-    gemma4_q4_gate_up_projection_kernel_for(
-        std::env::var("ATLAS_GEMMA4_FFN_GATE_UP_KERNEL_EXPERIMENT")
-            .ok()
-            .as_deref(),
-    )
-}
-
-fn gemma4_q4_batch_projection_kernel_for(experiment: Option<&str>) -> &'static str {
-    match experiment {
-        Some("tiled") => "matmul_q4_0_batch_16row_token_tiled",
-        _ => {
-            if gemma4_q4_simdgroup_tiled_enabled_for(experiment) {
-                "matmul_q4_0_batch_16row_simdgroup_tiled"
-            } else {
-                "matmul_q4_0_batch_16row"
-            }
-        }
-    }
-}
-
-fn gemma4_q4_batch_projection_kernel() -> &'static str {
-    gemma4_q4_batch_projection_kernel_for(
-        std::env::var("ATLAS_GEMMA4_Q4_BATCH_EXPERIMENT")
-            .ok()
-            .as_deref()
-            .or(std::env::var("ATLAS_GEMMA4_Q4_MATVEC_EXPERIMENT")
-                .ok()
-                .as_deref()),
-    )
-}
-
-fn gemma4_q4_batch_projection_tiled_enabled() -> bool {
-    std::env::var("ATLAS_GEMMA4_Q4_BATCH_EXPERIMENT")
-        .as_deref()
-        .ok()
-        == Some("tiled")
+    "matvec_q6_k_64row_mv"
 }
 
 pub(crate) fn gemma4_q4_projection_kernel() -> &'static str {
-    gemma4_q4_projection_kernel_for(
-        std::env::var("ATLAS_GEMMA4_Q4_MATVEC_EXPERIMENT")
-            .ok()
-            .as_deref(),
-    )
+    "matvec_q4_0_64row_mv"
+}
+
+pub(crate) fn gemma4_q4_qkv_projection_kernel() -> &'static str {
+    "matmul_q4_0_qkv_32row_mv_rms"
+}
+
+pub(crate) fn gemma4_q4_gate_up_projection_kernel() -> &'static str {
+    "matmul_q4_0_gate_up_32row_mv_rms"
+}
+
+fn gemma4_q4_batch_projection_kernel() -> &'static str {
+    "matmul_q4_0_batch_16row"
 }
 
 pub(crate) fn gemma4_ffn_down_projection_kernel() -> &'static str {
-    gemma4_ffn_down_projection_kernel_for(
-        std::env::var("ATLAS_GEMMA4_FFN_DOWN_EXPERIMENT")
-            .ok()
-            .as_deref(),
-    )
+    "matvec_q4_0_64row_mv"
 }
 
-fn gemma4_ffn_down_projection_kernel_for(experiment: Option<&str>) -> &'static str {
-    if gemma4_ffn_down_interleaved_enabled_for(experiment) {
-        "matvec_q4_0_16row_ffn_down_interleaved"
-    } else if gemma4_q4_mv_64row_enabled_for(experiment) || gemma4_q4_mv_64row_enabled() {
-        "matvec_q4_0_64row_mv"
-    } else if gemma4_q4_mv_ext_enabled_for(experiment) || gemma4_q4_mv_ext_enabled() {
-        "matvec_q4_0_32row_mv"
-    } else if gemma4_q4_simdgroup_tiled_enabled() {
-        "matvec_q4_0_16row_simdgroup_tiled"
-    } else {
-        "matvec_q4_0_16row"
-    }
-}
-
-fn gemma4_qk_norm_rope_fused_enabled() -> bool {
-    !matches!(
-        std::env::var("ATLAS_GEMMA4_QK_NORM_ROPE_EXPERIMENT").as_deref(),
-        Ok("baseline") | Ok("off") | Ok("0")
-    )
-}
-
-fn gemma4_ffn_gate_up_fused_enabled_for(experiment: Option<&str>) -> bool {
-    !matches!(experiment, Some("baseline") | Some("off") | Some("0"))
-}
-
-fn gemma4_ffn_gate_up_fused_enabled() -> bool {
-    gemma4_ffn_gate_up_fused_enabled_for(
-        std::env::var("ATLAS_GEMMA4_FFN_GATE_UP_EXPERIMENT")
-            .ok()
-            .as_deref(),
-    )
-}
-
-fn gemma4_ffn_gate_up_activation_fused_enabled_for(experiment: Option<&str>) -> bool {
-    matches!(experiment, Some("fused"))
-}
-
-fn gemma4_ffn_gate_up_activation_fused_enabled() -> bool {
-    gemma4_ffn_gate_up_activation_fused_enabled_for(
-        std::env::var("ATLAS_GEMMA4_FFN_GATE_UP_ACTIVATION_EXPERIMENT")
-            .ok()
-            .as_deref(),
-    )
-}
-
-fn gemma4_ffn_gelu_multiply_fused_enabled_for(experiment: Option<&str>) -> bool {
-    matches!(experiment, Some("fused"))
-}
-
-fn gemma4_ffn_gelu_multiply_fused_enabled() -> bool {
-    gemma4_ffn_gelu_multiply_fused_enabled_for(
-        std::env::var("ATLAS_GEMMA4_FFN_GELU_MULTIPLY_EXPERIMENT")
-            .ok()
-            .as_deref(),
-    )
-}
-
-fn gemma4_ple_composition_fused_enabled_for(experiment: Option<&str>) -> bool {
-    matches!(experiment, Some("fused"))
-}
-
-fn gemma4_ple_composition_fused_enabled() -> bool {
-    gemma4_ple_composition_fused_enabled_for(
-        std::env::var("ATLAS_GEMMA4_PLE_COMPOSITION_EXPERIMENT")
-            .ok()
-            .as_deref(),
-    )
-}
-
-/// RMS/residual fusion is deliberately opt-in.  It changes no executor mode,
-/// allocation, or readback contract, but must earn promotion with canonical
-/// greedy-token and Apple-Silicon throughput evidence.
-fn gemma4_rms_epilogue_fused_enabled_for(experiment: Option<&str>) -> bool {
-    matches!(experiment, Some("fused") | Some("on") | Some("1"))
-}
-
-fn gemma4_rms_epilogue_fused_enabled() -> bool {
-    gemma4_rms_epilogue_fused_enabled_for(
-        std::env::var("ATLAS_GEMMA4_RMS_EPILOGUE_EXPERIMENT")
-            .ok()
-            .as_deref(),
-    )
-}
-
-/// RMS-input fusion is deliberately opt-in. It folds the attention-input,
-/// FFN-input, and final output norms into the consuming 32-row mv_ext matvec
-/// kernels, removing their standalone dispatches and the normalized-buffer
-/// device round trip. It only applies to the mv_ext kernel family and must be
-/// disabled while stage tracing observes the standalone normalized buffer.
-fn gemma4_rms_matvec_fused_enabled_for(experiment: Option<&str>) -> bool {
-    matches!(experiment, Some("fused") | Some("on") | Some("1"))
-}
-
-/// KV-append + provider V-norm fusion is opt-in (phase 13.0 P2b): it removes
-/// one dispatch per provider layer without changing the quantized cache
-/// bytes, which stay bitwise identical to the unfused path.
-fn gemma4_kv_append_vnorm_fused_enabled_for(experiment: Option<&str>) -> bool {
-    matches!(experiment, Some("fused") | Some("on") | Some("1"))
-}
-
-fn gemma4_kv_append_vnorm_fused_enabled() -> bool {
-    gemma4_kv_append_vnorm_fused_enabled_for(
-        std::env::var("ATLAS_GEMMA4_KV_APPEND_VNORM_EXPERIMENT")
-            .ok()
-            .as_deref(),
-    )
-}
-
-fn gemma4_rms_matvec_fused_enabled() -> bool {
-    gemma4_rms_matvec_fused_enabled_for(
-        std::env::var("ATLAS_GEMMA4_RMS_MATVEC_EXPERIMENT")
-            .ok()
-            .as_deref(),
-    )
-}
-
-fn gemma4_rms_norm_decode_kernel_for(hidden_size: usize, experiment: Option<&str>) -> &'static str {
-    if matches!(
-        experiment,
-        Some("baseline") | Some("scalar") | Some("off") | Some("0")
-    ) {
-        "rms_norm_decode_f32"
-    } else if matches!(experiment, Some("vec4")) && hidden_size % 128 == 0 {
+fn gemma4_rms_norm_decode_kernel(hidden_size: usize) -> &'static str {
+    if hidden_size.is_multiple_of(128) {
         "rms_norm_decode_f32_vec4"
     } else {
         "rms_norm_decode_f32"
     }
-}
-
-fn gemma4_rms_norm_decode_kernel(hidden_size: usize) -> &'static str {
-    gemma4_rms_norm_decode_kernel_for(
-        hidden_size,
-        std::env::var("ATLAS_GEMMA4_RMS_NORM_EXPERIMENT")
-            .ok()
-            .as_deref(),
-    )
 }
 
 fn gemma4_kv_append_kernel(cache_type: Gemma4KvCacheType) -> &'static str {
@@ -1296,31 +810,15 @@ pub struct Gemma4E2bExecutor<'a> {
     k_rot: GpuBuffer,
     v: GpuBuffer,
     attention: GpuBuffer,
-    attention_partials: GpuBuffer,
-    attention_maxima: GpuBuffer,
-    attention_sums: GpuBuffer,
     work: GpuBuffer,
     gate: GpuBuffer,
-    up: Option<GpuBuffer>,
+    up: GpuBuffer,
     activated: GpuBuffer,
     product: GpuBuffer,
-    ffn_gate_up_activation_fused: bool,
-    gelu_multiply_fused: bool,
-    ple_composition_fused: bool,
-    ffn_down_packed16: bool,
-    ple_projection_packed16: bool,
-    trace_gate: GpuBuffer,
-    trace_activated: GpuBuffer,
-    trace_gelu_cubic: Option<GpuBuffer>,
-    trace_gelu_argument: Option<GpuBuffer>,
-    trace_gelu_tanh: Option<GpuBuffer>,
-    ffn_trace_width: usize,
     ple_lookup: GpuBuffer,
     ple_projected: GpuBuffer,
     ple: GpuBuffer,
     logits: GpuBuffer,
-    validity: GpuBuffer,
-    stage_max_abs: GpuBuffer,
     hidden: GpuBuffer,
     ple_total: GpuBuffer,
     ple_width: GpuBuffer,
@@ -1335,7 +833,6 @@ pub struct Gemma4E2bExecutor<'a> {
     kv_heads: GpuBuffer,
     vocab: GpuBuffer,
     capacity: GpuBuffer,
-    attention_two_pass_blocks: GpuBuffer,
     one: GpuBuffer,
     epsilon: GpuBuffer,
     embed_scale: GpuBuffer,
@@ -1417,41 +914,6 @@ impl<'a> Gemma4E2bExecutor<'a> {
             .copied()
             .max()
             .context("Gemma E2B has no FFN size")?;
-        let trace_stages = std::env::var_os("ATLAS_GEMMA4_TRACE_STAGES").is_some();
-        let trace_gelu = trace_stages && std::env::var_os("ATLAS_GEMMA4_TRACE_GELU").is_some();
-        let ffn_gate_up_activation_fused = gemma4_ffn_gate_up_activation_fused_enabled();
-        let gelu_multiply_fused = gemma4_ffn_gelu_multiply_fused_enabled();
-        let ple_composition_fused = gemma4_ple_composition_fused_enabled();
-        let ffn_down_packed16 = gemma4_q4_packed16_ffn_down_enabled();
-        let ple_projection_packed16 = gemma4_q4_packed16_ple_projection_enabled();
-        ensure!(
-            !ffn_gate_up_activation_fused || gemma4_ffn_gate_up_fused_enabled(),
-            "ATLAS_GEMMA4_FFN_GATE_UP_ACTIVATION_EXPERIMENT=fused requires the fused Gate/Up projection path"
-        );
-        ensure!(
-            !gelu_multiply_fused || gemma4_ffn_gate_up_fused_enabled(),
-            "ATLAS_GEMMA4_FFN_GELU_MULTIPLY_EXPERIMENT=fused requires the fused Gate/Up projection path"
-        );
-        ensure!(
-            !gelu_multiply_fused || !ffn_gate_up_activation_fused,
-            "ATLAS_GEMMA4_FFN_GELU_MULTIPLY_EXPERIMENT=fused is incompatible with ATLAS_GEMMA4_FFN_GATE_UP_ACTIVATION_EXPERIMENT=fused"
-        );
-        ensure!(
-            !ffn_gate_up_activation_fused || !trace_stages,
-            "ATLAS_GEMMA4_FFN_GATE_UP_ACTIVATION_EXPERIMENT=fused is unavailable while ATLAS_GEMMA4_TRACE_STAGES is enabled"
-        );
-        ensure!(
-            !gelu_multiply_fused || !trace_stages,
-            "ATLAS_GEMMA4_FFN_GELU_MULTIPLY_EXPERIMENT=fused is unavailable while ATLAS_GEMMA4_TRACE_STAGES is enabled"
-        );
-        ensure!(
-            !gelu_multiply_fused || !trace_gelu,
-            "ATLAS_GEMMA4_FFN_GELU_MULTIPLY_EXPERIMENT=fused is unavailable while GELU tracing is enabled"
-        );
-        ensure!(
-            !ple_composition_fused || !trace_stages,
-            "ATLAS_GEMMA4_PLE_COMPOSITION_EXPERIMENT=fused is unavailable while ATLAS_GEMMA4_TRACE_STAGES is enabled"
-        );
         let rope_freqs = model
             .gguf()
             .tensors
@@ -1668,53 +1130,15 @@ impl<'a> Gemma4E2bExecutor<'a> {
             k_rot: allocate(head)?,
             v: allocate(head)?,
             attention: allocate(q_width)?,
-            attention_partials: allocate(
-                GEMMA4_Q4_TWO_PASS_ATTENTION_BLOCKS
-                    .checked_mul(q_width)
-                    .context("Gemma two-pass attention partial size overflows")?,
-            )?,
-            attention_maxima: allocate(
-                GEMMA4_Q4_TWO_PASS_ATTENTION_BLOCKS
-                    .checked_mul(c.attention_heads)
-                    .context("Gemma two-pass attention maxima size overflows")?,
-            )?,
-            attention_sums: allocate(
-                GEMMA4_Q4_TWO_PASS_ATTENTION_BLOCKS
-                    .checked_mul(c.attention_heads)
-                    .context("Gemma two-pass attention sums size overflows")?,
-            )?,
             work: allocate(h)?,
             gate: allocate(max_ffn)?,
-            up: (!ffn_gate_up_activation_fused)
-                .then(|| allocate(max_ffn))
-                .transpose()?,
+            up: allocate(max_ffn)?,
             activated: allocate(max_ffn)?,
             product: allocate(max_ffn)?,
-            ffn_gate_up_activation_fused,
-            gelu_multiply_fused,
-            ple_composition_fused,
-            ffn_down_packed16,
-            ple_projection_packed16,
-            trace_gate: allocate(c.layers * max_ffn)?,
-            trace_activated: allocate(c.layers * max_ffn)?,
-            trace_gelu_cubic: trace_gelu
-                .then(|| allocate(c.layers * max_ffn))
-                .transpose()?,
-            trace_gelu_argument: trace_gelu
-                .then(|| allocate(c.layers * max_ffn))
-                .transpose()?,
-            trace_gelu_tanh: trace_gelu
-                .then(|| allocate(c.layers * max_ffn))
-                .transpose()?,
-            ffn_trace_width: max_ffn,
             ple_lookup: allocate(ple_total)?,
             ple_projected: allocate(ple_total)?,
             ple: allocate(ple_total)?,
             logits: allocate(c.vocab_size)?,
-            validity: runtime.allocate(4)?,
-            stage_max_abs: runtime.allocate(
-                (GEMMA4_TRACE_GLOBAL_STAGES + c.layers * GEMMA4_TRACE_STAGES_PER_LAYER) * 4,
-            )?,
             hidden: runtime.upload_u32(&[u32::try_from(h)?])?,
             ple_total: runtime.upload_u32(&[u32::try_from(ple_total)?])?,
             ple_width: runtime.upload_u32(&[u32::try_from(c.per_layer_embedding_size)?])?,
@@ -1744,8 +1168,6 @@ impl<'a> Gemma4E2bExecutor<'a> {
             kv_heads: runtime.upload_u32(&[1])?,
             vocab: runtime.upload_u32(&[u32::try_from(c.vocab_size)?])?,
             capacity: runtime.upload_u32(&[u32::try_from(max_context)?])?,
-            attention_two_pass_blocks: runtime
-                .upload_u32(&[u32::try_from(GEMMA4_Q4_TWO_PASS_ATTENTION_BLOCKS)?])?,
             one: runtime.upload_u32(&[1])?,
             epsilon: runtime.upload_f32(&[c.rms_norm_eps])?,
             embed_scale: runtime.upload_f32(&[(h as f32).sqrt()])?,
@@ -1791,35 +1213,19 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 &self.k_rot,
                 &self.v,
                 &self.attention,
-                &self.attention_partials,
-                &self.attention_maxima,
-                &self.attention_sums,
                 &self.work,
                 &self.gate,
                 &self.activated,
                 &self.product,
-                &self.trace_gate,
-                &self.trace_activated,
                 &self.ple_lookup,
                 &self.ple_projected,
                 &self.ple,
                 &self.logits,
-                &self.validity,
-                &self.stage_max_abs,
             ]
             .iter()
             .map(|v| v.bytes() as u64)
             .sum::<u64>()
-            + self.up.as_ref().map_or(0, |buffer| buffer.bytes() as u64)
-            + [
-                self.trace_gelu_cubic.as_ref(),
-                self.trace_gelu_argument.as_ref(),
-                self.trace_gelu_tanh.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            .map(|v| v.bytes() as u64)
-            .sum::<u64>()
+            + self.up.bytes() as u64
             + [
                 &self.prefill.state,
                 &self.prefill.next_state,
@@ -1910,11 +1316,6 @@ impl<'a> Gemma4E2bExecutor<'a> {
         format: GgufTensorType,
     ) -> Result<()> {
         let kernel = match format {
-            GgufTensorType::Q4_0
-                if self.ple_projection_packed16 && profiling_label == Some("ple_projection") =>
-            {
-                "matvec_q4_0_16row_packed16"
-            }
             GgufTensorType::Q4_0 => gemma4_q4_projection_kernel(),
             GgufTensorType::Q6K => gemma4_q6_projection_kernel(),
             GgufTensorType::F16 => "matvec_f16",
@@ -1922,44 +1323,20 @@ impl<'a> Gemma4E2bExecutor<'a> {
         };
         let buffers = &[input, weight, output, input_width, output_width_buffer];
         if format == GgufTensorType::Q4_0 {
-            let rows_per_group = if gemma4_q4_mv_64row_enabled() {
-                64
-            } else if gemma4_q4_mv_ext_enabled() {
-                32
-            } else {
-                16
-            };
-            let threads = if gemma4_q4_mv_64row_enabled() {
-                256
-            } else {
-                128
-            };
             command.dispatch_threadgroups_1d_labeled(
                 kernel,
                 profiling_label,
                 buffers,
-                output_width.div_ceil(rows_per_group),
-                threads,
+                output_width.div_ceil(64),
+                256,
             )?;
         } else if format == GgufTensorType::Q6K {
-            let rows_per_group = if gemma4_q6_mv_64row_enabled() {
-                64
-            } else if gemma4_q6_mv_ext_enabled() {
-                32
-            } else {
-                8
-            };
-            let threads = if gemma4_q6_mv_64row_enabled() {
-                256
-            } else {
-                128
-            };
             command.dispatch_threadgroups_1d_labeled(
                 kernel,
                 profiling_label,
                 buffers,
-                output_width.div_ceil(rows_per_group),
-                threads,
+                output_width.div_ceil(64),
+                256,
             )?;
         } else {
             command.dispatch_1d_labeled(kernel, profiling_label, buffers, output_width)?;
@@ -1985,14 +1362,8 @@ impl<'a> Gemma4E2bExecutor<'a> {
         rms_weight: &GpuBuffer,
     ) -> Result<()> {
         let (kernel, rows_per_group): (&'static str, usize) = match format {
-            GgufTensorType::Q4_0 if gemma4_q4_mv_ext_enabled() && gemma4_q4_mv_64row_enabled() => {
-                ("matvec_q4_0_64row_mv_rms", 64)
-            }
-            GgufTensorType::Q4_0 if gemma4_q4_mv_ext_enabled() => ("matvec_q4_0_32row_mv_rms", 32),
-            GgufTensorType::Q6K if gemma4_q6_mv_ext_enabled() && gemma4_q6_mv_64row_enabled() => {
-                ("matvec_q6_k_64row_mv_rms", 64)
-            }
-            GgufTensorType::Q6K if gemma4_q6_mv_ext_enabled() => ("matvec_q6_k_32row_mv_rms", 32),
+            GgufTensorType::Q4_0 => ("matvec_q4_0_64row_mv_rms", 64),
+            GgufTensorType::Q6K => ("matvec_q6_k_64row_mv_rms", 64),
             _ => anyhow::bail!(
                 "RMS-input matvec requires the mv_ext kernel family for format {format:?}"
             ),
@@ -2027,25 +1398,11 @@ impl<'a> Gemma4E2bExecutor<'a> {
         output_width_value: usize,
     ) -> Result<()> {
         command.dispatch_threadgroups_1d_labeled(
-            if self.ffn_down_packed16 {
-                "matvec_q4_0_16row_packed16"
-            } else {
-                gemma4_ffn_down_projection_kernel()
-            },
+            gemma4_ffn_down_projection_kernel(),
             Some("ffn_down_projection"),
             &[input, weight, output, input_width, output_width],
-            output_width_value.div_ceil(if gemma4_q4_mv_64row_enabled() {
-                64
-            } else if gemma4_q4_mv_ext_enabled() {
-                32
-            } else {
-                16
-            }),
-            if gemma4_q4_mv_64row_enabled() {
-                256
-            } else {
-                128
-            },
+            output_width_value.div_ceil(64),
+            256,
         )?;
         Ok(())
     }
@@ -2057,13 +1414,8 @@ impl<'a> Gemma4E2bExecutor<'a> {
         input: &GpuBuffer,
         weight: &GpuBuffer,
         output: &GpuBuffer,
-        force_baseline: bool,
     ) -> Result<()> {
-        let kernel = if force_baseline {
-            "rms_norm_decode_f32"
-        } else {
-            gemma4_rms_norm_decode_kernel(self.model.config.hidden_size)
-        };
+        let kernel = gemma4_rms_norm_decode_kernel(self.model.config.hidden_size);
         command.dispatch_threadgroups_1d_labeled(
             kernel,
             profiling_label,
@@ -2102,11 +1454,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 kernel,
                 Some("layer_major_batched_projection"),
                 buffers,
-                if gemma4_q4_batch_projection_tiled_enabled() {
-                    batch_value.div_ceil(8) * output_width_value.div_ceil(16)
-                } else {
-                    batch_value * output_width_value.div_ceil(16)
-                },
+                batch_value * output_width_value.div_ceil(16),
                 128,
             )?,
             GgufTensorType::Q6K => command.dispatch_threadgroups_1d_labeled(
@@ -2139,47 +1487,10 @@ impl<'a> Gemma4E2bExecutor<'a> {
         output_width_value: usize,
         batch_value: usize,
     ) -> Result<()> {
-        let kernel = if self.ffn_down_packed16 {
-            "matmul_q4_0_batch_16row_packed16"
-        } else if gemma4_ffn_down_interleaved_enabled() {
-            "matmul_q4_0_batch_16row_ffn_down_interleaved"
-        } else {
-            gemma4_q4_batch_projection_kernel()
-        };
+        let kernel = gemma4_q4_batch_projection_kernel();
         command.dispatch_threadgroups_1d_labeled(
             kernel,
             Some("layer_major_batched_ffn_down_projection"),
-            &[input, weight, output, input_width, output_width, batch],
-            if gemma4_q4_batch_projection_tiled_enabled() {
-                batch_value.div_ceil(8) * output_width_value.div_ceil(16)
-            } else {
-                batch_value * output_width_value.div_ceil(16)
-            },
-            128,
-        )?;
-        Ok(())
-    }
-
-    /// Apply a packed-16 Q4_0 matrix during layer-major prefill.  This is
-    /// intentionally a separate call site from the generic batch path: only
-    /// weights repacked at Resident initialization may use this kernel.
-    #[allow(clippy::too_many_arguments)]
-    fn matmul_q4_packed16_batch(
-        &self,
-        command: &mut atlas_metal::ResidentCommand<'_>,
-        input: &GpuBuffer,
-        weight: &GpuBuffer,
-        output: &GpuBuffer,
-        input_width: &GpuBuffer,
-        output_width: &GpuBuffer,
-        batch: &GpuBuffer,
-        output_width_value: usize,
-        batch_value: usize,
-        profiling_label: Option<&'static str>,
-    ) -> Result<()> {
-        command.dispatch_threadgroups_1d_labeled(
-            "matmul_q4_0_batch_16row_packed16",
-            profiling_label,
             &[input, weight, output, input_width, output_width, batch],
             batch_value * output_width_value.div_ceil(16),
             128,
@@ -2223,7 +1534,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
         rms_weight: Option<&GpuBuffer>,
     ) -> Result<()> {
         let (kernel, buffers): (&'static str, Vec<&GpuBuffer>) = match rms_weight {
-            Some(rms_weight) if gemma4_q4_mv_ext_enabled() => (
+            Some(rms_weight) => (
                 "matmul_q4_0_qkv_32row_mv_rms",
                 vec![
                     input,
@@ -2260,11 +1571,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
             kernel,
             Some("qkv_projection"),
             &buffers,
-            if gemma4_q4_mv_ext_enabled() {
-                q_width_value.div_ceil(32) + 2 * kv_width_value.div_ceil(32)
-            } else {
-                q_width_value.div_ceil(16) + 2 * kv_width_value.div_ceil(16)
-            },
+            q_width_value.div_ceil(32) + 2 * kv_width_value.div_ceil(32),
             128,
         )?;
         Ok(())
@@ -2283,7 +1590,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
         rms_weight: Option<&GpuBuffer>,
     ) -> Result<()> {
         let (kernel, buffers): (&'static str, Vec<&GpuBuffer>) = match rms_weight {
-            Some(rms_weight) if gemma4_q4_mv_ext_enabled() => (
+            Some(rms_weight) => (
                 "matmul_q4_0_gate_up_32row_mv_rms",
                 vec![
                     input,
@@ -2314,38 +1621,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
             kernel,
             Some("ffn_gate_up_projection"),
             &buffers,
-            if gemma4_q4_mv_ext_enabled() {
-                2 * output_width_value.div_ceil(32)
-            } else {
-                2 * output_width_value.div_ceil(16)
-            },
-            128,
-        )?;
-        Ok(())
-    }
-
-    fn matmul_q4_0_gate_up_gelu(
-        &self,
-        command: &mut atlas_metal::ResidentCommand<'_>,
-        input: &GpuBuffer,
-        gate_weight: &GpuBuffer,
-        up_weight: &GpuBuffer,
-        output: &GpuBuffer,
-        output_width: &GpuBuffer,
-        output_width_value: usize,
-    ) -> Result<()> {
-        command.dispatch_threadgroups_1d_labeled(
-            "matmul_q4_0_gate_up_gelu_16row",
-            Some("ffn_gate_up_projection"),
-            &[
-                input,
-                gate_weight,
-                up_weight,
-                output,
-                &self.hidden,
-                output_width,
-            ],
-            output_width_value.div_ceil(16),
+            2 * output_width_value.div_ceil(32),
             128,
         )?;
         Ok(())
@@ -2561,15 +1837,12 @@ impl<'a> Gemma4E2bExecutor<'a> {
             decode_telemetry: complete_decode_telemetry,
             complete_decode_telemetry,
             prefill_kernels: aggregate_profile_timings(prefill_timings),
-            prefill_path: gemma4_prefill_path(
-                prompt_ids.len(),
-                std::env::var_os("ATLAS_GEMMA4_TRACE_STAGES").is_some(),
-                gemma4_token_major_prefill_requested(),
-            ),
+            prefill_path: gemma4_prefill_path(prompt_ids.len()),
             attention_kernel: gemma4_attention_kernel(
                 self.kv_cache_type,
                 self.model.config.attention_heads,
                 self.model.config.key_length,
+                false,
             ),
             kv_cache_type: self.kv_cache_type,
             samples,
@@ -2679,11 +1952,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
         let prefill_started = Instant::now();
         let prefill_before = runtime.runtime_telemetry();
         let plan = Gemma4PrefillPlan::new(prompt_ids.len(), self.max_context)?;
-        let prefill_path = gemma4_prefill_path(
-            prompt_ids.len(),
-            std::env::var_os("ATLAS_GEMMA4_TRACE_STAGES").is_some(),
-            gemma4_token_major_prefill_requested(),
-        );
+        let prefill_path = gemma4_prefill_path(prompt_ids.len());
         let mut selected = 0;
         let chunk_count = plan.chunks;
         for (chunk_index, chunk) in prompt_ids.chunks(plan.chunk_size).enumerate() {
@@ -2835,6 +2104,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
                     self.kv_cache_type,
                     self.model.config.attention_heads,
                     self.model.config.key_length,
+                    false,
                 ),
                 weight_format: self.weight_format,
                 embedding_kernel: self.weight_format.embedding_kernel(),
@@ -2850,60 +2120,17 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 },
                 q4_projection_kernel: gemma4_q4_projection_kernel(),
                 q4_qkv_projection_kernel: gemma4_q4_qkv_projection_kernel(),
-                q4_gate_up_projection_kernel: if self.ffn_gate_up_activation_fused {
-                    "none"
-                } else {
-                    gemma4_q4_gate_up_projection_kernel()
-                },
-                ffn_gate_up_activation_kernel: if self.ffn_gate_up_activation_fused {
-                    "matmul_q4_0_gate_up_gelu_16row"
-                } else if self.gelu_multiply_fused {
-                    "gelu_multiply_f32"
-                } else {
-                    "gelu_f32+vector_multiply_f32"
-                },
-                ffn_gate_up_scratch_bytes: self
-                    .up
-                    .as_ref()
-                    .map_or(0, |buffer| buffer.bytes() as u64),
-                ple_composition_kernel: if self.ple_composition_fused {
-                    "ple_gelu_multiply_offset_f32"
-                } else {
-                    "gelu_f32+vector_multiply_offset_f32"
-                },
-                rms_epilogue_kernel: if gemma4_rms_epilogue_fused_enabled() {
-                    "gemma4_rms_residual_f32"
-                } else {
-                    "rms_norm_decode_f32+vector_add_f32"
-                },
-                q4_packed16_layout: match (self.ffn_down_packed16, self.ple_projection_packed16) {
-                    (false, false) => "baseline",
-                    (true, false) => "ffn_down",
-                    (false, true) => "ple",
-                    (true, true) => "ffn_down_ple",
-                },
+                q4_gate_up_projection_kernel: gemma4_q4_gate_up_projection_kernel(),
+                ffn_gate_up_activation_kernel: "gelu_multiply_f32",
+                ffn_gate_up_scratch_bytes: self.up.bytes() as u64,
+                ple_composition_kernel: "ple_gelu_multiply_offset_f32",
+                rms_epilogue_kernel: "gemma4_rms_residual_f32",
                 q4_batch_projection_kernel: gemma4_q4_batch_projection_kernel(),
-                ffn_down_projection_kernel: if self.ffn_down_packed16 {
-                    "matvec_q4_0_16row_packed16"
-                } else {
-                    gemma4_ffn_down_projection_kernel()
-                },
-                ple_projection_kernel: if self.ple_projection_packed16 {
-                    "matvec_q4_0_16row_packed16"
-                } else {
-                    gemma4_q4_projection_kernel()
-                },
+                ffn_down_projection_kernel: gemma4_ffn_down_projection_kernel(),
+                ple_projection_kernel: gemma4_q4_projection_kernel(),
                 rms_norm_kernel: gemma4_rms_norm_decode_kernel(self.model.config.hidden_size),
-                rms_fused_projection_kernel: if gemma4_rms_matvec_fused_enabled() {
-                    "rms_input_matvec_fused"
-                } else {
-                    "none"
-                },
-                kv_append_kernel: if gemma4_kv_append_vnorm_fused_enabled() {
-                    "kv_append_decode_fused_vnorm"
-                } else {
-                    gemma4_kv_append_kernel(self.kv_cache_type)
-                },
+                rms_fused_projection_kernel: "rms_input_matvec_fused",
+                kv_append_kernel: gemma4_kv_append_vnorm_kernel(self.kv_cache_type),
                 kv_cache_type: self.kv_cache_type,
                 kv_cache_bytes: self.kv_cache_bytes(),
                 quantization_plan_path: self.quantization_plan_path.clone(),
@@ -2984,9 +2211,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
             &self.model.config.sliding_pattern,
             self.model.config.sliding_window,
         )?)?;
-        let trace_stages = std::env::var_os("ATLAS_GEMMA4_TRACE_STAGES").is_some();
-        let mut command =
-            runtime.begin_resident_command_with_exact_timing(trace_stages || exact_profile)?;
+        let mut command = runtime.begin_resident_command_with_exact_timing(exact_profile)?;
         self.encode_current_token(
             &mut command,
             0,
@@ -3021,15 +2246,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
             self.position + tokens.len() <= self.max_context,
             "Gemma executor context exhausted"
         );
-        // Stage tracing is deliberately kept on the scalar oracle until the
-        // layer-major trace format is introduced.  Normal Resident prefill
-        // always takes this real matrix path for a multi-token chunk.
-        if gemma4_prefill_path(
-            tokens.len(),
-            std::env::var_os("ATLAS_GEMMA4_TRACE_STAGES").is_some(),
-            gemma4_token_major_prefill_requested(),
-        ) == "resident_layer_major"
-        {
+        if gemma4_prefill_path(tokens.len()) == "resident_layer_major" {
             return self.forward_tokens_layer_major(tokens, select_last, exact_profile);
         }
         // Prompt tokens are known before execution. Keep them and their
@@ -3084,9 +2301,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
             &self.model.config.sliding_pattern,
             self.model.config.sliding_window,
         )?)?;
-        let trace_stages = std::env::var_os("ATLAS_GEMMA4_TRACE_STAGES").is_some();
-        let mut command =
-            runtime.begin_resident_command_with_exact_timing(trace_stages || exact_profile)?;
+        let mut command = runtime.begin_resident_command_with_exact_timing(exact_profile)?;
         for index in 0..tokens.len() {
             command.dispatch_1d_at(
                 "copy_u32",
@@ -3678,33 +2893,18 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 c.per_layer_embedding_size,
             )?;
         }
-        if self.ple_projection_packed16 {
-            self.matmul_q4_packed16_batch(
-                command,
-                &self.prefill.activated,
-                &projection,
-                &self.prefill.work,
-                &self.ple_width,
-                &self.hidden,
-                batch,
-                h,
-                batch_value,
-                Some("layer_major_batched_ple_projection"),
-            )?;
-        } else {
-            self.matmul_batch(
-                command,
-                &self.prefill.activated,
-                &projection,
-                &self.prefill.work,
-                &self.ple_width,
-                &self.hidden,
-                batch,
-                h,
-                batch_value,
-                GgufTensorType::Q4_0,
-            )?;
-        }
+        self.matmul_batch(
+            command,
+            &self.prefill.activated,
+            &projection,
+            &self.prefill.work,
+            &self.ple_width,
+            &self.hidden,
+            batch,
+            h,
+            batch_value,
+            GgufTensorType::Q4_0,
+        )?;
         self.rms_norm_batch_decode_order(
             command,
             &self.prefill.work,
@@ -3752,15 +2952,8 @@ impl<'a> Gemma4E2bExecutor<'a> {
             "Gemma executor context exhausted"
         );
         let c = &self.model.config;
-        let runtime = self.model.runtime();
         let h = c.hidden_size;
         let ple_total = c.layers * c.per_layer_embedding_size;
-        let trace_stages = std::env::var_os("ATLAS_GEMMA4_TRACE_STAGES").is_some();
-        let trace_gelu = trace_stages && std::env::var_os("ATLAS_GEMMA4_TRACE_GELU").is_some();
-        let trace_sync = trace_stages && std::env::var_os("ATLAS_GEMMA4_TRACE_SYNC").is_some();
-        if trace_stages {
-            runtime.write_u32(&self.validity, &[u32::MAX])?;
-        }
         let per_layer_proj = self.weight("per_layer_model_proj.weight", GgufTensorType::F16)?;
         let per_layer_norm = self.weight("per_layer_proj_norm.weight", GgufTensorType::F32)?;
         command.dispatch_1d(
@@ -3780,19 +2973,6 @@ impl<'a> Gemma4E2bExecutor<'a> {
             &[&self.state, &self.state, &self.embed_scale, &self.hidden],
             h,
         )?;
-        if trace_stages {
-            let slot = runtime.upload_u32(&[0])?;
-            command.dispatch_1d(
-                "first_nonfinite_f32",
-                &[&self.state, &self.validity, &self.hidden, &slot],
-                1,
-            )?;
-            command.dispatch_1d(
-                "max_abs_f32",
-                &[&self.state, &self.stage_max_abs, &self.hidden, &slot],
-                1,
-            )?;
-        }
         let ple_total_buffer = &self.ple_total;
         command.dispatch_1d(
             self.weight_format.embedding_kernel(),
@@ -3806,24 +2986,6 @@ impl<'a> Gemma4E2bExecutor<'a> {
             ],
             ple_total,
         )?;
-        if trace_stages {
-            let slot = runtime.upload_u32(&[1])?;
-            command.dispatch_1d(
-                "first_nonfinite_f32",
-                &[&self.ple_lookup, &self.validity, &ple_total_buffer, &slot],
-                1,
-            )?;
-            command.dispatch_1d(
-                "max_abs_f32",
-                &[
-                    &self.ple_lookup,
-                    &self.stage_max_abs,
-                    &ple_total_buffer,
-                    &slot,
-                ],
-                1,
-            )?;
-        }
         command.dispatch_1d(
             "scalar_multiply_f32",
             &[
@@ -3834,24 +2996,6 @@ impl<'a> Gemma4E2bExecutor<'a> {
             ],
             ple_total,
         )?;
-        if trace_stages {
-            let slot = runtime.upload_u32(&[2])?;
-            command.dispatch_1d(
-                "first_nonfinite_f32",
-                &[&self.ple_lookup, &self.validity, &ple_total_buffer, &slot],
-                1,
-            )?;
-            command.dispatch_1d(
-                "max_abs_f32",
-                &[
-                    &self.ple_lookup,
-                    &self.stage_max_abs,
-                    &ple_total_buffer,
-                    &slot,
-                ],
-                1,
-            )?;
-        }
         self.matvec_labeled(
             &mut command,
             Some("ple_projection"),
@@ -3873,29 +3017,6 @@ impl<'a> Gemma4E2bExecutor<'a> {
             ],
             ple_total,
         )?;
-        if trace_stages {
-            let slot = runtime.upload_u32(&[3])?;
-            command.dispatch_1d(
-                "first_nonfinite_f32",
-                &[
-                    &self.ple_projected,
-                    &self.validity,
-                    &ple_total_buffer,
-                    &slot,
-                ],
-                1,
-            )?;
-            command.dispatch_1d(
-                "max_abs_f32",
-                &[
-                    &self.ple_projected,
-                    &self.stage_max_abs,
-                    &ple_total_buffer,
-                    &slot,
-                ],
-                1,
-            )?;
-        }
         command.dispatch_1d_labeled(
             "rms_norm_groups_in_place_stable_f32",
             Some("ple_norm"),
@@ -3908,29 +3029,6 @@ impl<'a> Gemma4E2bExecutor<'a> {
             ],
             ple_total,
         )?;
-        if trace_stages {
-            let slot = runtime.upload_u32(&[4])?;
-            command.dispatch_1d(
-                "first_nonfinite_f32",
-                &[
-                    &self.ple_projected,
-                    &self.validity,
-                    &ple_total_buffer,
-                    &slot,
-                ],
-                1,
-            )?;
-            command.dispatch_1d(
-                "max_abs_f32",
-                &[
-                    &self.ple_projected,
-                    &self.stage_max_abs,
-                    &ple_total_buffer,
-                    &slot,
-                ],
-                1,
-            )?;
-        }
         command.dispatch_1d(
             "vector_add_f32",
             &[
@@ -3951,19 +3049,6 @@ impl<'a> Gemma4E2bExecutor<'a> {
             ],
             ple_total,
         )?;
-        if trace_stages {
-            let slot = runtime.upload_u32(&[5])?;
-            command.dispatch_1d(
-                "first_nonfinite_f32",
-                &[&self.ple, &self.validity, &ple_total_buffer, &slot],
-                1,
-            )?;
-            command.dispatch_1d(
-                "max_abs_f32",
-                &[&self.ple, &self.stage_max_abs, &ple_total_buffer, &slot],
-                1,
-            )?;
-        }
         for layer in 0..c.layers {
             command.set_layer_index(Some(layer as u32));
             let p = format!("blk.{layer}");
@@ -3994,19 +3079,8 @@ impl<'a> Gemma4E2bExecutor<'a> {
             let attn_norm = self.weight(&format!("{p}.attn_norm.weight"), GgufTensorType::F32)?;
             let wq = self.weight(&format!("{p}.attn_q.weight"), GgufTensorType::Q4_0)?;
             let q_norm = self.weight(&format!("{p}.attn_q_norm.weight"), GgufTensorType::F32)?;
-            let fused_qkv = source == layer && gemma4_qkv_fused_enabled();
-            let fused_rms_qkv = !trace_stages && gemma4_rms_matvec_fused_enabled() && fused_qkv;
-            if !fused_rms_qkv {
-                self.rms_norm_decode_labeled(
-                    &mut command,
-                    Some("attention_input_norm"),
-                    &self.state,
-                    &attn_norm,
-                    &self.norm,
-                    trace_stages,
-                )?;
-            }
-            let fused_qk_norm_rope = gemma4_qk_norm_rope_fused_enabled();
+            let fused_qkv = source == layer;
+            let fused_qk_norm_rope = true;
             let (wk, wv, k_norm) = if source == layer {
                 (
                     Some(self.weight(&format!("{p}.attn_k.weight"), GgufTensorType::Q4_0)?),
@@ -4019,11 +3093,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
             if fused_qkv {
                 self.matmul_q4_0_qkv(
                     &mut command,
-                    if fused_rms_qkv {
-                        &self.state
-                    } else {
-                        &self.norm
-                    },
+                    &self.state,
                     &wq,
                     wk.as_ref().expect("provider layer has K weight"),
                     wv.as_ref().expect("provider layer has V weight"),
@@ -4034,19 +3104,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
                     head_width,
                     q_width,
                     head,
-                    fused_rms_qkv.then_some(&attn_norm),
-                )?;
-            } else {
-                self.matvec_labeled(
-                    &mut command,
-                    Some("qkv_projection"),
-                    &self.norm,
-                    &wq,
-                    &self.q,
-                    &self.hidden,
-                    q_width_buffer,
-                    q_width,
-                    GgufTensorType::Q4_0,
+                    Some(&attn_norm),
                 )?;
             }
             if fused_qk_norm_rope {
@@ -4060,138 +3118,27 @@ impl<'a> Gemma4E2bExecutor<'a> {
                     head_width,
                     source == layer,
                 )?;
-            } else {
-                command.dispatch_1d(
-                    "rms_norm_groups_in_place_f32",
-                    &[&self.q, &q_norm, head_width, &self.heads, &self.epsilon],
-                    q_width,
-                )?;
-                command.dispatch_1d(
-                    "rope_half_to_interleaved_f32",
-                    &[&self.q, &self.rope_input, &self.heads, head_width],
-                    q_width / 2,
-                )?;
-                command.dispatch_1d_at(
-                    "rope_f32",
-                    &[
-                        (&self.rope_input, 0),
-                        (cos, rope_offset),
-                        (sin, rope_offset),
-                        (&self.rope_output, 0),
-                        (head_width, 0),
-                    ],
-                    q_width / 2,
-                )?;
-                command.dispatch_1d(
-                    "rope_interleaved_to_half_f32",
-                    &[&self.rope_output, &self.q_rot, &self.heads, head_width],
-                    q_width / 2,
-                )?;
             }
             if source == layer {
-                if !fused_qkv {
-                    self.matvec_labeled(
-                        &mut command,
-                        Some("qkv_projection"),
-                        &self.norm,
-                        wk.as_ref().expect("provider layer has K weight"),
-                        &self.k,
-                        &self.hidden,
-                        head_width,
-                        head,
-                        GgufTensorType::Q4_0,
-                    )?;
-                    self.matvec_labeled(
-                        &mut command,
-                        Some("qkv_projection"),
-                        &self.norm,
-                        wv.as_ref().expect("provider layer has V weight"),
-                        &self.v,
-                        &self.hidden,
-                        head_width,
-                        head,
-                        GgufTensorType::Q4_0,
-                    )?;
-                }
-                if !fused_qk_norm_rope {
-                    command.dispatch_1d(
-                        "rms_norm_groups_in_place_f32",
-                        &[
-                            &self.k,
-                            k_norm.as_ref().expect("provider layer has K norm"),
-                            head_width,
-                            &self.one,
-                            &self.epsilon,
-                        ],
-                        head,
-                    )?;
-                }
-                if !fused_qk_norm_rope {
-                    command.dispatch_1d(
-                        "rope_half_to_interleaved_f32",
-                        &[&self.k, &self.rope_input, &self.one, head_width],
-                        head / 2,
-                    )?;
-                    command.dispatch_1d_at(
-                        "rope_f32",
-                        &[
-                            (&self.rope_input, 0),
-                            (cos, rope_offset),
-                            (sin, rope_offset),
-                            (&self.rope_output, 0),
-                            (head_width, 0),
-                        ],
-                        head / 2,
-                    )?;
-                    command.dispatch_1d(
-                        "rope_interleaved_to_half_f32",
-                        &[&self.rope_output, &self.k_rot, &self.one, head_width],
-                        head / 2,
-                    )?;
-                }
                 let cache = self.kv[layer].as_ref().expect("KV provider has cache");
                 let append_count = if self.kv_cache_type == Gemma4KvCacheType::F32 {
                     head
                 } else {
                     head / 32
                 };
-                let fused_append_vnorm = !trace_stages && gemma4_kv_append_vnorm_fused_enabled();
-                if !fused_append_vnorm {
-                    command.dispatch_1d_labeled(
-                        "rms_norm_groups_in_place_unweighted_f32",
-                        Some("provider_kv_value_norm"),
-                        &[&self.v, head_width, &self.one, &self.epsilon],
-                        head,
-                    )?;
-                }
-                if fused_append_vnorm {
-                    command.dispatch_1d(
-                        gemma4_kv_append_vnorm_kernel(self.kv_cache_type),
-                        &[
-                            &self.k_rot,
-                            &self.v,
-                            cache,
-                            head_width,
-                            &self.capacity,
-                            &self.position_buffer,
-                            &self.epsilon,
-                        ],
-                        append_count,
-                    )?;
-                } else {
-                    command.dispatch_1d(
-                        gemma4_kv_append_kernel(self.kv_cache_type),
-                        &[
-                            &self.k_rot,
-                            &self.v,
-                            cache,
-                            head_width,
-                            &self.capacity,
-                            &self.position_buffer,
-                        ],
-                        append_count,
-                    )?;
-                }
+                command.dispatch_1d(
+                    gemma4_kv_append_vnorm_kernel(self.kv_cache_type),
+                    &[
+                        &self.k_rot,
+                        &self.v,
+                        cache,
+                        head_width,
+                        &self.capacity,
+                        &self.position_buffer,
+                        &self.epsilon,
+                    ],
+                    append_count,
+                )?;
             }
             // Gemma's cache source is explicit and observable through kv_sources; the existing resident attention kernel remains valid for one KV head.
             let cache = self.kv[source].as_ref().expect("Gemma KV source has cache");
@@ -4200,18 +3147,10 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 .and_then(|entry| entry.checked_add(layer))
                 .and_then(|entry| entry.checked_mul(std::mem::size_of::<u32>()))
                 .context("Gemma attention control-table offset overflows")?;
-            let attention_key_count = gemma4_attention_key_count(
-                self.position
-                    .checked_add(batch_index)
-                    .context("Gemma attention position overflows")?,
-                sliding,
-                c.sliding_window,
-            );
             let (attention_kernel, attention_threads) =
                 gemma4_attention_binding(self.kv_cache_type);
-            let attention_experiment = std::env::var("ATLAS_GEMMA4_Q4_ATTENTION_EXPERIMENT").ok();
             let flash16_binding = if gemma4_q4_flash16_supported(c.attention_heads, head) {
-                gemma4_q4_flash16_binding(sliding, attention_experiment.as_deref())
+                Some(gemma4_q4_flash16_binding(sliding))
             } else {
                 None
             };
@@ -4231,75 +3170,6 @@ impl<'a> Gemma4E2bExecutor<'a> {
                     ],
                     c.attention_heads,
                     usize::try_from(attention_threads).expect("attention threadgroup size"),
-                )?;
-            } else if gemma4_q4_two_pass_attention_eligible(
-                self.kv_cache_type,
-                attention_key_count,
-                attention_experiment.as_deref(),
-            ) {
-                let shared_kv_scan = matches!(attention_experiment.as_deref(), Some("2pass_gqa"))
-                    && gemma4_q4_shared_kv_scan_supported(c.attention_heads, head);
-                let parallel_shared_kv_scan =
-                    matches!(attention_experiment.as_deref(), Some("2pass_mqa_tiled"))
-                        && gemma4_q4_shared_kv_scan_supported(c.attention_heads, head);
-                let attention_first_pass = gemma4_q4_two_pass_attention_first_pass_pipeline(
-                    attention_experiment.as_deref(),
-                    shared_kv_scan || parallel_shared_kv_scan,
-                );
-                // These labels split the two resident attention passes in
-                // diagnostics only; both retain the production pipeline,
-                // buffers, dispatch geometry, and reduction order.
-                command.dispatch_threadgroups_1d_at_labeled(
-                    attention_first_pass,
-                    Some(if sliding {
-                        "gemma_attention_sliding_split_scan"
-                    } else {
-                        "gemma_attention_global_split_scan"
-                    }),
-                    &[
-                        (&self.q_rot, 0),
-                        (cache, 0),
-                        (&self.attention_partials, 0),
-                        (&self.attention_maxima, 0),
-                        (&self.attention_sums, 0),
-                        (&self.heads, 0),
-                        (&self.kv_heads, 0),
-                        (head_width, 0),
-                        (&self.capacity, 0),
-                        (key_counts, key_count_offset),
-                        (&self.attention_two_pass_blocks, 0),
-                    ],
-                    if shared_kv_scan || parallel_shared_kv_scan {
-                        GEMMA4_Q4_TWO_PASS_ATTENTION_BLOCKS
-                    } else {
-                        c.attention_heads * GEMMA4_Q4_TWO_PASS_ATTENTION_BLOCKS
-                    },
-                    if parallel_shared_kv_scan {
-                        256
-                    } else if matches!(attention_experiment.as_deref(), Some("2pass_simd")) {
-                        32
-                    } else {
-                        128
-                    },
-                )?;
-                command.dispatch_threadgroups_1d_labeled(
-                    "attention_decode_fused_gemma4_simd_q4_0_2pass_2",
-                    Some(if sliding {
-                        "gemma_attention_sliding_split_combine"
-                    } else {
-                        "gemma_attention_global_split_combine"
-                    }),
-                    &[
-                        &self.attention_partials,
-                        &self.attention_maxima,
-                        &self.attention_sums,
-                        &self.attention,
-                        &self.heads,
-                        head_width,
-                        &self.attention_two_pass_blocks,
-                    ],
-                    c.attention_heads,
-                    128,
                 )?;
             } else {
                 command.dispatch_threadgroups_1d_at(
@@ -4330,279 +3200,50 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 h,
                 GgufTensorType::Q4_0,
             )?;
-            if trace_stages {
-                let slot =
-                    runtime.upload_u32(&[u32::try_from(gemma4_trace_layer_slot(layer, 1))?])?;
-                command.dispatch_1d(
-                    "first_nonfinite_f32",
-                    &[&self.work, &self.validity, &self.hidden, &slot],
-                    1,
-                )?;
-                command.dispatch_1d(
-                    "max_abs_f32",
-                    &[&self.work, &self.stage_max_abs, &self.hidden, &slot],
-                    1,
-                )?;
-            }
             let post_attn = self.weight(
                 &format!("{p}.post_attention_norm.weight"),
                 GgufTensorType::F32,
             )?;
-            if gemma4_rms_epilogue_fused_enabled() && !trace_stages {
-                command.dispatch_threadgroups_1d_labeled(
-                    "gemma4_rms_residual_f32",
-                    Some("post_attention_norm_residual"),
-                    &[
-                        &self.work,
-                        &post_attn,
-                        &self.state,
-                        &self.work,
-                        &self.residual,
-                        &self.hidden,
-                        &self.epsilon,
-                    ],
-                    1,
-                    32,
-                )?;
-            } else {
-                self.rms_norm_decode_labeled(
-                    &mut command,
-                    Some("post_attention_norm"),
+            command.dispatch_threadgroups_1d_labeled(
+                "gemma4_rms_residual_f32",
+                Some("post_attention_norm_residual"),
+                &[
                     &self.work,
                     &post_attn,
+                    &self.state,
                     &self.work,
-                    trace_stages,
-                )?;
-                command.dispatch_1d(
-                    "vector_add_f32",
-                    &[&self.state, &self.work, &self.residual, &self.hidden],
-                    h,
-                )?;
-            }
-            if trace_stages {
-                let slot =
-                    runtime.upload_u32(&[u32::try_from(gemma4_trace_layer_slot(layer, 2))?])?;
-                command.dispatch_1d(
-                    "first_nonfinite_f32",
-                    &[&self.residual, &self.validity, &self.hidden, &slot],
-                    1,
-                )?;
-                command.dispatch_1d(
-                    "max_abs_f32",
-                    &[&self.residual, &self.stage_max_abs, &self.hidden, &slot],
-                    1,
-                )?;
-            }
+                    &self.residual,
+                    &self.hidden,
+                    &self.epsilon,
+                ],
+                1,
+                32,
+            )?;
             let ffn_norm = self.weight(&format!("{p}.ffn_norm.weight"), GgufTensorType::F32)?;
             let ffn = c.feed_forward_sizes[layer];
             let ffn_buffer = &self.ffn_widths[layer];
             let gate = self.weight(&format!("{p}.ffn_gate.weight"), GgufTensorType::Q4_0)?;
             let up = self.weight(&format!("{p}.ffn_up.weight"), GgufTensorType::Q4_0)?;
             let down = self.weight(&format!("{p}.ffn_down.weight"), GgufTensorType::Q4_0)?;
-            let fused_ffn_gate_up = gemma4_ffn_gate_up_fused_enabled();
-            let fused_ffn_gate_up_activation = self.ffn_gate_up_activation_fused;
-            let fused_rms_gate_up = !trace_stages
-                && gemma4_rms_matvec_fused_enabled()
-                && fused_ffn_gate_up
-                && !fused_ffn_gate_up_activation;
-            if !fused_rms_gate_up {
-                self.rms_norm_decode_labeled(
-                    &mut command,
-                    Some("ffn_input_norm"),
-                    &self.residual,
-                    &ffn_norm,
-                    &self.norm,
-                    trace_stages,
-                )?;
-            }
-            if fused_ffn_gate_up_activation {
-                self.matmul_q4_0_gate_up_gelu(
-                    &mut command,
-                    &self.norm,
-                    &gate,
-                    &up,
-                    &self.product,
-                    ffn_buffer,
-                    ffn,
-                )?;
-            } else if fused_ffn_gate_up {
-                self.matmul_q4_0_gate_up(
-                    &mut command,
-                    if fused_rms_gate_up {
-                        &self.residual
-                    } else {
-                        &self.norm
-                    },
-                    &gate,
-                    &up,
-                    &self.gate,
-                    self.up
-                        .as_ref()
-                        .context("Gemma baseline FFN Up buffer is unavailable")?,
-                    ffn_buffer,
-                    ffn,
-                    fused_rms_gate_up.then_some(&ffn_norm),
-                )?;
-            } else {
-                self.matvec_labeled(
-                    &mut command,
-                    Some("ffn_gate_up_projection"),
-                    &self.norm,
-                    &gate,
-                    &self.gate,
-                    &self.hidden,
-                    ffn_buffer,
-                    ffn,
-                    GgufTensorType::Q4_0,
-                )?;
-            }
-            if trace_stages && !fused_ffn_gate_up_activation {
-                let trace_offset = layer
-                    .checked_mul(self.ffn_trace_width)
-                    .and_then(|offset| offset.checked_mul(std::mem::size_of::<f32>()))
-                    .context("Gemma FFN trace offset overflows")?;
-                command.dispatch_1d_at(
-                    "copy_f32",
-                    &[
-                        (&self.gate, 0),
-                        (&self.trace_gate, trace_offset),
-                        (&ffn_buffer, 0),
-                    ],
-                    ffn,
-                )?;
-                let slot =
-                    runtime.upload_u32(&[u32::try_from(gemma4_trace_layer_slot(layer, 3))?])?;
-                command.dispatch_1d(
-                    "first_nonfinite_f32",
-                    &[&self.gate, &self.validity, &ffn_buffer, &slot],
-                    1,
-                )?;
-                command.dispatch_1d(
-                    "max_abs_f32",
-                    &[&self.gate, &self.stage_max_abs, &ffn_buffer, &slot],
-                    1,
-                )?;
-            }
-            if !fused_ffn_gate_up && !fused_ffn_gate_up_activation {
-                self.matvec_labeled(
-                    &mut command,
-                    Some("ffn_gate_up_projection"),
-                    &self.norm,
-                    &up,
-                    self.up
-                        .as_ref()
-                        .context("Gemma baseline FFN Up buffer is unavailable")?,
-                    &self.hidden,
-                    ffn_buffer,
-                    ffn,
-                    GgufTensorType::Q4_0,
-                )?;
-            }
-            // Keep GELU out-of-place in the baseline. The fused candidates
-            // have already produced `product` without materializing FFN
-            // intermediates.
-            let fused_ffn_gelu_multiply = self.gelu_multiply_fused;
-            if !fused_ffn_gate_up_activation && trace_gelu {
-                let trace_offset = layer
-                    .checked_mul(self.ffn_trace_width)
-                    .and_then(|offset| offset.checked_mul(std::mem::size_of::<f32>()))
-                    .context("Gemma FFN trace offset overflows")?;
-                let cubic = self
-                    .trace_gelu_cubic
-                    .as_ref()
-                    .context("Gemma GELU cubic trace buffer is unavailable")?;
-                let argument = self
-                    .trace_gelu_argument
-                    .as_ref()
-                    .context("Gemma GELU argument trace buffer is unavailable")?;
-                let tanh = self
-                    .trace_gelu_tanh
-                    .as_ref()
-                    .context("Gemma GELU tanh trace buffer is unavailable")?;
-                command.dispatch_1d_at(
-                    "gelu_trace_f32",
-                    &[
-                        (&self.gate, 0),
-                        (&self.activated, 0),
-                        (cubic, trace_offset),
-                        (argument, trace_offset),
-                        (tanh, trace_offset),
-                        (&ffn_buffer, 0),
-                    ],
-                    ffn,
-                )?;
-            } else if fused_ffn_gelu_multiply {
-                let up = self
-                    .up
-                    .as_ref()
-                    .context("Gemma fused FFN Up buffer is unavailable")?;
-                command.dispatch_1d(
-                    "gelu_multiply_f32",
-                    &[&self.gate, up, &self.product, ffn_buffer],
-                    ffn,
-                )?;
-            } else if !fused_ffn_gate_up_activation {
-                command.dispatch_1d(
-                    "gelu_f32",
-                    &[&self.gate, &self.activated, &ffn_buffer],
-                    ffn,
-                )?;
-            }
-            if trace_stages && !fused_ffn_gate_up_activation {
-                let trace_offset = layer
-                    .checked_mul(self.ffn_trace_width)
-                    .and_then(|offset| offset.checked_mul(std::mem::size_of::<f32>()))
-                    .context("Gemma FFN trace offset overflows")?;
-                command.dispatch_1d_at(
-                    "copy_f32",
-                    &[
-                        (&self.activated, 0),
-                        (&self.trace_activated, trace_offset),
-                        (&ffn_buffer, 0),
-                    ],
-                    ffn,
-                )?;
-                let slot =
-                    runtime.upload_u32(&[u32::try_from(gemma4_trace_layer_slot(layer, 4))?])?;
-                command.dispatch_1d(
-                    "first_nonfinite_f32",
-                    &[&self.activated, &self.validity, &ffn_buffer, &slot],
-                    1,
-                )?;
-                command.dispatch_1d(
-                    "max_abs_f32",
-                    &[&self.activated, &self.stage_max_abs, &ffn_buffer, &slot],
-                    1,
-                )?;
-            }
-            if !fused_ffn_gate_up_activation && !fused_ffn_gelu_multiply {
-                command.dispatch_1d(
-                    "vector_multiply_f32",
-                    &[
-                        &self.activated,
-                        self.up
-                            .as_ref()
-                            .context("Gemma baseline FFN Up buffer is unavailable")?,
-                        &self.product,
-                        &ffn_buffer,
-                    ],
-                    ffn,
-                )?;
-            }
-            if trace_stages && !fused_ffn_gate_up_activation {
-                let slot =
-                    runtime.upload_u32(&[u32::try_from(gemma4_trace_layer_slot(layer, 5))?])?;
-                command.dispatch_1d(
-                    "first_nonfinite_f32",
-                    &[&self.product, &self.validity, &ffn_buffer, &slot],
-                    1,
-                )?;
-                command.dispatch_1d(
-                    "max_abs_f32",
-                    &[&self.product, &self.stage_max_abs, &ffn_buffer, &slot],
-                    1,
-                )?;
-            }
+            let up_buffer = &self.up;
+            self.matmul_q4_0_gate_up(
+                &mut command,
+                &self.residual,
+                &gate,
+                &up,
+                &self.gate,
+                up_buffer,
+                ffn_buffer,
+                ffn,
+                Some(&ffn_norm),
+            )?;
+            // Keep GELU out-of-place: the fused Gate/Up kernel has produced
+            // `product` without materializing FFN intermediates.
+            command.dispatch_1d(
+                "gelu_multiply_f32",
+                &[&self.gate, up_buffer, &self.product, ffn_buffer],
+                ffn,
+            )?;
             self.matvec_ffn_down(
                 &mut command,
                 &self.product,
@@ -4614,55 +3255,21 @@ impl<'a> Gemma4E2bExecutor<'a> {
             )?;
             let post_ffn =
                 self.weight(&format!("{p}.post_ffw_norm.weight"), GgufTensorType::F32)?;
-            if gemma4_rms_epilogue_fused_enabled() && !trace_stages {
-                command.dispatch_threadgroups_1d_labeled(
-                    "gemma4_rms_residual_f32",
-                    Some("post_ffn_norm_residual"),
-                    &[
-                        &self.work,
-                        &post_ffn,
-                        &self.residual,
-                        &self.work,
-                        &self.state,
-                        &self.hidden,
-                        &self.epsilon,
-                    ],
-                    1,
-                    32,
-                )?;
-            } else {
-                self.rms_norm_decode_labeled(
-                    &mut command,
-                    Some("post_ffn_norm"),
+            command.dispatch_threadgroups_1d_labeled(
+                "gemma4_rms_residual_f32",
+                Some("post_ffn_norm_residual"),
+                &[
                     &self.work,
                     &post_ffn,
+                    &self.residual,
                     &self.work,
-                    trace_stages,
-                )?;
-                if trace_stages {
-                    let slot =
-                        runtime.upload_u32(&[u32::try_from(gemma4_trace_layer_slot(layer, 6))?])?;
-                    command.dispatch_1d(
-                        "first_nonfinite_f32",
-                        &[&self.work, &self.validity, &self.hidden, &slot],
-                        1,
-                    )?;
-                }
-                command.dispatch_1d(
-                    "vector_add_f32",
-                    &[&self.residual, &self.work, &self.state, &self.hidden],
-                    h,
-                )?;
-            }
-            if trace_stages {
-                let slot =
-                    runtime.upload_u32(&[u32::try_from(gemma4_trace_layer_slot(layer, 7))?])?;
-                command.dispatch_1d(
-                    "first_nonfinite_f32",
-                    &[&self.state, &self.validity, &self.hidden, &slot],
-                    1,
-                )?;
-            }
+                    &self.state,
+                    &self.hidden,
+                    &self.epsilon,
+                ],
+                1,
+                32,
+            )?;
             let inp_gate = self.weight(&format!("{p}.inp_gate.weight"), GgufTensorType::Q4_0)?;
             let projection = self.weight(&format!("{p}.proj.weight"), GgufTensorType::Q4_0)?;
             let post_norm = self.weight(&format!("{p}.post_norm.weight"), GgufTensorType::F32)?;
@@ -4677,83 +3284,20 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 c.per_layer_embedding_size,
                 GgufTensorType::Q4_0,
             )?;
-            if trace_stages {
-                let slot =
-                    runtime.upload_u32(&[u32::try_from(gemma4_trace_layer_slot(layer, 8))?])?;
-                command.dispatch_1d(
-                    "first_nonfinite_f32",
-                    &[&self.gate, &self.validity, &self.ple_width, &slot],
-                    1,
-                )?;
-                command.dispatch_1d(
-                    "max_abs_f32",
-                    &[&self.gate, &self.stage_max_abs, &self.ple_width, &slot],
-                    1,
-                )?;
-            }
-            if !self.ple_composition_fused {
-                command.dispatch_1d(
-                    "gelu_f32",
-                    &[&self.gate, &self.gate, &self.ple_width],
-                    c.per_layer_embedding_size,
-                )?;
-            }
-            if trace_stages {
-                let slot =
-                    runtime.upload_u32(&[u32::try_from(gemma4_trace_layer_slot(layer, 9))?])?;
-                command.dispatch_1d(
-                    "first_nonfinite_f32",
-                    &[&self.gate, &self.validity, &self.ple_width, &slot],
-                    1,
-                )?;
-                command.dispatch_1d(
-                    "max_abs_f32",
-                    &[&self.gate, &self.stage_max_abs, &self.ple_width, &slot],
-                    1,
-                )?;
-            }
             // Current layer PLE is a contiguous [256] slice in the resident [layer][width] table.
             let ple_offset = &self.ple_offsets[layer];
-            if self.ple_composition_fused {
-                command.dispatch_1d_labeled(
-                    "ple_gelu_multiply_offset_f32",
-                    Some("ple_projection"),
-                    &[
-                        &self.gate,
-                        &self.ple,
-                        &self.activated,
-                        &ple_offset,
-                        &self.ple_width,
-                    ],
-                    c.per_layer_embedding_size,
-                )?;
-            } else {
-                command.dispatch_1d(
-                    "vector_multiply_offset_f32",
-                    &[
-                        &self.gate,
-                        &self.ple,
-                        &self.activated,
-                        &ple_offset,
-                        &self.ple_width,
-                    ],
-                    c.per_layer_embedding_size,
-                )?;
-            }
-            if trace_stages {
-                let slot =
-                    runtime.upload_u32(&[u32::try_from(gemma4_trace_layer_slot(layer, 10))?])?;
-                command.dispatch_1d(
-                    "first_nonfinite_f32",
-                    &[&self.activated, &self.validity, &self.ple_width, &slot],
-                    1,
-                )?;
-                command.dispatch_1d(
-                    "max_abs_f32",
-                    &[&self.activated, &self.stage_max_abs, &self.ple_width, &slot],
-                    1,
-                )?;
-            }
+            command.dispatch_1d_labeled(
+                "ple_gelu_multiply_offset_f32",
+                Some("ple_projection"),
+                &[
+                    &self.gate,
+                    &self.ple,
+                    &self.activated,
+                    &ple_offset,
+                    &self.ple_width,
+                ],
+                c.per_layer_embedding_size,
+            )?;
             self.matvec_labeled(
                 &mut command,
                 Some("ple_projection"),
@@ -4771,22 +3315,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 &self.work,
                 &post_norm,
                 &self.work,
-                trace_stages,
             )?;
-            if trace_stages {
-                let slot =
-                    runtime.upload_u32(&[u32::try_from(gemma4_trace_layer_slot(layer, 11))?])?;
-                command.dispatch_1d(
-                    "first_nonfinite_f32",
-                    &[&self.work, &self.validity, &self.hidden, &slot],
-                    1,
-                )?;
-                command.dispatch_1d(
-                    "max_abs_f32",
-                    &[&self.work, &self.stage_max_abs, &self.hidden, &slot],
-                    1,
-                )?;
-            }
             command.dispatch_1d(
                 "vector_add_f32",
                 &[&self.state, &self.work, &self.state, &self.hidden],
@@ -4801,63 +3330,24 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 &[&self.state, &self.state, &scale, &self.hidden],
                 h,
             )?;
-            if trace_stages {
-                let layer_slot =
-                    runtime.upload_u32(&[u32::try_from(gemma4_trace_layer_slot(layer, 12))?])?;
-                command.dispatch_1d(
-                    "first_nonfinite_f32",
-                    &[&self.state, &self.validity, &self.hidden, &layer_slot],
-                    1,
-                )?;
-                command.dispatch_1d(
-                    "max_abs_f32",
-                    &[&self.state, &self.stage_max_abs, &self.hidden, &layer_slot],
-                    1,
-                )?;
-            }
         }
         command.set_layer_index(None);
         if !select_output {
             return Ok(());
         }
         let output_norm = self.weight("output_norm.weight", GgufTensorType::F32)?;
-        let fused_rms_output = !trace_stages && gemma4_rms_matvec_fused_enabled();
-        if !fused_rms_output {
-            self.rms_norm_decode_labeled(
-                &mut command,
-                Some("final_output_norm"),
-                &self.state,
-                &output_norm,
-                &self.norm,
-                trace_stages,
-            )?;
-        }
-        if fused_rms_output {
-            self.matvec_rms_labeled(
-                &mut command,
-                Some("output_projection"),
-                &self.state,
-                &self.output_projection,
-                &self.logits,
-                &self.hidden,
-                &self.vocab,
-                c.vocab_size,
-                self.weight_format.output_format(),
-                &output_norm,
-            )?;
-        } else {
-            self.matvec_labeled(
-                &mut command,
-                Some("output_projection"),
-                &self.norm,
-                &self.output_projection,
-                &self.logits,
-                &self.hidden,
-                &self.vocab,
-                c.vocab_size,
-                self.weight_format.output_format(),
-            )?;
-        }
+        self.matvec_rms_labeled(
+            &mut command,
+            Some("output_projection"),
+            &self.state,
+            &self.output_projection,
+            &self.logits,
+            &self.hidden,
+            &self.vocab,
+            c.vocab_size,
+            self.weight_format.output_format(),
+            &output_norm,
+        )?;
         command.dispatch_1d(
             "softcap_f32",
             &[&self.logits, &self.final_softcap, &self.vocab],
@@ -4869,94 +3359,6 @@ impl<'a> Gemma4E2bExecutor<'a> {
             1,
             256,
         )?;
-        let trace_dispatches = if trace_sync {
-            command
-                .take_kernel_timings()
-                .into_iter()
-                .rev()
-                .take(12)
-                .map(|timing| {
-                    format!(
-                        "{}:{:.3}ms",
-                        timing.kernel,
-                        timing.timing.wall_time.as_secs_f64() * 1_000.0
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",")
-        } else {
-            String::new()
-        };
-        if trace_stages {
-            let marker = runtime.read_u32(&self.validity)?;
-            if marker != u32::MAX {
-                let slot = marker >> 16;
-                let index = marker & 0xffff;
-                let total_trace_stages = GEMMA4_TRACE_GLOBAL_STAGES
-                    + self.model.config.layers * GEMMA4_TRACE_STAGES_PER_LAYER;
-                let ranges = runtime.read_f32(&self.stage_max_abs, total_trace_stages)?;
-                if usize::try_from(slot)? < GEMMA4_TRACE_GLOBAL_STAGES {
-                    let stage = match slot {
-                        0 => "input_embedding",
-                        1 => "ple_lookup_raw",
-                        2 => "ple_lookup_scaled",
-                        3 => "ple_projection_scaled",
-                        4 => "ple_projection_rms",
-                        _ => "ple_combined",
-                    };
-                    let ple_layer =
-                        usize::try_from(index)? / self.model.config.per_layer_embedding_size;
-                    anyhow::bail!(
-                        "Gemma resident state became non-finite at {stage} index {index} (PLE layer {ple_layer}); max_abs input_embedding={} ple_lookup_raw={} ple_lookup_scaled={} ple_projection_scaled={} ple_projection_rms={} ple_combined={}; sync_dispatches=[{}]",
-                        ranges[0],
-                        ranges[1],
-                        ranges[2],
-                        ranges[3],
-                        ranges[4],
-                        ranges[5],
-                        trace_dispatches,
-                    );
-                }
-                let stages = u32::try_from(GEMMA4_TRACE_STAGES_PER_LAYER)?;
-                let layer_slot = slot - u32::try_from(GEMMA4_TRACE_GLOBAL_STAGES)?;
-                let layer = layer_slot / stages;
-                let stage = match usize::try_from(layer_slot)? % GEMMA4_TRACE_STAGES_PER_LAYER {
-                    0 => "input_embedding",
-                    1 => "attention_projection",
-                    2 => "post_attention",
-                    3 => "ffn_gate",
-                    4 => "ffn_gate_gelu",
-                    5 => "ffn_product",
-                    6 => "ffn_down_norm",
-                    7 => "post_mlp",
-                    8 => "ple_gate",
-                    9 => "ple_gate_gelu",
-                    10 => "ple_product",
-                    11 => "ple_projection_norm",
-                    _ => "post_ple",
-                };
-                let base = GEMMA4_TRACE_GLOBAL_STAGES
-                    + usize::try_from(layer).expect("trace slot fits usize")
-                        * GEMMA4_TRACE_STAGES_PER_LAYER;
-                anyhow::bail!(
-                    "Gemma resident state became non-finite at layer {layer} {stage} hidden index {index}; max_abs input_embedding={} attention_projection={} post_attention={} ffn_gate={} ffn_gate_gelu={} ffn_product={} ffn_down_norm={} post_mlp={} ple_gate={} ple_gate_gelu={} ple_product={} ple_projection_norm={} post_ple={}; sync_dispatches=[{}]",
-                    ranges[base],
-                    ranges[base + 1],
-                    ranges[base + 2],
-                    ranges[base + 3],
-                    ranges[base + 4],
-                    ranges[base + 5],
-                    ranges[base + 6],
-                    ranges[base + 7],
-                    ranges[base + 8],
-                    ranges[base + 9],
-                    ranges[base + 10],
-                    ranges[base + 11],
-                    ranges[base + 12],
-                    trace_dispatches,
-                );
-            }
-        }
         Ok(())
     }
 }
@@ -4966,25 +3368,13 @@ mod tests {
     use std::ffi::OsString;
 
     use super::{
-        GEMMA4_Q4_SHARED_KV_HEAD_DIM, GEMMA4_Q4_SHARED_KV_QUERY_HEADS,
-        GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD,
-        GEMMA4_Q4_TWO_PASS_ATTENTION_LEGACY_THRESHOLD, GEMMA4_SELECTED_GROUP_QKV,
-        GEMMA4_SELECTED_GROUP_VOCAB_EMBEDDINGS, GEMMA4_SELECTED_GROUP_VOCAB_OUTPUT,
-        Gemma4KvCacheType, Gemma4PrefillPlan, Gemma4WeightFormat, QuantizationPlan,
-        gemma4_attention_key_count, gemma4_attention_key_count_table,
-        gemma4_decode_profile_targets, gemma4_ffn_down_projection_kernel_for,
-        gemma4_ffn_gate_up_activation_fused_enabled_for, gemma4_ffn_gate_up_fused_enabled_for,
-        gemma4_ffn_gelu_multiply_fused_enabled_for, gemma4_kernel_family,
-        gemma4_kv_append_vnorm_fused_enabled_for, gemma4_ple_composition_fused_enabled_for,
-        gemma4_prefill_path, gemma4_profile_family, gemma4_q4_batch_projection_kernel_for,
-        gemma4_q4_gate_up_projection_kernel_for, gemma4_q4_projection_kernel_for,
-        gemma4_q4_qkv_projection_kernel_for, gemma4_q4_shared_kv_scan_supported,
-        gemma4_q4_two_pass_attention_eligible, gemma4_q4_two_pass_attention_first_pass_pipeline,
-        gemma4_q4_two_pass_attention_threshold, gemma4_q6_k_to_q4_0,
-        gemma4_q6_projection_kernel_for, gemma4_rms_epilogue_fused_enabled_for,
-        gemma4_rms_matvec_fused_enabled_for, gemma4_rms_norm_decode_kernel_for, gemma4_rope_angle,
-        gemma4_selected_group_formats, gemma4_should_finish, gemma4_two_pass_attention_ranges,
-        gemma4_weight_format_with_plan,
+        GEMMA4_SELECTED_GROUP_QKV, GEMMA4_SELECTED_GROUP_VOCAB_EMBEDDINGS,
+        GEMMA4_SELECTED_GROUP_VOCAB_OUTPUT, Gemma4KvCacheType, Gemma4PrefillPlan,
+        Gemma4WeightFormat, QuantizationPlan, gemma4_attention_key_count,
+        gemma4_attention_key_count_table, gemma4_decode_profile_targets, gemma4_kernel_family,
+        gemma4_prefill_path, gemma4_profile_family, gemma4_q6_k_to_q4_0,
+        gemma4_rms_norm_decode_kernel, gemma4_rope_angle, gemma4_selected_group_formats,
+        gemma4_should_finish, gemma4_weight_format_with_plan,
     };
     use atlas_core::{GgufTensorType, dequantize_block};
 
@@ -5000,23 +3390,9 @@ mod tests {
 
     #[test]
     fn layer_major_prefill_is_the_normal_multi_token_resident_path() {
-        assert_eq!(
-            gemma4_prefill_path(1, false, false),
-            "resident_chunked_command"
-        );
-        assert_eq!(gemma4_prefill_path(2, false, false), "resident_layer_major");
-        assert_eq!(
-            gemma4_prefill_path(128, false, false),
-            "resident_layer_major"
-        );
-        assert_eq!(
-            gemma4_prefill_path(128, true, false),
-            "resident_chunked_command"
-        );
-        assert_eq!(
-            gemma4_prefill_path(128, false, true),
-            "resident_token_major_command"
-        );
+        assert_eq!(gemma4_prefill_path(1), "resident_chunked_command");
+        assert_eq!(gemma4_prefill_path(2), "resident_layer_major");
+        assert_eq!(gemma4_prefill_path(128), "resident_layer_major");
     }
 
     #[test]
@@ -5042,207 +3418,19 @@ mod tests {
     }
 
     #[test]
+    fn rms_norm_kernel_uses_vec4_only_for_128_aligned_hidden_sizes() {
+        assert_eq!(
+            gemma4_rms_norm_decode_kernel(2304),
+            "rms_norm_decode_f32_vec4"
+        );
+        assert_eq!(gemma4_rms_norm_decode_kernel(2305), "rms_norm_decode_f32");
+    }
+
+    #[test]
     fn attention_control_table_keeps_each_token_and_layer_immutable() {
         let controls = gemma4_attention_key_count_table(126, 3, &[false, true, false], 128)
             .expect("build controls");
         assert_eq!(controls, vec![127, 127, 127, 128, 128, 128, 129, 128, 129]);
-    }
-
-    #[test]
-    fn two_pass_q4_attention_partitions_every_visible_key_once() {
-        for key_count in [96, 97, 128, 256] {
-            let ranges = gemma4_two_pass_attention_ranges(key_count);
-            assert_eq!(ranges[0].0, 0);
-            assert_eq!(ranges[3].1, key_count);
-            for pair in ranges.windows(2) {
-                assert_eq!(pair[0].1, pair[1].0);
-                assert!(pair[0].0 < pair[0].1);
-            }
-        }
-    }
-
-    #[test]
-    fn two_pass_attention_is_q4_only_and_starts_at_the_selected_threshold() {
-        assert!(!gemma4_q4_two_pass_attention_eligible(
-            Gemma4KvCacheType::Q4_0,
-            GEMMA4_Q4_TWO_PASS_ATTENTION_LEGACY_THRESHOLD - 1,
-            Some("2pass"),
-        ));
-        assert!(gemma4_q4_two_pass_attention_eligible(
-            Gemma4KvCacheType::Q4_0,
-            GEMMA4_Q4_TWO_PASS_ATTENTION_LEGACY_THRESHOLD,
-            Some("2pass"),
-        ));
-        assert!(!gemma4_q4_two_pass_attention_eligible(
-            Gemma4KvCacheType::Q8_0,
-            GEMMA4_Q4_TWO_PASS_ATTENTION_LEGACY_THRESHOLD,
-            Some("2pass"),
-        ));
-        assert!(!gemma4_q4_two_pass_attention_eligible(
-            Gemma4KvCacheType::F32,
-            GEMMA4_Q4_TWO_PASS_ATTENTION_LEGACY_THRESHOLD,
-            Some("2pass"),
-        ));
-    }
-
-    #[test]
-    fn two_pass_attention_threshold_modes_are_explicit() {
-        assert_eq!(
-            gemma4_q4_two_pass_attention_threshold(None),
-            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_threshold(Some("default")),
-            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_threshold(Some("2pass64")),
-            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_threshold(Some("baseline")),
-            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_threshold(Some("2pass_no_value_barrier")),
-            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_threshold(Some("2pass")),
-            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_LEGACY_THRESHOLD)
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_threshold(Some("2pass96")),
-            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_LEGACY_THRESHOLD)
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_threshold(Some("2pass80")),
-            Some(80)
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_threshold(Some("2pass_cache")),
-            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_threshold(Some("2pass_cache_no_value_barrier")),
-            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_threshold(Some("2pass_key_blockvec")),
-            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_threshold(Some("2pass_unroll2_no_value_barrier")),
-            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_threshold(Some("2pass_gqa")),
-            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_threshold(Some("2pass_mqa_tiled")),
-            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_threshold(Some("2pass_simd")),
-            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_threshold(Some("2pass_simd_reg")),
-            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_first_pass_pipeline(Some("2pass_simd_reg"), false),
-            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_simd_reg"
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_first_pass_pipeline(Some("2pass_cache"), false),
-            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_cacheopt"
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_first_pass_pipeline(
-                Some("2pass_cache_no_value_barrier"),
-                false
-            ),
-            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_cacheopt_no_value_barrier"
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_first_pass_pipeline(Some("2pass_key_blockvec"), false),
-            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_key_blockvec"
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_first_pass_pipeline(
-                Some("2pass_unroll2_no_value_barrier"),
-                false
-            ),
-            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_unroll2_no_value_barrier"
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_first_pass_pipeline(Some("2pass_no_value_barrier"), false),
-            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_no_value_barrier"
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_first_pass_pipeline(Some("2pass64"), false),
-            "attention_decode_fused_gemma4_simd_q4_0_2pass_1"
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_first_pass_pipeline(Some("2pass_gqa"), true),
-            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_gqa"
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_first_pass_pipeline(Some("2pass_gqa"), false),
-            "attention_decode_fused_gemma4_simd_q4_0_2pass_1"
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_first_pass_pipeline(Some("2pass_mqa_tiled"), true),
-            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_mqa_tiled"
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_first_pass_pipeline(Some("2pass_mqa_tiled"), false),
-            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_no_value_barrier"
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_first_pass_pipeline(Some("2pass_simd"), false),
-            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_simd"
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_first_pass_pipeline(None, false),
-            "attention_decode_fused_gemma4_simd_q4_0_2pass_1_no_value_barrier"
-        );
-        assert!(gemma4_q4_shared_kv_scan_supported(
-            GEMMA4_Q4_SHARED_KV_QUERY_HEADS,
-            GEMMA4_Q4_SHARED_KV_HEAD_DIM,
-        ));
-        assert!(!gemma4_q4_shared_kv_scan_supported(
-            GEMMA4_Q4_SHARED_KV_QUERY_HEADS + 1,
-            GEMMA4_Q4_SHARED_KV_HEAD_DIM,
-        ));
-        assert!(!gemma4_q4_shared_kv_scan_supported(
-            GEMMA4_Q4_SHARED_KV_QUERY_HEADS,
-            GEMMA4_Q4_SHARED_KV_HEAD_DIM / 2,
-        ));
-        assert_eq!(
-            gemma4_q4_two_pass_attention_threshold(Some("2pass64")),
-            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_threshold(Some("2pass72")),
-            None
-        );
-        assert_eq!(
-            gemma4_q4_two_pass_attention_threshold(Some("baseline")),
-            Some(GEMMA4_Q4_TWO_PASS_ATTENTION_BASELINE_THRESHOLD)
-        );
-        assert!(!gemma4_q4_two_pass_attention_eligible(
-            Gemma4KvCacheType::Q4_0,
-            63,
-            None,
-        ));
-        assert!(gemma4_q4_two_pass_attention_eligible(
-            Gemma4KvCacheType::Q4_0,
-            64,
-            None,
-        ));
     }
 
     #[test]
@@ -5281,11 +3469,11 @@ mod tests {
     #[test]
     fn decode_profile_groups_gemma_kernel_families_without_hiding_other_work() {
         assert_eq!(
-            gemma4_kernel_family("matvec_q4_0_16row"),
+            gemma4_kernel_family("matvec_q4_0_64row_mv"),
             "q4_projection_other"
         );
         assert_eq!(
-            gemma4_kernel_family("matvec_q6_k_8row"),
+            gemma4_kernel_family("matvec_q6_k_64row_mv"),
             "q6_lm_head_projection"
         );
         assert_eq!(
@@ -5293,11 +3481,11 @@ mod tests {
             "batched_projection"
         );
         assert_eq!(
-            gemma4_kernel_family("matmul_q4_0_qkv_16row"),
+            gemma4_kernel_family("matmul_q4_0_qkv_32row_mv_rms"),
             "q4_qkv_projection"
         );
         assert_eq!(
-            gemma4_kernel_family("matmul_q4_0_gate_up_16row"),
+            gemma4_kernel_family("matmul_q4_0_gate_up_32row_mv_rms"),
             "q4_ffn_gate_up_projection"
         );
         assert_eq!(gemma4_kernel_family("rms_norm_decode_f32"), "rms_norm");
@@ -5321,106 +3509,6 @@ mod tests {
         );
         assert_eq!(gemma4_kernel_family("vector_add_f32"), "residual");
         assert_eq!(gemma4_kernel_family("gelu_f32"), "ffn_activation");
-    }
-
-    #[test]
-    fn vectorized_rms_norm_is_opt_in_with_a_baseline_default() {
-        assert_eq!(
-            gemma4_rms_norm_decode_kernel_for(2304, None),
-            "rms_norm_decode_f32"
-        );
-        assert_eq!(
-            gemma4_rms_norm_decode_kernel_for(2304, Some("baseline")),
-            "rms_norm_decode_f32"
-        );
-        assert_eq!(
-            gemma4_rms_norm_decode_kernel_for(2304, Some("scalar")),
-            "rms_norm_decode_f32"
-        );
-        assert_eq!(
-            gemma4_rms_norm_decode_kernel_for(2304, Some("vec4")),
-            "rms_norm_decode_f32_vec4"
-        );
-        assert_eq!(
-            gemma4_rms_norm_decode_kernel_for(2305, Some("vec4")),
-            "rms_norm_decode_f32"
-        );
-    }
-
-    #[test]
-    fn ple_composition_is_opt_in() {
-        assert!(!gemma4_ple_composition_fused_enabled_for(None));
-        assert!(!gemma4_ple_composition_fused_enabled_for(Some("baseline")));
-        assert!(gemma4_ple_composition_fused_enabled_for(Some("fused")));
-    }
-
-    #[test]
-    fn q4_projection_experiments_are_opt_in_with_a_baseline_escape_hatch() {
-        assert_eq!(gemma4_q4_projection_kernel_for(None), "matvec_q4_0_16row");
-        assert_eq!(
-            gemma4_q4_projection_kernel_for(Some("baseline")),
-            "matvec_q4_0_16row"
-        );
-        assert_eq!(
-            gemma4_q4_projection_kernel_for(Some("shared_input")),
-            "matvec_q4_0_16row_shared_input"
-        );
-        assert_eq!(
-            gemma4_q4_projection_kernel_for(Some("simdgroup_tiled")),
-            "matvec_q4_0_16row_simdgroup_tiled"
-        );
-        assert_eq!(
-            gemma4_q4_projection_kernel_for(Some("mv_ext")),
-            "matvec_q4_0_32row_mv"
-        );
-        assert_eq!(
-            gemma4_q4_projection_kernel_for(Some("mv_ext_64")),
-            "matvec_q4_0_64row_mv"
-        );
-        assert_eq!(
-            gemma4_q4_qkv_projection_kernel_for(Some("mv_ext")),
-            "matmul_q4_0_qkv_32row_mv"
-        );
-        assert_eq!(
-            gemma4_q4_qkv_projection_kernel_for(Some("mv_ext_64")),
-            "matmul_q4_0_qkv_32row_mv"
-        );
-        assert_eq!(
-            gemma4_q4_qkv_projection_kernel_for(Some("simdgroup_tiled")),
-            "matmul_q4_0_qkv_16row_simdgroup_tiled"
-        );
-        assert_eq!(
-            gemma4_q4_gate_up_projection_kernel_for(Some("mv_ext")),
-            "matmul_q4_0_gate_up_32row_mv"
-        );
-        assert_eq!(
-            gemma4_q4_gate_up_projection_kernel_for(Some("mv_ext_64")),
-            "matmul_q4_0_gate_up_32row_mv"
-        );
-        assert_eq!(
-            gemma4_q4_gate_up_projection_kernel_for(None),
-            "matmul_q4_0_gate_up_16row"
-        );
-        assert_eq!(
-            gemma4_q4_gate_up_projection_kernel_for(Some("baseline")),
-            "matmul_q4_0_gate_up_16row"
-        );
-        assert_eq!(
-            gemma4_q4_gate_up_projection_kernel_for(Some("simdgroup_tiled")),
-            "matmul_q4_0_gate_up_16row_simdgroup_tiled"
-        );
-        assert_eq!(
-            gemma4_q4_batch_projection_kernel_for(Some("simdgroup_tiled")),
-            "matmul_q4_0_batch_16row_simdgroup_tiled"
-        );
-        assert_eq!(
-            gemma4_q4_batch_projection_kernel_for(Some("tiled")),
-            "matmul_q4_0_batch_16row_token_tiled"
-        );
-        assert_eq!(
-            gemma4_q4_batch_projection_kernel_for(None),
-            "matmul_q4_0_batch_16row"
-        );
     }
 
     #[test]
@@ -5557,47 +3645,6 @@ mod tests {
     }
 
     #[test]
-    fn q6_lm_head_cacheopt_is_opt_in() {
-        assert_eq!(gemma4_q6_projection_kernel_for(None), "matvec_q6_k_8row");
-        assert_eq!(
-            gemma4_q6_projection_kernel_for(Some("cacheopt")),
-            "matvec_q6_k_8row_cacheopt"
-        );
-        assert_eq!(
-            gemma4_q6_projection_kernel_for(Some("mv_ext")),
-            "matvec_q6_k_32row_mv"
-        );
-        assert_eq!(
-            gemma4_q6_projection_kernel_for(Some("mv_ext_64")),
-            "matvec_q6_k_64row_mv"
-        );
-    }
-
-    #[test]
-    fn ffn_down_interleaved_projection_is_opt_in() {
-        assert_eq!(
-            gemma4_ffn_down_projection_kernel_for(None),
-            "matvec_q4_0_16row"
-        );
-        assert_eq!(
-            gemma4_ffn_down_projection_kernel_for(Some("baseline")),
-            "matvec_q4_0_16row"
-        );
-        assert_eq!(
-            gemma4_ffn_down_projection_kernel_for(Some("interleaved16")),
-            "matvec_q4_0_16row_ffn_down_interleaved"
-        );
-        assert_eq!(
-            gemma4_ffn_down_projection_kernel_for(Some("mv_ext")),
-            "matvec_q4_0_32row_mv"
-        );
-        assert_eq!(
-            gemma4_ffn_down_projection_kernel_for(Some("mv_ext_64")),
-            "matvec_q4_0_64row_mv"
-        );
-    }
-
-    #[test]
     fn all_q4_vocabulary_conversion_preserves_packed_layout_and_bounded_oracle_error() {
         // A Q6_K block with every quantized value at -32, unit group scales,
         // and a unit super-block scale is easy to audit byte-for-byte.
@@ -5700,41 +3747,6 @@ mod tests {
     }
 
     #[test]
-    fn gemma4_ffn_gate_up_fusion_defaults_on_with_an_explicit_baseline_escape_hatch() {
-        assert!(gemma4_ffn_gate_up_fused_enabled_for(None));
-        assert!(gemma4_ffn_gate_up_fused_enabled_for(Some("fused")));
-        assert!(!gemma4_ffn_gate_up_fused_enabled_for(Some("baseline")));
-        assert!(!gemma4_ffn_gate_up_fused_enabled_for(Some("off")));
-        assert!(!gemma4_ffn_gate_up_fused_enabled_for(Some("0")));
-    }
-
-    #[test]
-    fn gemma4_ffn_gate_up_activation_fusion_is_opt_in() {
-        assert!(!gemma4_ffn_gate_up_activation_fused_enabled_for(None));
-        assert!(!gemma4_ffn_gate_up_activation_fused_enabled_for(Some(
-            "baseline"
-        )));
-        assert!(gemma4_ffn_gate_up_activation_fused_enabled_for(Some(
-            "fused"
-        )));
-        assert!(!gemma4_ffn_gate_up_activation_fused_enabled_for(Some(
-            "simdgroup_tiled"
-        )));
-    }
-
-    #[test]
-    fn gemma4_ffn_gelu_multiply_fusion_is_opt_in() {
-        assert!(!gemma4_ffn_gelu_multiply_fused_enabled_for(None));
-        assert!(!gemma4_ffn_gelu_multiply_fused_enabled_for(Some(
-            "baseline"
-        )));
-        assert!(gemma4_ffn_gelu_multiply_fused_enabled_for(Some("fused")));
-        assert!(!gemma4_ffn_gelu_multiply_fused_enabled_for(Some(
-            "simdgroup_tiled"
-        )));
-    }
-
-    #[test]
     fn decode_profile_prefers_each_semantic_label_over_pipeline_family() {
         for label in [
             "attention_input_norm",
@@ -5766,76 +3778,26 @@ mod tests {
             );
         }
         assert_eq!(
-            gemma4_profile_family(None, "matvec_q4_0_16row"),
+            gemma4_profile_family(None, "matvec_q4_0_64row_mv"),
             "q4_projection_other"
         );
     }
 
     #[test]
-    fn rms_epilogue_fusion_is_opt_in_with_a_baseline_escape_hatch() {
-        assert!(!gemma4_rms_epilogue_fused_enabled_for(None));
-        assert!(!gemma4_rms_epilogue_fused_enabled_for(Some("baseline")));
-        assert!(!gemma4_rms_epilogue_fused_enabled_for(Some("off")));
-        assert!(gemma4_rms_epilogue_fused_enabled_for(Some("fused")));
-        assert!(gemma4_rms_epilogue_fused_enabled_for(Some("1")));
-    }
-
-    #[test]
-    fn kv_append_vnorm_fusion_is_opt_in_with_a_baseline_default() {
-        assert!(!gemma4_kv_append_vnorm_fused_enabled_for(None));
-        assert!(!gemma4_kv_append_vnorm_fused_enabled_for(Some("baseline")));
-        assert!(!gemma4_kv_append_vnorm_fused_enabled_for(Some("off")));
-        assert!(!gemma4_kv_append_vnorm_fused_enabled_for(Some("0")));
-        assert!(!gemma4_kv_append_vnorm_fused_enabled_for(Some("")));
-        assert!(gemma4_kv_append_vnorm_fused_enabled_for(Some("fused")));
-        assert!(gemma4_kv_append_vnorm_fused_enabled_for(Some("on")));
-        assert!(gemma4_kv_append_vnorm_fused_enabled_for(Some("1")));
-    }
-
-    #[test]
-    fn rms_matvec_fusion_is_opt_in_with_a_baseline_default() {
-        assert!(!gemma4_rms_matvec_fused_enabled_for(None));
-        assert!(!gemma4_rms_matvec_fused_enabled_for(Some("baseline")));
-        assert!(!gemma4_rms_matvec_fused_enabled_for(Some("off")));
-        assert!(!gemma4_rms_matvec_fused_enabled_for(Some("0")));
-        assert!(!gemma4_rms_matvec_fused_enabled_for(Some("")));
-        assert!(gemma4_rms_matvec_fused_enabled_for(Some("fused")));
-        assert!(gemma4_rms_matvec_fused_enabled_for(Some("on")));
-        assert!(gemma4_rms_matvec_fused_enabled_for(Some("1")));
-    }
-
-    #[test]
     fn rms_matvec_kernels_map_into_their_projection_families() {
-        for kernel in [
-            "matvec_q4_0_32row_mv_rms",
-            "matvec_q4_0_32row_mv",
-            "matvec_q4_0_64row_mv_rms",
-            "matvec_q4_0_64row_mv",
-            "matvec_q4_0_16row",
-        ] {
+        for kernel in ["matvec_q4_0_64row_mv_rms", "matvec_q4_0_64row_mv"] {
             assert_eq!(gemma4_kernel_family(kernel), "q4_projection_other");
         }
-        for kernel in [
-            "matmul_q4_0_qkv_32row_mv_rms",
-            "matmul_q4_0_qkv_32row_mv",
-            "matmul_q4_0_qkv_16row",
-        ] {
+        for kernel in ["matmul_q4_0_qkv_32row_mv_rms", "matmul_q4_0_qkv_32row_mv"] {
             assert_eq!(gemma4_kernel_family(kernel), "q4_qkv_projection");
         }
         for kernel in [
             "matmul_q4_0_gate_up_32row_mv_rms",
             "matmul_q4_0_gate_up_32row_mv",
-            "matmul_q4_0_gate_up_16row",
         ] {
             assert_eq!(gemma4_kernel_family(kernel), "q4_ffn_gate_up_projection");
         }
-        for kernel in [
-            "matvec_q6_k_32row_mv_rms",
-            "matvec_q6_k_32row_mv",
-            "matvec_q6_k_64row_mv_rms",
-            "matvec_q6_k_64row_mv",
-            "matvec_q6_k_8row",
-        ] {
+        for kernel in ["matvec_q6_k_64row_mv_rms", "matvec_q6_k_64row_mv"] {
             assert_eq!(gemma4_kernel_family(kernel), "q6_lm_head_projection");
         }
     }
