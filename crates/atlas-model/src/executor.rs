@@ -1990,6 +1990,7 @@ impl<'a> AtlasExecutor<'a> {
                 text: self.model.decode(&ids)?,
                 trace: LayerTrace::default(),
                 final_logits: step.logits,
+                logit_digests: Vec::new(),
             },
             metrics: ExecutorMetrics {
                 cpu_encode,

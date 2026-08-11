@@ -51,6 +51,7 @@ fn raw_token_golden_requires_exact_ids_and_tolerant_logits() {
         text: String::new(),
         trace: LayerTrace::default(),
         final_logits: vec![1.0005, -2.0005],
+        logit_digests: Vec::new(),
     };
     validate_generation_golden(&path, &generation).unwrap();
     fs::remove_file(path).unwrap();

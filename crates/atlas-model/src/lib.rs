@@ -938,6 +938,7 @@ impl AtlasModel {
             text: self.decode(&ids)?,
             trace,
             final_logits,
+            logit_digests: Vec::new(),
         })
     }
     /// Executes the requested prefix of layers; `layers=1` is the larger-model gate.
@@ -1319,6 +1320,13 @@ pub struct Generation {
     pub text: String,
     pub trace: LayerTrace,
     pub final_logits: Vec<f32>,
+    /// One SHA-256 per generated token, hashing that token's fp32 logit
+    /// vector byte-for-byte. Populated only when the resident path runs with
+    /// `ATLAS_GEMMA4_TRACE_LOGIT_DIGESTS` set, so the hot generation path
+    /// never pays for the per-token readback. Enables arithmetic-level parity
+    /// comparison (e.g. flash16 vs LegacyFused attention) beyond token
+    /// equality.
+    pub logit_digests: Vec<[u8; 32]>,
 }
 
 /// Compare a generation to the pinned raw-token Phase 3 oracle JSON.

@@ -13,6 +13,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use atlas_core::{GgufTensorType, dequantize_block, quantize_q4_0};
 use atlas_metal::GpuBuffer;
+use sha2::{Digest, Sha256};
 
 use crate::{
     Gemma4E2bModel, Generation, LayerTrace, gemma4_shared_kv_sources,
@@ -22,6 +23,17 @@ use crate::{
 const GEMMA4_PREFILL_BATCH_CAPACITY: usize = 128;
 #[cfg(test)]
 const GEMMA4_DECODE_PROFILE_TARGETS: [usize; 9] = [1, 32, 64, 128, 256, 512, 1024, 2048, 4096];
+
+/// Byte-for-byte SHA-256 of an fp32 logit vector. Each f32 contributes its
+/// IEEE-754 little-endian bits so the digest is fully deterministic across
+/// GPU readback and host comparison.
+fn sha256_f32_logits(logits: &[f32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for logit in logits {
+        hasher.update(logit.to_le_bytes());
+    }
+    hasher.finalize().into()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gemma4WeightFormat {
@@ -343,10 +355,13 @@ impl Gemma4KvCacheType {
 
 /// Decode attention implementation for Q4 KV caches.
 ///
-/// `LegacyFused` is the production Resident default because it retains the
-/// established exact greedy stream. `Flash16` is an explicit experimental
-/// Resident path until it passes the exact-token parity gate; neither mode is
-/// a CPU fallback.
+/// `Flash16` is the production Resident default: it specializes Gemma's two
+/// head widths and preserves LegacyFused's four-SIMD reduction, key-ordered
+/// online softmax, and per-token fp32 logit arithmetic, so it is byte-exact
+/// against the established greedy stream (see the ignored exact-token and
+/// per-token logit-digest parity gates) while dropping the redundant value
+/// barrier. `LegacyFused` remains an explicit diagnostic path; neither mode
+/// is a CPU fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gemma4Q4AttentionMode {
     Flash16,
@@ -355,7 +370,7 @@ pub enum Gemma4Q4AttentionMode {
 
 impl Default for Gemma4Q4AttentionMode {
     fn default() -> Self {
-        Self::LegacyFused
+        Self::Flash16
     }
 }
 
@@ -908,15 +923,17 @@ impl<'a> Gemma4E2bExecutor<'a> {
             model,
             max_context,
             kv_cache_type,
-            Gemma4Q4AttentionMode::LegacyFused,
+            Gemma4Q4AttentionMode::default(),
         )
     }
 
     /// Create a Resident executor with an explicit Q4-KV attention mode.
     ///
-    /// Normal inference should use [`Self::new_with_kv_cache`], which keeps
-    /// `LegacyFused` as the production default. `Flash16` is an explicit
-    /// Resident-only experiment for validating the fast kernel.
+    /// Normal inference should use [`Self::new_with_kv_cache`], which selects
+    /// `Flash16` (the exact-compatible attention kernel: it preserves
+    /// LegacyFused's four-SIMD reduction, key-ordered online softmax, and
+    /// per-token fp32 logit arithmetic while dropping the redundant value
+    /// barrier). `LegacyFused` remains selectable for diagnostics.
     pub fn new_with_kv_cache_and_q4_attention_mode(
         model: &'a Gemma4E2bModel,
         max_context: usize,
@@ -2024,6 +2041,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
         let plan = Gemma4PrefillPlan::new(prompt_ids.len(), self.max_context)?;
         let prefill_path = gemma4_prefill_path(prompt_ids.len());
         let mut selected = 0;
+        let mut logit_digests: Vec<[u8; 32]> = Vec::new();
         let chunk_count = plan.chunks;
         for (chunk_index, chunk) in prompt_ids.chunks(plan.chunk_size).enumerate() {
             if let Some(token) = self.forward_tokens(chunk, chunk_index + 1 == chunk_count)? {
@@ -2054,12 +2072,18 @@ impl<'a> Gemma4E2bExecutor<'a> {
         let mut first_eos_position = None;
         let mut decoded = String::new();
         let mut token_latency = prefill;
+        let trace_logit_digests = std::env::var_os("ATLAS_GEMMA4_TRACE_LOGIT_DIGESTS").is_some();
         for index in 0..max_new_tokens {
             if cancelled.load(Ordering::Acquire) {
                 finish_reason = Gemma4FinishReason::Cancelled;
                 break;
             }
             generated.push(selected);
+            if trace_logit_digests {
+                logit_digests.push(sha256_f32_logits(
+                    &runtime.read_f32(&self.logits, self.model.config.vocab_size)?,
+                ));
+            }
             let next_decoded = self.model.decode(&generated)?;
             let fragment = next_decoded
                 .strip_prefix(&decoded)
@@ -2145,6 +2169,11 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 text: self.model.decode(&ids)?,
                 trace: LayerTrace::default(),
                 final_logits,
+                logit_digests: if trace_logit_digests {
+                    logit_digests
+                } else {
+                    Vec::new()
+                },
             },
             metrics: Gemma4Metrics {
                 resident_bytes: self.resident_bytes(),
@@ -3490,7 +3519,7 @@ mod tests {
     }
 
     #[test]
-    fn q4_attention_mode_keeps_legacy_as_default_and_exposes_flash16_experiment() {
+    fn q4_attention_mode_defaults_to_flash16_and_keeps_legacy_experiment() {
         assert_eq!(
             Gemma4Q4AttentionMode::parse("flash16").unwrap(),
             Gemma4Q4AttentionMode::Flash16
@@ -3508,7 +3537,7 @@ mod tests {
                 false,
                 Gemma4Q4AttentionMode::default(),
             ),
-            "attention_decode_fused_gemma4_simd_q4_0"
+            "attention_decode_gemma4_simd_q4_0_flash16_exact_nb"
         );
         assert_eq!(
             gemma4_attention_kernel(
@@ -3516,9 +3545,9 @@ mod tests {
                 8,
                 512,
                 false,
-                Gemma4Q4AttentionMode::Flash16,
+                Gemma4Q4AttentionMode::LegacyFused,
             ),
-            "attention_decode_gemma4_simd_q4_0_flash16_exact_nb"
+            "attention_decode_fused_gemma4_simd_q4_0"
         );
     }
 

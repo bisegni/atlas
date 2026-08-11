@@ -486,9 +486,11 @@ fn generate(args: &[String]) -> Result<()> {
     let mut chat = false;
     let mut json_output = false;
     let mut kv_cache_type = Gemma4KvCacheType::Q4_0;
-    // This selector exists only for the Resident Q4-KV parity harness. Normal
-    // CLI chat and generate flows retain the exact LegacyFused default.
-    let mut q4_attention_mode = Gemma4Q4AttentionMode::LegacyFused;
+    // This selector exists only for the Resident Q4-KV parity harness. The
+    // Flash16 exact-attention kernel is now the production default; it
+    // preserves LegacyFused's FP32 reduction and online-softmax ordering
+    // byte-for-byte (see the ignored exact-token and logit-digest gates).
+    let mut q4_attention_mode = Gemma4Q4AttentionMode::default();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1510,7 +1512,7 @@ fn parse_profile_args(args: &[String]) -> Result<GemmaProfileArgs> {
     let mut warmup_decode_tokens = 32;
     let mut max_context = 4096;
     let mut kv_cache_type = Gemma4KvCacheType::Q4_0;
-    let mut q4_attention_mode = Gemma4Q4AttentionMode::LegacyFused;
+    let mut q4_attention_mode = Gemma4Q4AttentionMode::default();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1579,7 +1581,7 @@ fn parse_benchmark_args(args: &[String]) -> Result<GemmaBenchmarkArgs> {
     let mut warmup_decode_tokens = 32;
     let mut max_context = 4096;
     let mut kv_cache_type = Gemma4KvCacheType::Q4_0;
-    let mut q4_attention_mode = Gemma4Q4AttentionMode::LegacyFused;
+    let mut q4_attention_mode = Gemma4Q4AttentionMode::default();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1657,7 +1659,7 @@ fn parse_chat_args(
     let mut max = None;
     let mut thoughts = false;
     let mut kv_cache_type = Gemma4KvCacheType::Q4_0;
-    let mut q4_attention_mode = Gemma4Q4AttentionMode::LegacyFused;
+    let mut q4_attention_mode = Gemma4Q4AttentionMode::default();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -2100,7 +2102,7 @@ mod kv_cache_cli_tests {
         let (_, _, _, _, cache_type, attention_mode) =
             parse_chat_args(&args).expect("parse chat options");
         assert_eq!(cache_type, Gemma4KvCacheType::Q8_0);
-        assert_eq!(attention_mode, Gemma4Q4AttentionMode::LegacyFused);
+        assert_eq!(attention_mode, Gemma4Q4AttentionMode::Flash16);
     }
 
     #[test]
@@ -2159,7 +2161,7 @@ mod kv_cache_cli_tests {
             parse_benchmark_args(&benchmark)
                 .expect("parse benchmark options")
                 .q4_attention_mode,
-            Gemma4Q4AttentionMode::LegacyFused
+            Gemma4Q4AttentionMode::Flash16
         );
 
         let profile = vec!["--model".to_owned(), "gemma4-e2b-q4_0".to_owned()];
@@ -2196,7 +2198,7 @@ mod kv_cache_cli_tests {
         assert_eq!(parsed.warmup_decode_tokens, 32);
         assert_eq!(parsed.max_context, 4096);
         assert_eq!(parsed.kv_cache_type, Gemma4KvCacheType::Q4_0);
-        assert_eq!(parsed.q4_attention_mode, Gemma4Q4AttentionMode::LegacyFused);
+        assert_eq!(parsed.q4_attention_mode, Gemma4Q4AttentionMode::Flash16);
         assert!(parse_benchmark_args(&args[..4]).is_err());
     }
 

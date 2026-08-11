@@ -75,6 +75,110 @@ fn first_generated_token_divergence(left: &[u32], right: &[u32]) -> Option<usize
         .or_else(|| (left.len() != right.len()).then_some(left.len().min(right.len())))
 }
 
+fn first_logit_digest_divergence(left: &[[u8; 32]], right: &[[u8; 32]]) -> Option<usize> {
+    left.iter()
+        .zip(right)
+        .position(|(left, right)| left != right)
+        .or_else(|| (left.len() != right.len()).then_some(left.len().min(right.len())))
+}
+
+#[test]
+#[ignore = "requires local Metal, the Gemma 4 E2B Q4 GGUF fixture, and per-token logit readback"]
+fn flash16_matches_legacy_resident_output_logit_digests() {
+    // Arithmetic-level parity gate for the exact flash16 attention candidate.
+    // Beyond equal greedy tokens, every generated token must produce a
+    // byte-identical fp32 logit vector, captured as the per-token SHA-256
+    // digest added to `Generation.logit_digests`. Token equality alone cannot
+    // catch a small logit drift that flips a later token; the digest proves
+    // the flash16 kernel reproduces LegacyFused's arithmetic exactly.
+    unsafe {
+        std::env::set_var("ATLAS_GEMMA4_TRACE_LOGIT_DIGESTS", "1");
+    }
+    let canonical = canonical();
+    let canonical_prompt = canonical["prompt"].as_str().expect("canonical prompt");
+    let code_prompt = render_gemma4_chat(&[Gemma4ChatMessage::new(
+        Gemma4ChatRole::User,
+        "write an hello world main c++ function",
+    )])
+    .expect("render C++ chat prompt");
+    let model = Gemma4E2bModel::load_gguf(fixture_path()).expect("load Gemma E2B GGUF");
+    let cancelled = AtomicBool::new(false);
+
+    for (name, prompt) in [("canonical", canonical_prompt), ("long-cpp", code_prompt.as_str())] {
+        let mut fast = Gemma4E2bExecutor::new_with_kv_cache_and_q4_attention_mode(
+            &model,
+            4096,
+            Gemma4KvCacheType::Q4_0,
+            Gemma4Q4AttentionMode::Flash16,
+        )
+        .expect("create flash16 Resident executor");
+        let mut legacy = Gemma4E2bExecutor::new_with_kv_cache_and_q4_attention_mode(
+            &model,
+            4096,
+            Gemma4KvCacheType::Q4_0,
+            Gemma4Q4AttentionMode::LegacyFused,
+        )
+        .expect("create legacy Resident executor");
+
+        let fast_generation = fast
+            .generate_greedy_chat_stream(prompt, 64, &cancelled, |_| Ok(()))
+            .expect("run flash16 Resident chat");
+        let legacy_generation = legacy
+            .generate_greedy_chat_stream(prompt, 64, &cancelled, |_| Ok(()))
+            .expect("run legacy Resident chat");
+
+        assert_eq!(
+            fast_generation.generation.logit_digests.len(),
+            fast_generation.generation.generated_token_ids.len(),
+            "flash16 digest count must cover every generated token for {name}"
+        );
+        assert_eq!(
+            legacy_generation.generation.logit_digests.len(),
+            legacy_generation.generation.generated_token_ids.len(),
+            "legacy digest count must cover every generated token for {name}"
+        );
+        assert_eq!(
+            fast_generation.generation.logit_digests,
+            legacy_generation.generation.logit_digests,
+            "flash16 per-token fp32 logit digest parity for {name} prompt {prompt:?}; first divergent token: {:?}",
+            first_logit_digest_divergence(
+                &fast_generation.generation.logit_digests,
+                &legacy_generation.generation.logit_digests
+            )
+        );
+    }
+
+    let mut fast = Gemma4E2bExecutor::new_with_kv_cache_and_q4_attention_mode(
+        &model,
+        4096,
+        Gemma4KvCacheType::Q4_0,
+        Gemma4Q4AttentionMode::Flash16,
+    )
+    .expect("create long-window flash16 executor");
+    let mut legacy = Gemma4E2bExecutor::new_with_kv_cache_and_q4_attention_mode(
+        &model,
+        4096,
+        Gemma4KvCacheType::Q4_0,
+        Gemma4Q4AttentionMode::LegacyFused,
+    )
+    .expect("create long-window legacy executor");
+    let fast_generation = fast
+        .generate_greedy_fixed_benchmark_window_stream(&code_prompt, 256, 64, &cancelled, |_| Ok(()))
+        .expect("run long-window flash16 Resident decode");
+    let legacy_generation = legacy
+        .generate_greedy_fixed_benchmark_window_stream(&code_prompt, 256, 64, &cancelled, |_| Ok(()))
+        .expect("run long-window legacy Resident decode");
+    assert_eq!(
+        fast_generation.generation.logit_digests,
+        legacy_generation.generation.logit_digests,
+        "flash16 long-window per-token fp32 logit digest parity; first divergent token: {:?}",
+        first_logit_digest_divergence(
+            &fast_generation.generation.logit_digests,
+            &legacy_generation.generation.logit_digests
+        )
+    );
+}
+
 #[test]
 #[ignore = "requires local Metal and the Gemma 4 E2B Q4 GGUF fixture"]
 fn resident_canonical_chat_matches_pinned_tokens_and_stays_warm_after_reset() {
