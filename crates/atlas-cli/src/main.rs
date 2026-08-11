@@ -17,7 +17,7 @@ use atlas_model::{
     Gemma4ChatMessage, Gemma4ChatRole, Gemma4E2bModel,
     gemma4_executor::{
         Gemma4E2bExecutor, Gemma4FinishReason, Gemma4Generation, Gemma4KvCacheType,
-        Gemma4SelectedGroupFormat,
+        Gemma4Q4AttentionMode, Gemma4SelectedGroupFormat,
     },
     gemma4_quantization_preflight::{
         Gemma4QuantizationPreflightInvocation, run_gemma4_quantization_preflight,
@@ -50,6 +50,7 @@ struct GemmaProfileArgs {
     decode_tokens: usize,
     max_context: usize,
     kv_cache_type: Gemma4KvCacheType,
+    q4_attention_mode: Gemma4Q4AttentionMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +77,7 @@ struct GemmaBenchmarkArgs {
     measured_decode_tokens: usize,
     max_context: usize,
     kv_cache_type: Gemma4KvCacheType,
+    q4_attention_mode: Gemma4Q4AttentionMode,
 }
 
 #[derive(Debug)]
@@ -185,10 +187,16 @@ fn provider_command(args: &[String]) -> Result<()> {
 
 fn chat(args: &[String]) -> Result<()> {
     CHAT_INTERRUPTED.store(false, Ordering::Release);
-    let (model_id, prompt, max_tokens, show_thoughts, kv_cache_type) = parse_chat_args(args)?;
+    let (model_id, prompt, max_tokens, show_thoughts, kv_cache_type, q4_attention_mode) =
+        parse_chat_args(args)?;
     let selection = resolve_model(&model_id)?;
     let model = load_verified_model(&selection)?;
-    let mut executor = Gemma4E2bExecutor::new_with_kv_cache(&model, 4096, kv_cache_type)?;
+    let mut executor = Gemma4E2bExecutor::new_with_kv_cache_and_q4_attention_mode(
+        &model,
+        4096,
+        kv_cache_type,
+        q4_attention_mode,
+    )?;
     let mut messages = Vec::new();
     if let Some(prompt) = prompt {
         messages.push(Gemma4ChatMessage::new(Gemma4ChatRole::User, prompt));
@@ -424,6 +432,7 @@ fn emit_metrics(
         "quantization_plan": generation.metrics.quantization_plan_path,
         "selected_group_formats": selected_group_formats_json(&generation.metrics.selected_group_formats),
         "quantization_rejections": generation.metrics.quantization_rejections,
+        "q4_attention_mode": generation.metrics.q4_attention_mode.as_str(),
         "attention_kernel": generation.metrics.attention_kernel,
         "timing": {
             "prefill_ms": generation.metrics.prefill.as_secs_f64() * 1000.0,
@@ -475,7 +484,11 @@ fn generate(args: &[String]) -> Result<()> {
     let mut max_tokens = None;
     let mut greedy = false;
     let mut chat = false;
+    let mut json_output = false;
     let mut kv_cache_type = Gemma4KvCacheType::Q4_0;
+    // This selector exists only for the Resident Q4-KV parity harness. Normal
+    // CLI chat and generate flows retain the exact LegacyFused default.
+    let mut q4_attention_mode = Gemma4Q4AttentionMode::LegacyFused;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -497,10 +510,17 @@ fn generate(args: &[String]) -> Result<()> {
             }
             "--greedy" => greedy = true,
             "--chat" => chat = true,
+            "--json" => json_output = true,
             "--kv-cache-type" => {
                 i += 1;
                 kv_cache_type = Gemma4KvCacheType::parse(
                     args.get(i).context("--kv-cache-type needs a value")?,
+                )?;
+            }
+            "--q4-attention-mode" => {
+                i += 1;
+                q4_attention_mode = Gemma4Q4AttentionMode::parse(
+                    args.get(i).context("--q4-attention-mode needs a value")?,
                 )?;
             }
             flag => bail!("unknown generate option: {flag}"),
@@ -516,13 +536,49 @@ fn generate(args: &[String]) -> Result<()> {
     } else {
         prompt
     };
-    let mut executor = Gemma4E2bExecutor::new_with_kv_cache(&gemma, 4096, kv_cache_type)?;
+    let mut executor = Gemma4E2bExecutor::new_with_kv_cache_and_q4_attention_mode(
+        &gemma,
+        4096,
+        kv_cache_type,
+        q4_attention_mode,
+    )?;
     let max_tokens = max_tokens.context("--max-new-tokens is required")?;
     let result = if chat {
         executor.generate_greedy_chat_stream(&prompt, max_tokens, &CHAT_INTERRUPTED, |_| Ok(()))?
     } else {
         executor.generate_greedy_stream(&prompt, max_tokens, &CHAT_INTERRUPTED, |_| Ok(()))?
     };
+    if json_output {
+        let visible_text = if chat {
+            visible_chat_completion(&result.generation.text, &prompt).to_owned()
+        } else {
+            result.generation.text.clone()
+        };
+        println!(
+            "{}",
+            json!({
+                "event": "generation",
+                "model_id": selection.id,
+                "prompt": prompt,
+                "prompt_token_ids": result.generation.prompt_token_ids,
+                "generated_token_ids": result.generation.generated_token_ids,
+                "finish_reason": match result.finish_reason {
+                    Gemma4FinishReason::Eos => "eos",
+                    Gemma4FinishReason::MaxTokens => "max_tokens",
+                    Gemma4FinishReason::Cancelled => "cancelled",
+                },
+                "text": result.generation.text,
+                "visible_text": visible_text,
+                "executor": "resident",
+                "kv_cache_type": result.metrics.kv_cache_type.as_str(),
+                "q4_attention_mode": result.metrics.q4_attention_mode.as_str(),
+                "attention_kernel": result.metrics.attention_kernel,
+                "resident_bytes": result.metrics.resident_bytes,
+                "readback_bytes": result.metrics.readback_bytes,
+            })
+        );
+        return Ok(());
+    }
     println!(
         "prompt_token_ids: {:?}\ngenerated_token_ids: {:?}\ntext: {}",
         result.generation.prompt_token_ids,
@@ -531,9 +587,17 @@ fn generate(args: &[String]) -> Result<()> {
     );
     println!(
         "{}",
-        json!({"event":"generation_metrics","model_id":selection.id,"executor":"resident","format":"gguf-gemma4-q4_0","weight_format":result.metrics.weight_format.as_str(),"embedding_kernel":result.metrics.embedding_kernel,"output_projection_kernel":result.metrics.output_projection_kernel,"q4_projection_kernel":result.metrics.q4_projection_kernel,"q4_qkv_projection_kernel":result.metrics.q4_qkv_projection_kernel,"q4_gate_up_projection_kernel":result.metrics.q4_gate_up_projection_kernel,"q4_batch_projection_kernel":result.metrics.q4_batch_projection_kernel,"ffn_down_projection_kernel":result.metrics.ffn_down_projection_kernel,"ple_projection_kernel":result.metrics.ple_projection_kernel,"rms_norm_kernel":result.metrics.rms_norm_kernel,"finish_reason":match result.finish_reason { Gemma4FinishReason::Eos => "eos", Gemma4FinishReason::MaxTokens => "max_tokens", Gemma4FinishReason::Cancelled => "cancelled" },"resident_bytes":result.metrics.resident_bytes,"peak_resident_bytes":result.metrics.peak_resident_bytes,"kv_cache_type":result.metrics.kv_cache_type.as_str(),"kv_cache_bytes":result.metrics.kv_cache_bytes,"weight_upload_bytes":result.metrics.weight_upload_bytes,"upload_bytes":result.metrics.upload_bytes,"readback_bytes":result.metrics.readback_bytes,"dispatches":result.metrics.dispatches,"buffer_allocations":result.metrics.buffer_allocations,"gpu_execution_ms":result.metrics.gpu_execution_time.as_secs_f64()*1000.0,"command_buffers":result.metrics.command_buffers})
+        json!({"event":"generation_metrics","model_id":selection.id,"executor":"resident","format":"gguf-gemma4-q4_0","weight_format":result.metrics.weight_format.as_str(),"embedding_kernel":result.metrics.embedding_kernel,"output_projection_kernel":result.metrics.output_projection_kernel,"q4_projection_kernel":result.metrics.q4_projection_kernel,"q4_qkv_projection_kernel":result.metrics.q4_qkv_projection_kernel,"q4_gate_up_projection_kernel":result.metrics.q4_gate_up_projection_kernel,"q4_batch_projection_kernel":result.metrics.q4_batch_projection_kernel,"ffn_down_projection_kernel":result.metrics.ffn_down_projection_kernel,"ple_projection_kernel":result.metrics.ple_projection_kernel,"rms_norm_kernel":result.metrics.rms_norm_kernel,"finish_reason":match result.finish_reason { Gemma4FinishReason::Eos => "eos", Gemma4FinishReason::MaxTokens => "max_tokens", Gemma4FinishReason::Cancelled => "cancelled" },"resident_bytes":result.metrics.resident_bytes,"peak_resident_bytes":result.metrics.peak_resident_bytes,"kv_cache_type":result.metrics.kv_cache_type.as_str(),"q4_attention_mode":result.metrics.q4_attention_mode.as_str(),"attention_kernel":result.metrics.attention_kernel,"kv_cache_bytes":result.metrics.kv_cache_bytes,"weight_upload_bytes":result.metrics.weight_upload_bytes,"upload_bytes":result.metrics.upload_bytes,"readback_bytes":result.metrics.readback_bytes,"dispatches":result.metrics.dispatches,"buffer_allocations":result.metrics.buffer_allocations,"gpu_execution_ms":result.metrics.gpu_execution_time.as_secs_f64()*1000.0,"command_buffers":result.metrics.command_buffers})
     );
     Ok(())
+}
+
+fn visible_chat_completion<'a>(protocol_text: &'a str, prompt: &str) -> &'a str {
+    protocol_text
+        .strip_prefix(prompt)
+        .unwrap_or(protocol_text)
+        .strip_suffix("<turn|>")
+        .unwrap_or_else(|| protocol_text.strip_prefix(prompt).unwrap_or(protocol_text))
 }
 
 /// Diagnostic-only exact Metal timing for the growing-context Gemma decode
@@ -546,8 +610,12 @@ fn profile(args: &[String]) -> Result<()> {
     let args = parse_profile_args(args)?;
     let record = resolve_model(&args.model_id)?;
     let model = load_verified_model(&record)?;
-    let mut executor =
-        Gemma4E2bExecutor::new_with_kv_cache(&model, args.max_context, args.kv_cache_type)?;
+    let mut executor = Gemma4E2bExecutor::new_with_kv_cache_and_q4_attention_mode(
+        &model,
+        args.max_context,
+        args.kv_cache_type,
+        args.q4_attention_mode,
+    )?;
     let prompt = render_gemma4_chat(&[Gemma4ChatMessage::new(
         Gemma4ChatRole::User,
         args.prompt.clone(),
@@ -641,6 +709,7 @@ fn profile_bottlenecks(args: &[String]) -> Result<()> {
                     || flag == "--warmup-decode-tokens"
                     || flag == "--max-context"
                     || flag == "--kv-cache-type"
+                    || flag == "--q4-attention-mode"
                 {
                     i += 1;
                     profile_args.push(
@@ -659,8 +728,12 @@ fn profile_bottlenecks(args: &[String]) -> Result<()> {
     let args = parse_profile_args(&profile_args)?;
     let record = resolve_model(&args.model_id)?;
     let model = load_verified_model(&record)?;
-    let mut executor =
-        Gemma4E2bExecutor::new_with_kv_cache(&model, args.max_context, args.kv_cache_type)?;
+    let mut executor = Gemma4E2bExecutor::new_with_kv_cache_and_q4_attention_mode(
+        &model,
+        args.max_context,
+        args.kv_cache_type,
+        args.q4_attention_mode,
+    )?;
     // Diagnostic mode is the only mode that may split command buffers to
     // obtain exact per-dispatch GPU timestamps. Benchmark mode must retain
     // the production command-buffer boundary so its wall-clock result is
@@ -1252,8 +1325,12 @@ fn benchmark(args: &[String]) -> Result<()> {
     let args = parse_benchmark_args(args)?;
     let record = resolve_model(&args.model_id)?;
     let model = load_verified_model(&record)?;
-    let mut executor =
-        Gemma4E2bExecutor::new_with_kv_cache(&model, args.max_context, args.kv_cache_type)?;
+    let mut executor = Gemma4E2bExecutor::new_with_kv_cache_and_q4_attention_mode(
+        &model,
+        args.max_context,
+        args.kv_cache_type,
+        args.q4_attention_mode,
+    )?;
     let prompt = render_gemma4_chat(&[Gemma4ChatMessage::new(Gemma4ChatRole::User, args.prompt)])?;
     let generation = executor.generate_greedy_fixed_benchmark_window_stream(
         &prompt,
@@ -1348,6 +1425,7 @@ fn benchmark(args: &[String]) -> Result<()> {
         "quantization_plan": generation.metrics.quantization_plan_path,
         "selected_group_formats": selected_group_formats_json(&generation.metrics.selected_group_formats),
         "quantization_rejections": generation.metrics.quantization_rejections,
+        "q4_attention_mode": generation.metrics.q4_attention_mode.as_str(),
         "selected_kernels": selected_kernels,
         "timing": {
             "prefill_ms": generation.metrics.prefill.as_secs_f64() * 1000.0,
@@ -1432,6 +1510,7 @@ fn parse_profile_args(args: &[String]) -> Result<GemmaProfileArgs> {
     let mut warmup_decode_tokens = 32;
     let mut max_context = 4096;
     let mut kv_cache_type = Gemma4KvCacheType::Q4_0;
+    let mut q4_attention_mode = Gemma4Q4AttentionMode::LegacyFused;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1470,6 +1549,12 @@ fn parse_profile_args(args: &[String]) -> Result<GemmaProfileArgs> {
                     args.get(i).context("--kv-cache-type needs a value")?,
                 )?;
             }
+            "--q4-attention-mode" => {
+                i += 1;
+                q4_attention_mode = Gemma4Q4AttentionMode::parse(
+                    args.get(i).context("--q4-attention-mode needs a value")?,
+                )?;
+            }
             flag => bail!("unknown profile option: {flag}"),
         }
         i += 1;
@@ -1483,6 +1568,7 @@ fn parse_profile_args(args: &[String]) -> Result<GemmaProfileArgs> {
         decode_tokens,
         max_context,
         kv_cache_type,
+        q4_attention_mode,
     })
 }
 
@@ -1493,6 +1579,7 @@ fn parse_benchmark_args(args: &[String]) -> Result<GemmaBenchmarkArgs> {
     let mut warmup_decode_tokens = 32;
     let mut max_context = 4096;
     let mut kv_cache_type = Gemma4KvCacheType::Q4_0;
+    let mut q4_attention_mode = Gemma4Q4AttentionMode::LegacyFused;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1533,6 +1620,12 @@ fn parse_benchmark_args(args: &[String]) -> Result<GemmaBenchmarkArgs> {
                     args.get(i).context("--kv-cache-type needs a value")?,
                 )?;
             }
+            "--q4-attention-mode" => {
+                i += 1;
+                q4_attention_mode = Gemma4Q4AttentionMode::parse(
+                    args.get(i).context("--q4-attention-mode needs a value")?,
+                )?;
+            }
             flag => bail!("unknown benchmark option: {flag}"),
         }
         i += 1;
@@ -1545,6 +1638,7 @@ fn parse_benchmark_args(args: &[String]) -> Result<GemmaBenchmarkArgs> {
         measured_decode_tokens: decode_tokens.context("--decode-tokens is required")?,
         max_context,
         kv_cache_type,
+        q4_attention_mode,
     })
 }
 
@@ -1556,12 +1650,14 @@ fn parse_chat_args(
     Option<usize>,
     bool,
     Gemma4KvCacheType,
+    Gemma4Q4AttentionMode,
 )> {
     let mut model = None;
     let mut prompt = None;
     let mut max = None;
     let mut thoughts = false;
     let mut kv_cache_type = Gemma4KvCacheType::Q4_0;
+    let mut q4_attention_mode = Gemma4Q4AttentionMode::LegacyFused;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1586,6 +1682,12 @@ fn parse_chat_args(
                     args.get(i).context("--kv-cache-type needs a value")?,
                 )?;
             }
+            "--q4-attention-mode" => {
+                i += 1;
+                q4_attention_mode = Gemma4Q4AttentionMode::parse(
+                    args.get(i).context("--q4-attention-mode needs a value")?,
+                )?;
+            }
             "--executor" => {
                 i += 1;
                 ensure!(
@@ -1603,6 +1705,7 @@ fn parse_chat_args(
         max,
         thoughts,
         kv_cache_type,
+        q4_attention_mode,
     ))
 }
 
@@ -1902,9 +2005,9 @@ fn metal_info() -> Result<()> {
 #[cfg(test)]
 mod kv_cache_cli_tests {
     use super::{
-        Gemma4KvCacheType, GpuCountersMode, ThoughtFilter, attention_dimensions,
-        parse_benchmark_args, parse_chat_args, parse_profile_args, profiler_operation_family,
-        token_ids_sha256,
+        Gemma4KvCacheType, Gemma4Q4AttentionMode, GpuCountersMode, ThoughtFilter,
+        attention_dimensions, parse_benchmark_args, parse_chat_args, parse_profile_args,
+        profiler_operation_family, token_ids_sha256, visible_chat_completion,
     };
     use atlas_profiler::{AttentionKind, AttentionScanPass, OperationFamily};
 
@@ -1994,8 +2097,40 @@ mod kv_cache_cli_tests {
             "--kv-cache-type".to_owned(),
             "q8_0".to_owned(),
         ];
-        let (_, _, _, _, cache_type) = parse_chat_args(&args).expect("parse chat options");
+        let (_, _, _, _, cache_type, attention_mode) =
+            parse_chat_args(&args).expect("parse chat options");
         assert_eq!(cache_type, Gemma4KvCacheType::Q8_0);
+        assert_eq!(attention_mode, Gemma4Q4AttentionMode::LegacyFused);
+    }
+
+    #[test]
+    fn chat_and_benchmark_accept_explicit_flash16_attention_mode() {
+        let chat = vec![
+            "--model".to_owned(),
+            "gemma4-e2b-q4_0".to_owned(),
+            "--q4-attention-mode".to_owned(),
+            "flash16".to_owned(),
+        ];
+        assert_eq!(
+            parse_chat_args(&chat).expect("parse chat options").5,
+            Gemma4Q4AttentionMode::Flash16
+        );
+        let benchmark = vec![
+            "--model".to_owned(),
+            "gemma4-e2b-q4_0".to_owned(),
+            "--prompt".to_owned(),
+            "fixed workload".to_owned(),
+            "--decode-tokens".to_owned(),
+            "128".to_owned(),
+            "--q4-attention-mode".to_owned(),
+            "flash16".to_owned(),
+        ];
+        assert_eq!(
+            parse_benchmark_args(&benchmark)
+                .expect("parse benchmark options")
+                .q4_attention_mode,
+            Gemma4Q4AttentionMode::Flash16
+        );
     }
 
     #[test]
@@ -2019,6 +2154,12 @@ mod kv_cache_cli_tests {
                 .expect("parse benchmark options")
                 .kv_cache_type,
             Gemma4KvCacheType::Q4_0
+        );
+        assert_eq!(
+            parse_benchmark_args(&benchmark)
+                .expect("parse benchmark options")
+                .q4_attention_mode,
+            Gemma4Q4AttentionMode::LegacyFused
         );
 
         let profile = vec!["--model".to_owned(), "gemma4-e2b-q4_0".to_owned()];
@@ -2055,6 +2196,7 @@ mod kv_cache_cli_tests {
         assert_eq!(parsed.warmup_decode_tokens, 32);
         assert_eq!(parsed.max_context, 4096);
         assert_eq!(parsed.kv_cache_type, Gemma4KvCacheType::Q4_0);
+        assert_eq!(parsed.q4_attention_mode, Gemma4Q4AttentionMode::LegacyFused);
         assert!(parse_benchmark_args(&args[..4]).is_err());
     }
 
@@ -2112,5 +2254,14 @@ mod kv_cache_cli_tests {
     fn fixed_benchmark_prompt_identity_is_token_sensitive() {
         assert_eq!(token_ids_sha256(&[1, 2, 3]), token_ids_sha256(&[1, 2, 3]));
         assert_ne!(token_ids_sha256(&[1, 2, 3]), token_ids_sha256(&[1, 2, 4]));
+    }
+
+    #[test]
+    fn generate_json_extracts_only_the_visible_chat_completion() {
+        let prompt = "<|turn>user\nhi<turn|>\n<|turn>model\n";
+        assert_eq!(
+            visible_chat_completion(&format!("{prompt}Hello.<turn|>"), prompt),
+            "Hello."
+        );
     }
 }

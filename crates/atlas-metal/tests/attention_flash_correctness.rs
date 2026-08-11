@@ -1,5 +1,6 @@
-//! Tolerance-based correctness check for the production flash16 unweighted
-//! attention kernels (`flash16_uw`, `flash16_swa_uw`) against an independent
+//! Correctness checks for Gemma Q4 attention kernels. The historical
+//! slice-merge Flash16 kernels (`flash16_uw`, `flash16_swa_uw`) are checked
+//! against an independent
 //! CPU oracle: Q4_0-dequantized dot-product scores, exact softmax, weighted
 //! sum of dequantized values. The kernels use flash-style per-slice rescaling
 //! that changes the accumulation order, so this asserts a small
@@ -221,6 +222,75 @@ fn flash16_uw_matches_cpu_oracle() {
                     &format!("{label} keys={key_count} rising={rising}"),
                     &reference,
                     &candidate,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn flash16_exact_variants_match_legacy_fused_bitwise() {
+    let runtime = match MetalRuntime::new() {
+        Ok(runtime) => runtime,
+        Err(MetalError::NoDevice) => {
+            eprintln!("skipping: no Metal device is available to this process");
+            return;
+        }
+        Err(error) => panic!("Metal runtime should initialize: {error}"),
+    };
+
+    let scenarios = [
+        (
+            "full-512-exact",
+            512u32,
+            "attention_decode_gemma4_simd_q4_0_flash16_exact",
+            &[48, 256, 1024, 2048][..],
+        ),
+        (
+            "full-512-exact-no-value-barrier",
+            512u32,
+            "attention_decode_gemma4_simd_q4_0_flash16_exact_nb",
+            &[48, 256, 1024, 2048][..],
+        ),
+        (
+            "swa-256-exact",
+            256u32,
+            "attention_decode_gemma4_simd_q4_0_flash16_swa_exact",
+            &[48, 128, 256][..],
+        ),
+        (
+            "swa-256-exact-no-value-barrier",
+            256u32,
+            "attention_decode_gemma4_simd_q4_0_flash16_swa_exact_nb",
+            &[48, 128, 256][..],
+        ),
+    ];
+    for (label, head_dim, flash_kernel, key_counts) in scenarios {
+        let query = build_query(head_dim);
+        for key_count in key_counts {
+            for rising in [false, true] {
+                let cache = build_cache(*key_count, head_dim, rising);
+                let legacy = run_flash16(
+                    &runtime,
+                    "attention_decode_fused_gemma4_simd_q4_0",
+                    128,
+                    &query,
+                    &cache,
+                    head_dim,
+                    *key_count,
+                );
+                let exact = run_flash16(
+                    &runtime,
+                    flash_kernel,
+                    128,
+                    &query,
+                    &cache,
+                    head_dim,
+                    *key_count,
+                );
+                assert_eq!(
+                    exact, legacy,
+                    "{label}: exact Flash16 must preserve LegacyFused FP32 output for keys={key_count} rising={rising}"
                 );
             }
         }

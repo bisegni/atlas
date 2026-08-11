@@ -33,6 +33,89 @@ Promotion evidence: `artifacts/phase-12.3-q4-matvec-mv-ext-ab/20260809T223643Z/`
 Device facts: Apple M2 Max, `metal-info` reports 32 KiB threadgroup memory
 and 1024 max threads per threadgroup.
 
+## Shared-KV query repair and Flash16 correctness gate (implementation pending Metal acceptance)
+
+The layer-major Resident path must project a fresh Q vector for every layer,
+including layers that reuse K/V from an earlier provider. The fused QKV path
+already handled provider layers, but shared-KV layers could leave the Q buffer
+unchanged and therefore attend with stale data. This is unrelated to
+quantization-plan selection: cached and disabled preflight runs select the
+same mixed Q4/Q6 formats.
+
+`Gemma4E2bExecutor` now uses the RMS-input Q4 matvec for those shared-KV
+layers. This removed the initial stale-Q failure: the C++ chat is coherent
+through a 64-token run on the Resident Flash16 path. It does **not** accept
+Flash16 as numerically correct yet. Apple-Silicon evidence on the C++ prompt
+shows Flash16 and the prior Resident `LegacyFused` attention kernel agree for
+the first 50 generated tokens and diverge at zero-based generated token 50
+(the 51st generated token).
+
+The slice-merge `_flash16_uw` kernels are therefore retired from the Flash16
+selector. Flash16 now selects head-specialized `_flash16_exact_nb` kernels
+that preserve LegacyFused's four-SIMD score reduction and key-ordered online
+softmax arithmetic while removing only the post-value barrier; the following
+score-reduction barrier still protects the next shared softmax state. They
+remain experimental until the exact GPU stream and matched-performance gates
+pass.
+
+Flash16 cannot be selected for normal Q4-KV inference while this exact-token
+failure exists. `LegacyFused` is now the Resident production default: it is
+the known-correct GPU path, not a CPU fallback. Flash16 remains selectable
+only through the explicit `--q4-attention-mode flash16` diagnostic and
+performance interfaces. The ignored Gemma test
+`q4_kv_flash16_matches_legacy_resident_attention_across_chat_and_long_decode`
+is self-contained: it requires Flash16 exact token/finish parity with
+Resident LegacyFused for canonical and C++ chat prompts plus a 256+64 long
+decode window. It must pass on Apple Silicon before Flash16 is accepted.
+
+External-oracle acceptance is deliberately separate. After fixture capture,
+`legacy_fused_matches_captured_llama_oracles` requires Resident LegacyFused to
+reproduce independently captured llama.cpp streams for both the short
+canonical chat and the fixed 64-token C++ chat. This prevents a missing local
+oracle artifact from hiding the Flash16-versus-LegacyFused kernel diagnosis.
+
+Capture the canonical independently before running the full ignored suite:
+
+```zsh
+bash scripts/capture-gemma4-llama-oracle.sh
+```
+
+The script runs the identical GGUF and token-identical Gemma protocol prompts
+through llama.cpp greedy Q4-K/V decoding: a short terminal `<turn|>` case and
+a fixed 64-token C++ case. It promotes ignored local fixtures only from the
+Resident `LegacyFused` result after exact prompt-ID, visible-output, and finish
+checks against llama.cpp. It then captures Flash16 separately and writes the
+first divergent generated-token index and both streams under
+`artifacts/phase-12a-llama-oracle/`; it exits non-zero while Flash16 differs.
+
+Run the external-oracle gate after the capture has written both verified
+fixtures. The capture can still exit non-zero because Flash16 parity is
+currently expected to fail:
+
+```zsh
+cargo test -p atlas-model --test phase_12a_gemma4_resident \
+  legacy_fused_matches_captured_llama_oracles \
+  -- --ignored --exact
+```
+
+For a direct diagnostic capture, use:
+
+```zsh
+cargo run --release -p atlas-cli -- generate \
+  --model gemma4-e2b-q4_0 --chat \
+  --prompt "write an hello world main c++ function" \
+  --max-new-tokens 64 --greedy \
+  --q4-attention-mode legacy_fused --json
+```
+
+To run the exact Flash16 candidate in normal chat while it is under
+validation, add `--q4-attention-mode flash16`; the emitted metrics must name
+`attention_decode_gemma4_simd_q4_0_flash16_exact_nb`.
+
+The normal `chat`, `benchmark`, and `generate` defaults now use LegacyFused
+and report `q4_attention_mode` with the selected Resident kernel. Flash16 may
+only be restored as default after the exact Resident parity test passes.
+
 ## Measured hotspot baseline (new phase baseline)
 
 Profile of the composed stack, long-context decode (1024-token attribution

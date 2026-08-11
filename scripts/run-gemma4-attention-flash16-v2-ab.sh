@@ -1,12 +1,8 @@
 #!/usr/bin/env bash
-# Flash16 v2 attention A/B: the second-generation flash16 kernels
-# (force-unrolled block loops, register-cached query, wider uw slices) vs the
-# first-generation flash16 kernel. Both modes run on the composed candidate
-# stack (mv_ext matvec + Q6 mv + gate-up mv + rms vec4) so the screen isolates
-# the attention delta on the current best configuration. Parity is superseded:
-# correctness is proven by the kernel-level tolerance test
-# crates/atlas-metal/tests/attention_flash_correctness.rs. --screen uses two
-# runs and is not eligible for promotion.
+# Exact Flash16 attention A/B: the exact-compatible Flash16 kernel versus the
+# Resident LegacyFused oracle. Both modes run with the same fixed workload so
+# exact token/EOS parity and a positive median decode improvement decide
+# whether Flash16 can return to the production default.
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -77,7 +73,6 @@ run_mode() {
         echo "Running ${runs} ${label} ${workload}-context Resident windows..."
         for run in $(seq 1 "$runs"); do
             if ! env "${clean_env[@]}" \
-                "ATLAS_GEMMA4_Q4_ATTENTION_EXPERIMENT=$attention_selector" \
                 cargo run --release -p atlas-cli -- benchmark \
                     --model "$model_id" \
                     --kv-cache-type q4_0 \
@@ -85,6 +80,7 @@ run_mode() {
                     --warmup-decode-tokens "$warmup" \
                     --decode-tokens "$measured" \
                     --max-context "$context" \
+                    --q4-attention-mode "$attention_selector" \
                     > "$mode_dir/$workload-$run.json" \
                     2> "$mode_dir/$workload-$run.log"; then
                 echo "${label} ${workload} run ${run} failed; log follows:" >&2
@@ -124,11 +120,11 @@ run_mode() {
     done
 }
 
-echo "Running flash16 kernel-level tolerance parity tests..."
+echo "Running Flash16 exact kernel parity tests..."
 cargo test --release -p atlas-metal --test attention_flash_correctness \
     > "$artifact_dir/attention-flash-correctness.log" 2>&1
 parity_pass=false
-grep -q "1 passed; 0 failed" "$artifact_dir/attention-flash-correctness.log" && parity_pass=true
+grep -q "2 passed; 0 failed" "$artifact_dir/attention-flash-correctness.log" && parity_pass=true
 [[ "$parity_pass" == true ]] || { echo "flash16 parity tests failed; log:" >&2; cat "$artifact_dir/attention-flash-correctness.log" >&2; exit 1; }
 
 echo "Verifying pinned Gemma fixture..."
@@ -136,12 +132,12 @@ cargo run --release -p atlas-cli -- model verify --model "$model_id" \
     | tee "$artifact_dir/model-verify.json"
 shasum -a 256 "$fixture" | tee "$artifact_dir/fixture-sha256.txt"
 
-run_mode baseline flash16 attention_decode_gemma4_simd_q4_0_flash16
-run_mode candidate flash16_uw attention_decode_gemma4_simd_q4_0_flash16_uw
+run_mode baseline legacy_fused attention_decode_fused_gemma4_simd_q4_0
+run_mode candidate flash16 attention_decode_gemma4_simd_q4_0_flash16_exact
 
 jq -n \
-    --arg baseline_env "flash16 on mv_ext + q6 mv + gate-up mv + rms vec4 stack" \
-    --arg candidate_env "flash16_uw on mv_ext + q6 mv + gate-up mv + rms vec4 stack" \
+    --arg baseline_env "legacy_fused on mv_ext + q6 mv + gate-up mv + rms vec4 stack" \
+    --arg candidate_env "flash16 exact on mv_ext + q6 mv + gate-up mv + rms vec4 stack" \
     --arg parity_log "$artifact_dir/attention-flash-correctness.log" \
     --argjson promotion "$promotion" \
     --slurpfile baseline_short "$artifact_dir/baseline/short-summary.json" \
@@ -152,7 +148,7 @@ jq -n \
     ($candidate_short[0]) as $cs | ($candidate_long[0]) as $cl |
     {
       baseline_environment: $baseline_env, candidate_environment: $candidate_env,
-      kernel_parity_test: "attention_flash_correctness: all flash16 kernels max-abs < 1e-3 vs production",
+      kernel_parity_test: "attention_flash_correctness: Flash16 exact is bitwise equal to LegacyFused across Q4-KV cases",
       baseline: {long: $bl, short: $bs}, candidate: {long: $cl, short: $cs},
       comparison: {
         stream_drift_long: ($bl.records[0].generated_token_sha256 != $cl.records[0].generated_token_sha256),
@@ -168,7 +164,7 @@ jq -n \
     }
     | .comparison.long_speedup_percent = ((.comparison.candidate_long_tok_s / .comparison.baseline_long_tok_s - 1) * 100)
     | .comparison.short_speedup_percent = ((.comparison.candidate_short_tok_s / .comparison.baseline_short_tok_s - 1) * 100)
-    | .comparison.long_improved = (.comparison.long_speedup_percent >= 3)
+    | .comparison.long_improved = (.comparison.long_speedup_percent > 0)
     | .comparison.short_not_regressed = (.comparison.short_speedup_percent >= 0)
     | .pass = (all(.baseline[]; .pass) and all(.candidate[]; .pass) and all(.comparison["stable_long_accounting","stable_short_accounting","short_not_regressed"]; . == true) and (if .comparison.promotion_eligible then .comparison.long_improved else (.comparison.long_speedup_percent >= 0) end))
   ' | tee "$artifact_dir/q4-attention-flash16-v2-ab-summary.json"

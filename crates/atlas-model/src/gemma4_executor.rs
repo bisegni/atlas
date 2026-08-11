@@ -277,22 +277,21 @@ fn gemma4_q4_flash16_supported(attention_heads: usize, head_dim: usize) -> bool 
     attention_heads == 8 && (head_dim == 512 || head_dim == 256)
 }
 
-/// The promoted production attention binding: the flash16 unweighted
-/// two-tile attention kernel (with the sliding-window variant for sliding
-/// layers). Sliding layers keep their own kernel and label but share the
-/// same pipeline, buffers, and reduction order.
+/// Exact-compatible Flash16 attention bindings. They specialize Gemma's full
+/// and sliding head widths while preserving LegacyFused's FP32 reduction and
+/// online-softmax ordering, without the redundant value-update barrier.
 fn gemma4_q4_flash16_binding(sliding: bool) -> (&'static str, &'static str, u32) {
     if sliding {
         (
-            "attention_decode_gemma4_simd_q4_0_flash16_swa_uw",
+            "attention_decode_gemma4_simd_q4_0_flash16_swa_exact_nb",
             "gemma_attention_flash16_swa",
-            768,
+            128,
         )
     } else {
         (
-            "attention_decode_gemma4_simd_q4_0_flash16_uw",
+            "attention_decode_gemma4_simd_q4_0_flash16_exact_nb",
             "gemma_attention_flash16",
-            384,
+            128,
         )
     }
 }
@@ -339,6 +338,45 @@ impl Gemma4KvCacheType {
             .and_then(|blocks| blocks.checked_mul(2))
             .and_then(|blocks| blocks.checked_mul(self.bytes_per_block()))
             .context("Gemma KV cache allocation overflows")
+    }
+}
+
+/// Decode attention implementation for Q4 KV caches.
+///
+/// `LegacyFused` is the production Resident default because it retains the
+/// established exact greedy stream. `Flash16` is an explicit experimental
+/// Resident path until it passes the exact-token parity gate; neither mode is
+/// a CPU fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gemma4Q4AttentionMode {
+    Flash16,
+    LegacyFused,
+}
+
+impl Default for Gemma4Q4AttentionMode {
+    fn default() -> Self {
+        Self::LegacyFused
+    }
+}
+
+impl Gemma4Q4AttentionMode {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "flash16" => Ok(Self::Flash16),
+            "legacy_fused" => Ok(Self::LegacyFused),
+            _ => {
+                anyhow::bail!(
+                    "unknown Gemma Q4 attention mode `{value}`; expected flash16 or legacy_fused"
+                )
+            }
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Flash16 => "flash16",
+            Self::LegacyFused => "legacy_fused",
+        }
     }
 }
 
@@ -423,6 +461,7 @@ pub struct Gemma4Metrics {
     pub quantization_preflight_state: &'static str,
     pub selected_group_formats: Vec<Gemma4SelectedGroupFormat>,
     pub quantization_rejections: Vec<String>,
+    pub q4_attention_mode: Gemma4Q4AttentionMode,
     pub attention_kernel: &'static str,
     pub weight_format: Gemma4WeightFormat,
     pub embedding_kernel: &'static str,
@@ -688,8 +727,10 @@ fn gemma4_attention_kernel(
     attention_heads: usize,
     full_head_dim: usize,
     sliding: bool,
+    q4_attention_mode: Gemma4Q4AttentionMode,
 ) -> &'static str {
-    if cache_type == Gemma4KvCacheType::Q4_0
+    if q4_attention_mode == Gemma4Q4AttentionMode::Flash16
+        && cache_type == Gemma4KvCacheType::Q4_0
         && gemma4_q4_flash16_supported(attention_heads, full_head_dim)
     {
         return gemma4_q4_flash16_binding(sliding).0;
@@ -790,6 +831,7 @@ pub struct Gemma4E2bExecutor<'a> {
     kv_sources: Vec<usize>,
     kv: Vec<Option<GpuBuffer>>,
     kv_cache_type: Gemma4KvCacheType,
+    q4_attention_mode: Gemma4Q4AttentionMode,
     weight_format: Gemma4WeightFormat,
     quantization_plan_path: Option<String>,
     token_embedding: GpuBuffer,
@@ -862,13 +904,39 @@ impl<'a> Gemma4E2bExecutor<'a> {
         max_context: usize,
         kv_cache_type: Gemma4KvCacheType,
     ) -> Result<Self> {
-        Self::new_with_kv_cache_from_selection(model, max_context, kv_cache_type, None)
+        Self::new_with_kv_cache_and_q4_attention_mode(
+            model,
+            max_context,
+            kv_cache_type,
+            Gemma4Q4AttentionMode::LegacyFused,
+        )
+    }
+
+    /// Create a Resident executor with an explicit Q4-KV attention mode.
+    ///
+    /// Normal inference should use [`Self::new_with_kv_cache`], which keeps
+    /// `LegacyFused` as the production default. `Flash16` is an explicit
+    /// Resident-only experiment for validating the fast kernel.
+    pub fn new_with_kv_cache_and_q4_attention_mode(
+        model: &'a Gemma4E2bModel,
+        max_context: usize,
+        kv_cache_type: Gemma4KvCacheType,
+        q4_attention_mode: Gemma4Q4AttentionMode,
+    ) -> Result<Self> {
+        Self::new_with_kv_cache_from_selection(
+            model,
+            max_context,
+            kv_cache_type,
+            q4_attention_mode,
+            None,
+        )
     }
 
     pub(crate) fn new_with_kv_cache_from_selection(
         model: &'a Gemma4E2bModel,
         max_context: usize,
         kv_cache_type: Gemma4KvCacheType,
+        q4_attention_mode: Gemma4Q4AttentionMode,
         selection: Option<(Gemma4SelectedFormatMap, Option<String>, &'static str)>,
     ) -> Result<Self> {
         ensure!(
@@ -1110,6 +1178,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
             kv_sources,
             kv,
             kv_cache_type,
+            q4_attention_mode,
             weight_format,
             quantization_plan_path,
             token_embedding,
@@ -1345,9 +1414,9 @@ impl<'a> Gemma4E2bExecutor<'a> {
     }
 
     /// Matvec over an input that is normalized in-kernel by the RMS-input
-    /// variants of the mv_ext kernels. Only the vocabulary output projection
-    /// consumes this path; the attention-input and FFN-input norms ride the
-    /// fused qkv/gate-up dispatches instead.
+    /// variants of the mv_ext kernels. Provider layers use the fused QKV
+    /// dispatch; shared-KV layers use this Q-only form so every layer still
+    /// computes its own query from its current hidden state.
     fn matvec_rms_labeled(
         &self,
         command: &mut atlas_metal::ResidentCommand<'_>,
@@ -1843,6 +1912,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 self.model.config.attention_heads,
                 self.model.config.key_length,
                 false,
+                self.q4_attention_mode,
             ),
             kv_cache_type: self.kv_cache_type,
             samples,
@@ -2100,11 +2170,13 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 quantization_preflight_state: self.quantization_preflight_state,
                 selected_group_formats: self.selected_group_formats.iter().cloned().collect(),
                 quantization_rejections: self.quantization_rejections.clone(),
+                q4_attention_mode: self.q4_attention_mode,
                 attention_kernel: gemma4_attention_kernel(
                     self.kv_cache_type,
                     self.model.config.attention_heads,
                     self.model.config.key_length,
                     false,
+                    self.q4_attention_mode,
                 ),
                 weight_format: self.weight_format,
                 embedding_kernel: self.weight_format.embedding_kernel(),
@@ -3106,6 +3178,24 @@ impl<'a> Gemma4E2bExecutor<'a> {
                     head,
                     Some(&attn_norm),
                 )?;
+            } else {
+                // Shared-KV layers reuse K/V from their provider but still
+                // require a layer-local Q projection. Leaving `self.q`
+                // untouched here reuses a stale query from an earlier layer,
+                // producing incorrect greedy output despite a valid Resident
+                // command stream and weight format.
+                self.matvec_rms_labeled(
+                    &mut command,
+                    Some("qkv_projection"),
+                    &self.state,
+                    &wq,
+                    &self.q,
+                    &self.hidden,
+                    q_width_buffer,
+                    q_width,
+                    GgufTensorType::Q4_0,
+                    &attn_norm,
+                )?;
             }
             if fused_qk_norm_rope {
                 self.gemma4_qk_norm_rope_fused(
@@ -3149,7 +3239,8 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 .context("Gemma attention control-table offset overflows")?;
             let (attention_kernel, attention_threads) =
                 gemma4_attention_binding(self.kv_cache_type);
-            let flash16_binding = if self.kv_cache_type == Gemma4KvCacheType::Q4_0
+            let flash16_binding = if self.q4_attention_mode == Gemma4Q4AttentionMode::Flash16
+                && self.kv_cache_type == Gemma4KvCacheType::Q4_0
                 && gemma4_q4_flash16_supported(c.attention_heads, head)
             {
                 Some(gemma4_q4_flash16_binding(sliding))
@@ -3372,11 +3463,12 @@ mod tests {
     use super::{
         GEMMA4_SELECTED_GROUP_QKV, GEMMA4_SELECTED_GROUP_VOCAB_EMBEDDINGS,
         GEMMA4_SELECTED_GROUP_VOCAB_OUTPUT, Gemma4KvCacheType, Gemma4PrefillPlan,
-        Gemma4WeightFormat, QuantizationPlan, gemma4_attention_key_count,
-        gemma4_attention_key_count_table, gemma4_decode_profile_targets, gemma4_kernel_family,
-        gemma4_prefill_path, gemma4_profile_family, gemma4_q6_k_to_q4_0,
-        gemma4_rms_norm_decode_kernel, gemma4_rope_angle, gemma4_selected_group_formats,
-        gemma4_should_finish, gemma4_weight_format_with_plan,
+        Gemma4Q4AttentionMode, Gemma4WeightFormat, QuantizationPlan, gemma4_attention_kernel,
+        gemma4_attention_key_count, gemma4_attention_key_count_table,
+        gemma4_decode_profile_targets, gemma4_kernel_family, gemma4_prefill_path,
+        gemma4_profile_family, gemma4_q6_k_to_q4_0, gemma4_rms_norm_decode_kernel,
+        gemma4_rope_angle, gemma4_selected_group_formats, gemma4_should_finish,
+        gemma4_weight_format_with_plan,
     };
     use atlas_core::{GgufTensorType, dequantize_block};
 
@@ -3395,6 +3487,39 @@ mod tests {
         assert_eq!(gemma4_prefill_path(1), "resident_chunked_command");
         assert_eq!(gemma4_prefill_path(2), "resident_layer_major");
         assert_eq!(gemma4_prefill_path(128), "resident_layer_major");
+    }
+
+    #[test]
+    fn q4_attention_mode_keeps_legacy_as_default_and_exposes_flash16_experiment() {
+        assert_eq!(
+            Gemma4Q4AttentionMode::parse("flash16").unwrap(),
+            Gemma4Q4AttentionMode::Flash16
+        );
+        assert_eq!(
+            Gemma4Q4AttentionMode::parse("legacy_fused").unwrap(),
+            Gemma4Q4AttentionMode::LegacyFused
+        );
+        assert!(Gemma4Q4AttentionMode::parse("fast").is_err());
+        assert_eq!(
+            gemma4_attention_kernel(
+                Gemma4KvCacheType::Q4_0,
+                8,
+                512,
+                false,
+                Gemma4Q4AttentionMode::default(),
+            ),
+            "attention_decode_fused_gemma4_simd_q4_0"
+        );
+        assert_eq!(
+            gemma4_attention_kernel(
+                Gemma4KvCacheType::Q4_0,
+                8,
+                512,
+                false,
+                Gemma4Q4AttentionMode::Flash16,
+            ),
+            "attention_decode_gemma4_simd_q4_0_flash16_exact_nb"
+        );
     }
 
     #[test]

@@ -1008,6 +1008,64 @@ kernel void attention_decode_fused_gemma4_simd_q4_0(
     for (uint d = tid; d < head_dim; d += threads) output[head * head_dim + d] /= denominator;
 }
 
+// Exact-compatible Flash16 replacement. The previous flash16_uw kernels
+// partitioned keys into independently normalized slices and merged them. That
+// is mathematically sound but changes FP32 rounding enough to alter Gemma's
+// greedy stream. Keep the same four-SIMD reduction and key-ordered online
+// softmax sequence as the established Resident Q4 kernel, while specializing
+// the two Gemma head geometries at compile time.
+#define FLASH16_VALUE_BARRIER threadgroup_barrier(mem_flags::mem_threadgroup);
+#define FLASH16_NO_VALUE_BARRIER
+#define DEFINE_FLASH16_EXACT(NAME, HEAD_DIM, VALUE_BARRIER) \
+kernel void NAME( \
+    device const float *query [[buffer(0)]], device const uchar *cache [[buffer(1)]], \
+    device float *output [[buffer(2)]], constant uint &heads [[buffer(3)]], \
+    constant uint &kv_heads [[buffer(4)]], constant uint &head_dim [[buffer(5)]], \
+    constant uint &capacity [[buffer(6)]], constant uint &key_count [[buffer(7)]], \
+    uint head [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]], \
+    uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]) { \
+    if (head >= heads || head_dim != HEAD_DIM) return; \
+    uint kv_head = head / (heads / kv_heads); \
+    uint blocks_per_position = (kv_heads * HEAD_DIM) / 32; \
+    uint value_base = capacity * blocks_per_position; \
+    threadgroup float simd_sums[4], maximum, denominator, rescale, weight; \
+    maximum = -INFINITY; denominator = 0.0f; \
+    for (uint d = tid; d < HEAD_DIM; d += 128) output[head * HEAD_DIM + d] = 0.0f; \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+    for (uint key = 0; key < key_count; ++key) { \
+        float partial = 0.0f; \
+        uint key_element = key * kv_heads * HEAD_DIM + kv_head * HEAD_DIM; \
+        for (uint d = tid; d < HEAD_DIM; d += 128) { \
+            uint index = key_element + d; \
+            partial += query[head * HEAD_DIM + d] * kv_q4_0_value(cache + (index / 32) * 18, index % 32); \
+        } \
+        float simd_total = simd_sum(partial); \
+        if (lane == 0) simd_sums[simd_group] = simd_total; \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+        if (tid == 0) { \
+            float score = simd_sums[0] + simd_sums[1] + simd_sums[2] + simd_sums[3]; \
+            if (score > maximum) { \
+                rescale = exp(maximum - score); weight = 1.0f; maximum = score; denominator = denominator * rescale + weight; \
+            } else { \
+                rescale = 1.0f; weight = exp(score - maximum); denominator += weight; \
+            } \
+        } \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+        for (uint d = tid; d < HEAD_DIM; d += 128) { \
+            uint index = key_element + d; \
+            output[head * HEAD_DIM + d] = output[head * HEAD_DIM + d] * rescale \
+                + weight * kv_q4_0_value(cache + (value_base + index / 32) * 18, index % 32); \
+        } \
+        VALUE_BARRIER \
+    } \
+    for (uint d = tid; d < HEAD_DIM; d += 128) output[head * HEAD_DIM + d] /= denominator; \
+}
+
+DEFINE_FLASH16_EXACT(attention_decode_gemma4_simd_q4_0_flash16_exact, 512, FLASH16_VALUE_BARRIER)
+DEFINE_FLASH16_EXACT(attention_decode_gemma4_simd_q4_0_flash16_swa_exact, 256, FLASH16_VALUE_BARRIER)
+DEFINE_FLASH16_EXACT(attention_decode_gemma4_simd_q4_0_flash16_exact_nb, 512, FLASH16_NO_VALUE_BARRIER)
+DEFINE_FLASH16_EXACT(attention_decode_gemma4_simd_q4_0_flash16_swa_exact_nb, 256, FLASH16_NO_VALUE_BARRIER)
+
 
 
 
