@@ -168,6 +168,12 @@ substantially cheaper than Atlas's per-slice KV scan.
 Each recommendation names the exact code that must change and what the
 replacement should look like, so it can be executed directly.
 
+> Status 2026-08-12: **R1 is implemented** (phase-13.1) — prefill is ~200
+> tok/s flat across prompt sizes with a byte-identical greedy stream. **R2 is
+> already in production.** The remaining decode gap is covered by the
+> dedicated [Decode improvement recommendations](#decode-improvement-recommendations-measured-2026-08-12-phase-132)
+> section below (D1–D4).
+
 ### R1 — Batch the remaining per-token prefill kernels (highest priority)
 
 **Problem (the 12–45× gap).** The matmuls are already token-batched
@@ -295,13 +301,133 @@ let the bandwidth floor become the limit. Re-measure with
 **Expected impact.** Closes part of the 2.1×→8.7× floor distance, but only in
 combination with R2/R3.
 
+## Decode improvement recommendations (measured 2026-08-12, phase 13.2+)
+
+Status as of phase-13.1 (R1 landed): prefill is now ~200 tok/s flat across
+prompt sizes. **Decode is the remaining gap** — 19.6 tok/s at the matched
+pp512 workload, unchanged since this analysis. This section re-measures the
+decode baseline and prioritizes the concrete work, superseding the generic
+R2–R5 ordering for decode.
+
+### Measured decode baseline (matched pp512, tg128, q4_0 KV, Resident)
+
+| Metric | Atlas | llama.cpp (`tg`) | Ratio |
+|---|---:|---:|---:|
+| Decode tok/s | 19.6 | 80.3 | 4.1× |
+| Decode ms/token (GPU) | ~50.4 | ~12.5 | 4.0× |
+| Dispatches/token | 547.7 | — | — |
+| × memory-bandwidth floor (5.8 ms/token) | 8.7× | 2.1× | — |
+
+Source: `artifacts/phase-13.1/matched-benchmark-pp512-tg128.jsonl` (five-run;
+19.59–19.79 tok/s, decode GPU 6403–6471 ms/128 tokens, 70,104 dispatches).
+
+### Kernel breakdown (decode profile, per token)
+
+| Family | GPU ms/t | Disp/t |
+|---|---:|---:|
+| gemma_attention | 8.62 | 35 |
+| ffn_gate_up_projection | 2.87 | 35 |
+| qk_norm_rope_fused | 2.41 | 35 |
+| ple_projection | 2.31 | 106 |
+| ffn_down_projection | 1.96 | 35 |
+| qkv_projection | 0.96 | 35 |
+| attention_output_projection | 0.88 | 35 |
+| kv_append | 0.76 | 15 |
+| other | ~4.3 | ~221 |
+| **total** | **25.6** (short ctx) | **552** |
+
+Attention dominates and is O(context): at the 512-token benchmark context it
+is the single largest share of the ~50 ms/token. `ple_projection` (106
+dispatches/token = 3 matvecs × 35 layers + norm) is the largest dispatch
+count after attention.
+
+### Measured: Flash16-exact is not a decode win by itself
+
+Switching the q4 attention from `attention_decode_fused_gemma4_simd_q4_0`
+(LegacyFused) to `attention_decode_gemma4_simd_q4_0_flash16_exact_runtime`
+moves decode GPU 6443 → 6402 ms (19.79 → 19.74 tok/s), i.e. no material
+delta, with the greedy stream hash unchanged (`f23c2962…`). The exact kernels
+deliberately preserve LegacyFused's per-key serial scan and value barrier, so
+they are parity-equivalent by design, not faster.
+
+### D1 — Default the q4 attention to the no-value-barrier flash16 variant
+
+**Problem.** The production default (`LegacyFused`) and the
+`_flash16_exact_runtime` binding both hold a `threadgroup_barrier` after every
+key's value update. `attention_decode_gemma4_simd_q4_0_flash16_exact_nb`
+removes only that redundant barrier (same four-SIMD reduction, same
+key-ordered online softmax); phase-13.0 and commit 3da8bb9 measured ~8% decode
+GPU from it.
+
+**Suggested solution.** Gate on `flash16_matches_legacy_resident_output_logit_digests`
+(ignored, per-token FP32 logit digests) and the exact-token stream, then flip
+`Gemma4Q4AttentionMode::default()` to `Flash16` and point
+`gemma4_q4_flash16_binding` (`crates/atlas-model/src/gemma4_executor.rs:420`)
+at `attention_decode_gemma4_simd_q4_0_flash16_exact_nb` /
+`_swa_exact_nb` (already registered in `kernels.metal:1085-1086`).
+
+**Expected impact.** ~8% decode GPU, zero risk to greedy parity.
+
+### D2 — Vectorize the attention KV scan (R4, the largest lever)
+
+**Problem.** The dominant cost. Both attention kernels scan keys serially with
+a per-key threadgroup barrier and online-softmax value update, re-reading the
+KV range per slice; cost grows with context (decode 41→19→16 tok/s at
+pp100→512→1024).
+
+**Suggested solution.** Keep the exact FP32 accumulation order, but stage key
+blocks through threadgroup memory so each block is read once per threadgroup
+instead of once per slice, with single-writer V accumulation (one SIMD group
+owns a V half while the score reduction covers the full key range). Phase-13.0
+P3 was blocked on the 32 KiB budget for the value merge; the wider-visibility
+redesign is the path. Verified by `attention_flash_correctness.rs` and the
+exact-stream gate.
+
+**Expected impact.** Attention stops growing with context; largest single
+decode win at 512+ context.
+
+### D3 — Cut decode dispatches from ~552 to ~180/token (R3, refined)
+
+**Problem.** 547.7 dispatches/token ≈ 16.3/layer/token is the latency binding
+behind the 8.7× floor distance; host-encode is ~2.1 ms/token (~16%).
+
+**Suggested solution.** Fusion is already partially in production (R2 landed:
+`matmul_q4_0_qkv_32row_mv_rms`, `matmul_q4_0_gate_up_32row_mv_rms`,
+`gemma4_rms_residual_f32`, `gelu_multiply_f32`). Close the rest:
+
+- **PLE (106 disp/t)**: batch or fuse the three per-layer PLE matvecs
+  (`matvec_labeled` on `inp_gate`, `projection`, and the per-layer model proj)
+  and the PLE norm; mirror the prefill batched-PLE pattern from R1.
+- **attn-out + post-attention RMS + residual**: fold the attention-output
+  matvec epilogue into `gemma4_rms_residual_f32`.
+- **ffn-down + post-FFN RMS + residual**: extend the same
+  `gemma4_rms_residual_f32` site to the FFN matvec.
+- **qk-norm+rope → attention**: skip (P2d measured Q-side <0.3%; K-side
+  blocked because attention reads the quantized cache while K-norm runs on raw
+  K).
+
+**Expected impact.** 10–30% decode plus most of the host-encode component;
+35 layers × ~5 fused dispatches ≈ ~180/token.
+
+### D4 — Do not tune matvec breadth further (R5)
+
+The 64-row family cut threadgroups 18% but moved GPU ~1%. Re-measure only
+after D1–D3; the floor becomes the limit when the small-kernel overhead is
+gone.
+
+### Execution order (decode)
+
+**D1 first** — ~8%, parity-proven, one-line binding change. **D2** when
+context-length decode is the bottleneck (it is, at pp512). **D3** in
+parallel with D2 (independent dispatch plumbing). **D4** only after D1–D3 so
+the floor measurement is honest.
+
 ---
 
-### Execution order
+### Execution order (overall)
 
-**R1 first** — it addresses the dominant and fastest-growing gap (prefill
-12×→45×) with the lowest risk: the buffers and control tables for a
-token-batched grid already exist, and each new kernel is gated by an existing
-tolerance-parity pattern. **R2 then R3** promote already-proven fusion work
-into the default decode path. **R4** only when context-length decode is the
-next bottleneck. **R5** only after R2/R3 so the floor measurement is honest.
+**R1 (landed, phase-13.1)** — batched prefill kernels; prefill 49.6 → ~200
+tok/s at pp512 with a byte-identical greedy stream. **Decode work is now the
+bottleneck**: follow D1 → D2/D3 above. **R2** is already in production.
+**R4/R5** map to D2/D4. Any new decode kernel must keep the exact FP32
+accumulation order (greedy-stream hash `f23c2962…` is the drift sentinel).
