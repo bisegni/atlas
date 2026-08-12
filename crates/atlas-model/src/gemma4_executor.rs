@@ -20,7 +20,7 @@ use crate::{
     quantization_plan::QuantizationPlan,
 };
 
-const GEMMA4_PREFILL_BATCH_CAPACITY: usize = 128;
+const GEMMA4_PREFILL_BATCH_CAPACITY: usize = 512;
 #[cfg(test)]
 const GEMMA4_DECODE_PROFILE_TARGETS: [usize; 9] = [1, 32, 64, 128, 256, 512, 1024, 2048, 4096];
 
@@ -678,7 +678,7 @@ impl Gemma4PrefillPlan {
             prompt_tokens <= max_context,
             "Gemma prefill exceeds context capacity"
         );
-        let chunk_size = prompt_tokens.min(128);
+        let chunk_size = prompt_tokens.min(GEMMA4_PREFILL_BATCH_CAPACITY);
         Ok(Self {
             prompt_tokens,
             chunk_size,
@@ -877,7 +877,9 @@ fn gemma4_kernel_family(kernel: &str) -> &'static str {
         "q6_projection_other"
     } else if kernel.contains("attention") || kernel.contains("attn_") {
         "gemma_attention"
-    } else if kernel == "gemma4_qk_norm_rope_fused_f32" {
+    } else if kernel == "gemma4_qk_norm_rope_fused_f32"
+        || kernel == "gemma4_qk_norm_rope_fused_batch_f32"
+    {
         "qk_norm_rope_fused"
     } else if kernel.starts_with("rms_norm") {
         "rms_norm"
@@ -964,6 +966,14 @@ fn gemma4_attention_binding(cache_type: Gemma4KvCacheType) -> (&'static str, usi
     }
 }
 
+fn gemma4_attention_batch_binding(cache_type: Gemma4KvCacheType) -> (&'static str, usize) {
+    match cache_type {
+        Gemma4KvCacheType::F32 => ("attention_decode_fused_gemma4_simd_f32_batch", 128),
+        Gemma4KvCacheType::Q8_0 => ("attention_decode_fused_gemma4_simd_q8_0_batch", 128),
+        Gemma4KvCacheType::Q4_0 => ("attention_decode_fused_gemma4_simd_q4_0_batch", 128),
+    }
+}
+
 fn gemma4_attention_kernel(
     cache_type: Gemma4KvCacheType,
     attention_heads: usize,
@@ -1017,6 +1027,14 @@ fn gemma4_kv_append_kernel(cache_type: Gemma4KvCacheType) -> &'static str {
         Gemma4KvCacheType::F32 => "kv_append_decode_f32",
         Gemma4KvCacheType::Q8_0 => "kv_append_decode_q8_0",
         Gemma4KvCacheType::Q4_0 => "kv_append_decode_q4_0",
+    }
+}
+
+fn gemma4_kv_append_batch_kernel(cache_type: Gemma4KvCacheType) -> &'static str {
+    match cache_type {
+        Gemma4KvCacheType::F32 => "kv_append_decode_f32_batch",
+        Gemma4KvCacheType::Q8_0 => "kv_append_decode_q8_0_batch",
+        Gemma4KvCacheType::Q4_0 => "kv_append_decode_q4_0_batch",
     }
 }
 
@@ -1118,6 +1136,8 @@ pub struct Gemma4E2bExecutor<'a> {
     vocab: GpuBuffer,
     capacity: GpuBuffer,
     one: GpuBuffer,
+    zero: GpuBuffer,
+    rope_pairs: GpuBuffer,
     epsilon: GpuBuffer,
     embed_scale: GpuBuffer,
     ple_projection_scale: GpuBuffer,
@@ -1496,6 +1516,9 @@ impl<'a> Gemma4E2bExecutor<'a> {
             vocab: runtime.upload_u32(&[u32::try_from(c.vocab_size)?])?,
             capacity: runtime.upload_u32(&[u32::try_from(max_context)?])?,
             one: runtime.upload_u32(&[1])?,
+            zero: runtime.upload_u32(&[0])?,
+            rope_pairs: runtime
+                .upload_u32(&[u32::try_from(c.key_length.max(c.key_length_swa) / 2)?])?,
             epsilon: runtime.upload_f32(&[c.rms_norm_eps])?,
             embed_scale: runtime.upload_f32(&[(h as f32).sqrt()])?,
             ple_projection_scale: runtime.upload_f32(&[(h as f32).sqrt().recip()])?,
@@ -2920,20 +2943,19 @@ impl<'a> Gemma4E2bExecutor<'a> {
             ],
             batch_value * ple_total,
         )?;
-        for token in 0..batch_value {
-            let offset = token * ple_total * std::mem::size_of::<f32>();
-            command.dispatch_1d_at(
-                "rms_norm_groups_in_place_stable_f32",
-                &[
-                    (&self.prefill.ple_projected, offset),
-                    (&per_layer_norm, 0),
-                    (&self.ple_width, 0),
-                    (&self.layers, 0),
-                    (&self.epsilon, 0),
-                ],
-                c.layers,
-            )?;
-        }
+        let batch_layers = runtime.upload_u32(&[u32::try_from(batch_value * c.layers)?])?;
+        command.dispatch_1d_labeled(
+            "rms_norm_groups_in_place_stable_f32",
+            Some("layer_major_batched_ple_norm"),
+            &[
+                &self.prefill.ple_projected,
+                &per_layer_norm,
+                &self.ple_width,
+                &batch_layers,
+                &self.epsilon,
+            ],
+            batch_value * c.layers,
+        )?;
         command.dispatch_1d(
             "vector_add_f32",
             &[
@@ -2966,7 +2988,6 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 &full_sin,
                 &swa_cos,
                 &swa_sin,
-                rope_pairs,
                 &key_counts,
             )?;
         }
@@ -3028,7 +3049,6 @@ impl<'a> Gemma4E2bExecutor<'a> {
         full_sin: &GpuBuffer,
         swa_cos: &GpuBuffer,
         swa_sin: &GpuBuffer,
-        rope_pairs: usize,
         key_counts: &GpuBuffer,
     ) -> Result<()> {
         command.set_layer_index(Some(layer as u32));
@@ -3117,81 +3137,82 @@ impl<'a> Gemma4E2bExecutor<'a> {
         } else {
             (full_cos, full_sin)
         };
-        for token in 0..batch_value {
-            let q_offset = token * q_width * std::mem::size_of::<f32>();
-            let k_offset = token * head * std::mem::size_of::<f32>();
-            let rope_offset = token * rope_pairs * std::mem::size_of::<f32>();
-            command.dispatch_threadgroups_1d_at(
-                "gemma4_qk_norm_rope_fused_f32",
-                &[
-                    (&self.prefill.q, q_offset),
-                    (&self.prefill.k, k_offset),
-                    (&q_norm, 0),
-                    (k_norm.as_ref().unwrap_or(&q_norm), 0),
-                    (cos, rope_offset),
-                    (sin, rope_offset),
-                    (&self.prefill.q_rot, q_offset),
-                    (&self.prefill.k_rot, k_offset),
-                    (head_width, 0),
-                    (&self.heads, 0),
-                    (&self.one, 0),
-                    (&self.epsilon, 0),
-                ],
-                c.attention_heads + usize::from(source == layer),
-                1,
+        let has_key = usize::from(source == layer);
+        let has_key_buffer: &GpuBuffer = if source == layer {
+            &self.one
+        } else {
+            &self.zero
+        };
+        command.dispatch_threadgroups_1d_labeled(
+            "gemma4_qk_norm_rope_fused_batch_f32",
+            Some("layer_major_batched_qk_norm_rope"),
+            &[
+                &self.prefill.q,
+                &self.prefill.k,
+                &q_norm,
+                k_norm.as_ref().unwrap_or(&q_norm),
+                cos,
+                sin,
+                &self.prefill.q_rot,
+                &self.prefill.k_rot,
+                head_width,
+                &self.heads,
+                has_key_buffer,
+                &self.epsilon,
+                batch,
+                &self.rope_pairs,
+            ],
+            batch_value * (c.attention_heads + has_key),
+            1,
+        )?;
+        if source == layer {
+            command.dispatch_1d_labeled(
+                "rms_norm_groups_in_place_unweighted_f32",
+                Some("layer_major_batched_v_norm"),
+                &[&self.prefill.v, head_width, batch, &self.epsilon],
+                batch_value,
             )?;
-            if source == layer {
-                command.dispatch_1d_at(
-                    "rms_norm_groups_in_place_unweighted_f32",
-                    &[
-                        (&self.prefill.v, k_offset),
-                        (head_width, 0),
-                        (&self.one, 0),
-                        (&self.epsilon, 0),
-                    ],
-                    1,
-                )?;
-                let cache = self.kv[layer].as_ref().expect("KV provider has cache");
-                let append_count = if self.kv_cache_type == Gemma4KvCacheType::F32 {
-                    head
-                } else {
-                    head / 32
-                };
-                command.dispatch_1d_at(
-                    gemma4_kv_append_kernel(self.kv_cache_type),
-                    &[
-                        (&self.prefill.k_rot, k_offset),
-                        (&self.prefill.v, k_offset),
-                        (cache, 0),
-                        (head_width, 0),
-                        (&self.capacity, 0),
-                        (positions, token * std::mem::size_of::<u32>()),
-                    ],
-                    append_count,
-                )?;
-            }
+            let cache = self.kv[layer].as_ref().expect("KV provider has cache");
+            let append_count = if self.kv_cache_type == Gemma4KvCacheType::F32 {
+                head
+            } else {
+                head / 32
+            };
+            command.dispatch_1d_labeled(
+                gemma4_kv_append_batch_kernel(self.kv_cache_type),
+                Some("layer_major_batched_kv_append"),
+                &[
+                    &self.prefill.k_rot,
+                    &self.prefill.v,
+                    cache,
+                    head_width,
+                    &self.capacity,
+                    positions,
+                ],
+                batch_value * append_count,
+            )?;
         }
         let cache = self.kv[source].as_ref().expect("Gemma KV source has cache");
-        let (attention_kernel, attention_threads) = gemma4_attention_binding(self.kv_cache_type);
-        for token in 0..batch_value {
-            let q_offset = token * q_width * std::mem::size_of::<f32>();
-            let controls_offset = (token * c.layers + layer) * std::mem::size_of::<u32>();
-            command.dispatch_threadgroups_1d_at(
-                attention_kernel,
-                &[
-                    (&self.prefill.q_rot, q_offset),
-                    (cache, 0),
-                    (&self.prefill.attention, q_offset),
-                    (&self.heads, 0),
-                    (&self.kv_heads, 0),
-                    (head_width, 0),
-                    (&self.capacity, 0),
-                    (key_counts, controls_offset),
-                ],
-                c.attention_heads,
-                usize::try_from(attention_threads).expect("attention threadgroup size"),
-            )?;
-        }
+        let (attention_kernel, attention_threads) =
+            gemma4_attention_batch_binding(self.kv_cache_type);
+        let controls_offset = layer * std::mem::size_of::<u32>();
+        command.dispatch_threadgroups_1d_at_labeled(
+            attention_kernel,
+            Some("layer_major_batched_attention"),
+            &[
+                (&self.prefill.q_rot, 0),
+                (cache, 0),
+                (&self.prefill.attention, 0),
+                (&self.heads, 0),
+                (&self.kv_heads, 0),
+                (head_width, 0),
+                (&self.capacity, 0),
+                (key_counts, controls_offset),
+                (&self.layers, 0),
+            ],
+            batch_value * c.attention_heads,
+            attention_threads,
+        )?;
         let wo = self.weight(&format!("{p}.attn_output.weight"), GgufTensorType::Q4_0)?;
         self.matmul_batch(
             command,
@@ -3330,23 +3351,20 @@ impl<'a> Gemma4E2bExecutor<'a> {
             &[&self.prefill.gate, &self.prefill.gate, &ple_batch],
             batch_value * c.per_layer_embedding_size,
         )?;
-        let ple_offset = &self.ple_offsets[layer];
-        for token in 0..batch_value {
-            let offset = token * c.per_layer_embedding_size * std::mem::size_of::<f32>();
-            let source_offset =
-                token * c.layers * c.per_layer_embedding_size * std::mem::size_of::<f32>();
-            command.dispatch_1d_at(
-                "vector_multiply_offset_f32",
-                &[
-                    (&self.prefill.gate, offset),
-                    (&self.prefill.ple, source_offset),
-                    (&self.prefill.activated, offset),
-                    (ple_offset, 0),
-                    (&self.ple_width, 0),
-                ],
-                c.per_layer_embedding_size,
-            )?;
-        }
+        command.dispatch_1d_labeled(
+            "vector_multiply_offset_batch_f32",
+            Some("layer_major_batched_ple_composition"),
+            &[
+                &self.prefill.gate,
+                &self.prefill.ple,
+                &self.prefill.activated,
+                &self.ple_offsets[layer],
+                &self.layers,
+                &self.ple_width,
+                batch,
+            ],
+            batch_value * c.per_layer_embedding_size,
+        )?;
         self.matmul_batch(
             command,
             &self.prefill.activated,
@@ -3898,7 +3916,9 @@ mod tests {
         let short = Gemma4PrefillPlan::new(10, 4096).unwrap();
         assert_eq!((short.chunk_size, short.chunks), (10, 1));
         let long = Gemma4PrefillPlan::new(300, 4096).unwrap();
-        assert_eq!((long.chunk_size, long.chunks), (128, 3));
+        assert_eq!((long.chunk_size, long.chunks), (300, 1));
+        let very_long = Gemma4PrefillPlan::new(1000, 4096).unwrap();
+        assert_eq!((very_long.chunk_size, very_long.chunks), (512, 2));
         assert!(Gemma4PrefillPlan::new(0, 4096).is_err());
         assert!(Gemma4PrefillPlan::new(4097, 4096).is_err());
     }
@@ -3955,14 +3975,14 @@ mod tests {
 
     #[test]
     fn prefill_chunk_boundaries_preserve_absolute_positions() {
-        let plan = Gemma4PrefillPlan::new(300, 4096).unwrap();
-        assert_eq!(plan.chunks, 3);
+        let plan = Gemma4PrefillPlan::new(600, 4096).unwrap();
+        assert_eq!(plan.chunks, 2);
         let chunks = (0..plan.prompt_tokens)
             .collect::<Vec<_>>()
             .chunks(plan.chunk_size)
             .map(|chunk| (chunk[0], *chunk.last().unwrap()))
             .collect::<Vec<_>>();
-        assert_eq!(chunks, vec![(0, 127), (128, 255), (256, 299)]);
+        assert_eq!(chunks, vec![(0, 511), (512, 599)]);
     }
 
     #[test]
