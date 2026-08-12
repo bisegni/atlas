@@ -8,7 +8,10 @@ cd "$repo_root"
 
 model_id=gemma4-e2b-q4_0
 fixture=models/gguf/gemma-4-e2b-it-q4_0/gemma-4-E2B_q4_0-it.gguf
-llama_simple=${LLAMA_SIMPLE:-llama-simple}
+# The minimal `llama-simple` sample does not expose the Q4-KV, tokenizer,
+# sampling, or version flags required for this matched oracle. Keep the
+# historical override name for callers, but default to the full CLI.
+llama_simple=${LLAMA_SIMPLE:-llama-cli}
 llama_tokenize=${LLAMA_TOKENIZE:-llama-tokenize}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 artifact_dir="artifacts/phase-12a-llama-oracle/${stamp}"
@@ -31,9 +34,12 @@ mkdir -p "$artifact_dir"
 shasum -a 256 "$fixture" | tee "$artifact_dir/fixture-sha256.txt"
 "$llama_simple" --version | tee "$artifact_dir/llama-version.txt"
 
-# The embedded Hugging Face tokenizer uses Metaspace::Always. Retain the
-# leading ASCII space and suppress llama.cpp's automatic BOS token so both
-# engines consume identical prompt IDs.
+# The raw prompt below is the exact rendering of the model's Jinja one-turn
+# template. `llama-tokenize` verifies that rendering while llama-cli receives
+# only the user content and renders it itself via Jinja; feeding raw turn
+# markers to llama-cli enters its interactive parser on recent llama.cpp.
+# Suppress llama.cpp's automatic BOS token so both engines consume identical
+# prompt IDs.
 capture_case() {
     local label=$1
     local atlas_prompt=$2
@@ -42,9 +48,9 @@ capture_case() {
     local expected_finish=$5
     local fixture_path=$6
     local case_dir="$artifact_dir/$label"
-    local oracle_output oracle_visible atlas_prompt_ids llama_prompt_ids
+    local oracle_output oracle_visible atlas_prompt_ids llama_prompt_ids llama_stderr
     local legacy_visible legacy_finish flash_visible flash_finish
-    local legacy_tokens flash_tokens first_divergence model_sha256 llama_version
+    local legacy_tokens flash_tokens llama_completion_tokens first_divergence first_llama_divergence model_sha256 llama_version
 
     mkdir -p "$case_dir"
     printf '%s' "$raw_prompt" > "$case_dir/raw-prompt.txt"
@@ -66,9 +72,20 @@ capture_case() {
         -n "$max_tokens" \
         --temp 0 \
         --top-k 1 \
+        --jinja \
+        --conversation \
+        --single-turn \
+        --no-display-prompt \
         --special \
+        --simple-io \
         --log-disable \
-        "$raw_prompt" > "$case_dir/llama-completion.txt"
+        --prompt "$atlas_prompt" > "$case_dir/llama-completion.txt" 2> "$case_dir/llama-stderr.txt"
+
+    llama_stderr=$(<"$case_dir/llama-stderr.txt")
+    if [[ "$llama_stderr" == *"available commands:"* ]]; then
+        echo "[$label] llama.cpp entered its chat UI instead of raw completion mode; refusing to promote a fixture" >&2
+        exit 1
+    fi
 
     echo "[$label] capturing Resident LegacyFused oracle..."
     cargo run --release -p atlas-cli -- generate \
@@ -99,6 +116,13 @@ capture_case() {
     fi
 
     oracle_output=$(<"$case_dir/llama-completion.txt")
+    "$llama_tokenize" \
+        -m "$fixture" \
+        --no-bos \
+        --ids \
+        --log-disable \
+        --prompt "$oracle_output" > "$case_dir/llama-completion-token-ids.json"
+    llama_completion_tokens=$(jq -c . "$case_dir/llama-completion-token-ids.json")
     if [[ "$expected_finish" == eos ]]; then
         if [[ "$oracle_output" != *'<turn|>' ]]; then
             echo "[$label] llama.cpp did not terminate with <turn|>; refusing to promote a fixture" >&2
@@ -145,13 +169,25 @@ capture_case() {
           | select($legacy[.] != $flash[.])]
          | first // (if ($legacy | length) == ($flash | length)
                      then null else ([$legacy | length, $flash | length] | min) end)')
+    first_llama_divergence=$(jq -n \
+        --argjson llama "$llama_completion_tokens" \
+        --argjson flash "$flash_tokens" \
+        '[range(0; ([$llama | length, $flash | length] | min))
+          | select($llama[.] != $flash[.])]
+         | first // (if ($llama | length) == ($flash | length)
+                     then null else ([$llama | length, $flash | length] | min) end)')
     jq -n \
         --arg label "$label" \
         --argjson first_divergence "$first_divergence" \
+        --argjson first_llama_divergence "$first_llama_divergence" \
+        --argjson llama_completion_tokens "$llama_completion_tokens" \
         --slurpfile legacy "$case_dir/atlas-legacy.json" \
         --slurpfile flash16 "$case_dir/atlas-flash16.json" \
         '{label: $label, first_divergent_generated_token: $first_divergence,
+          first_flash16_vs_llama_generated_token: $first_llama_divergence,
+          llama_completion_token_ids: $llama_completion_tokens,
           exact_token_parity: ($legacy[0].generated_token_ids == $flash16[0].generated_token_ids),
+          flash16_matches_llama_tokens: ($llama_completion_tokens == $flash16[0].generated_token_ids),
           exact_finish_parity: ($legacy[0].finish_reason == $flash16[0].finish_reason),
           legacy: $legacy[0], flash16: $flash16[0]}' > "$case_dir/flash16-parity.json"
 
@@ -205,6 +241,6 @@ capture_case \
 
 echo "Oracle artifacts: $artifact_dir"
 if (( flash_mismatch )); then
-    echo "Flash16 remains the production default but is not accepted until this parity artifact is clean" >&2
+    echo "Flash16 remains opt-in until this parity artifact is clean" >&2
     exit 1
 fi

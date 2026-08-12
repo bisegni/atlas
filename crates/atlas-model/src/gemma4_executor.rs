@@ -35,6 +35,124 @@ fn sha256_f32_logits(logits: &[f32]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+fn flash16_tensor_summary(values: &[f32]) -> (f64, f32, usize, [u8; 32]) {
+    let mut sum_squares = 0.0f64;
+    let mut max_abs = 0.0f32;
+    let mut non_finite = 0usize;
+    let mut hasher = Sha256::new();
+    for value in values {
+        hasher.update(value.to_le_bytes());
+        if value.is_finite() {
+            sum_squares += f64::from(*value) * f64::from(*value);
+            max_abs = max_abs.max(value.abs());
+        } else {
+            non_finite += 1;
+        }
+    }
+    (
+        sum_squares.sqrt(),
+        max_abs,
+        non_finite,
+        hasher.finalize().into(),
+    )
+}
+
+fn flash16_top_two(logits: &[f32]) -> (u32, f32, u32, f32, usize) {
+    let mut best = (0u32, f32::NEG_INFINITY);
+    let mut next = (0u32, f32::NEG_INFINITY);
+    let mut non_finite = 0usize;
+    for (index, logit) in logits.iter().copied().enumerate() {
+        if !logit.is_finite() {
+            non_finite += 1;
+            continue;
+        }
+        if logit > best.1 {
+            next = best;
+            best = (
+                u32::try_from(index).expect("vocabulary index fits u32"),
+                logit,
+            );
+        } else if logit > next.1 {
+            next = (
+                u32::try_from(index).expect("vocabulary index fits u32"),
+                logit,
+            );
+        }
+    }
+    (best.0, best.1, next.0, next.1, non_finite)
+}
+
+/// Independent host calculation for selected Q6_K vocabulary rows. This is
+/// deliberately tiny (two rows) and trace-only: it checks the final Resident
+/// projection without introducing a CPU inference fallback.
+fn gemma4_cpu_q6_output_logits(
+    model: &Gemma4E2bModel,
+    state: &[f32],
+    rows: &[u32],
+) -> Result<Vec<f32>> {
+    let hidden = model.config.hidden_size;
+    ensure!(
+        state.len() == hidden,
+        "output-projection state width mismatch"
+    );
+    let tensor = model
+        .gguf()
+        .tensors
+        .iter()
+        .find(|tensor| tensor.name == "token_embd.weight")
+        .context("Gemma output vocabulary tensor is missing")?;
+    ensure!(
+        tensor.tensor_type == GgufTensorType::Q6K,
+        "trace expects Q6_K output vocabulary"
+    );
+    let norm = model
+        .gguf()
+        .tensors
+        .iter()
+        .find(|tensor| tensor.name == "output_norm.weight")
+        .context("Gemma output norm tensor is missing")?;
+    let norm_bytes = model.gguf().tensor_data(norm)?;
+    ensure!(
+        norm_bytes.len() == hidden * std::mem::size_of::<f32>(),
+        "output norm width mismatch"
+    );
+    let weights = model.gguf().tensor_data(tensor)?;
+    let blocks = hidden / 256;
+    let row_bytes = blocks * GgufTensorType::Q6K.block_bytes();
+    let mean_square = state.iter().map(|value| value * value).sum::<f32>() / hidden as f32;
+    let inverse_rms = (mean_square + model.config.rms_norm_eps).sqrt().recip();
+    let mut block = [0.0f32; 256];
+    rows.iter()
+        .map(|&row| {
+            let row = usize::try_from(row)?;
+            ensure!(
+                row < model.config.vocab_size,
+                "output row is outside vocabulary"
+            );
+            let mut total = 0.0f32;
+            for block_index in 0..blocks {
+                let offset = (row * row_bytes) + (block_index * GgufTensorType::Q6K.block_bytes());
+                dequantize_block(
+                    GgufTensorType::Q6K,
+                    &weights[offset..offset + GgufTensorType::Q6K.block_bytes()],
+                    &mut block,
+                )?;
+                for lane in 0..256 {
+                    let index = block_index * 256 + lane;
+                    let norm_weight = f32::from_le_bytes(
+                        norm_bytes[index * 4..index * 4 + 4]
+                            .try_into()
+                            .expect("four-byte F32"),
+                    );
+                    total += state[index] * inverse_rms * norm_weight * block[lane];
+                }
+            }
+            let cap = model.config.final_logit_softcap;
+            Ok(cap * (total / cap).tanh())
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gemma4WeightFormat {
     MixedQ4Q6,
@@ -289,19 +407,26 @@ fn gemma4_q4_flash16_supported(attention_heads: usize, head_dim: usize) -> bool 
     attention_heads == 8 && (head_dim == 512 || head_dim == 256)
 }
 
-/// Exact-compatible Flash16 attention bindings. They specialize Gemma's full
-/// and sliding head widths while preserving LegacyFused's FP32 reduction and
-/// online-softmax ordering, without the redundant value-update barrier.
+/// Diagnostic-only: make decode use the same V-RMS-normalize then KV-append
+/// sequence as layer-major prefill. This isolates the fused decode shortcut
+/// without changing the Resident executor or production default.
+fn gemma4_decode_uses_unfused_vnorm() -> bool {
+    std::env::var_os("ATLAS_GEMMA4_UNFUSED_VNORM").is_some()
+}
+
+/// Exact-compatible Flash16 attention bindings. They retain Flash16's
+/// explicit Resident dispatches while preserving LegacyFused's runtime FP32
+/// dot-product, reduction, online-softmax ordering, and value-update barrier.
 fn gemma4_q4_flash16_binding(sliding: bool) -> (&'static str, &'static str, u32) {
     if sliding {
         (
-            "attention_decode_gemma4_simd_q4_0_flash16_swa_exact_nb",
+            "attention_decode_gemma4_simd_q4_0_flash16_swa_exact_runtime",
             "gemma_attention_flash16_swa",
             128,
         )
     } else {
         (
-            "attention_decode_gemma4_simd_q4_0_flash16_exact_nb",
+            "attention_decode_gemma4_simd_q4_0_flash16_exact_runtime",
             "gemma_attention_flash16",
             128,
         )
@@ -355,13 +480,10 @@ impl Gemma4KvCacheType {
 
 /// Decode attention implementation for Q4 KV caches.
 ///
-/// `Flash16` is the production Resident default: it specializes Gemma's two
-/// head widths and preserves LegacyFused's four-SIMD reduction, key-ordered
-/// online softmax, and per-token fp32 logit arithmetic, so it is byte-exact
-/// against the established greedy stream (see the ignored exact-token and
-/// per-token logit-digest parity gates) while dropping the redundant value
-/// barrier. `LegacyFused` remains an explicit diagnostic path; neither mode
-/// is a CPU fallback.
+/// `LegacyFused` is the production Resident default until Flash16 passes the
+/// ignored exact-token and per-token logit-digest parity gates on Apple
+/// Silicon. `Flash16` remains an explicit diagnostic and performance path;
+/// neither mode is a CPU fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gemma4Q4AttentionMode {
     Flash16,
@@ -370,7 +492,7 @@ pub enum Gemma4Q4AttentionMode {
 
 impl Default for Gemma4Q4AttentionMode {
     fn default() -> Self {
-        Self::Flash16
+        Self::LegacyFused
     }
 }
 
@@ -412,7 +534,7 @@ fn gemma4_should_finish(token: u32, eos_token: u32, decoded: &str, chat: bool) -
     token == eos_token || (chat && decoded.contains("<turn|>"))
 }
 
-/// Number of keys visible to a query at `position`.  The cache owns absolute
+/// Number of keys visible to a query at `position`. The cache owns absolute
 /// positions; sliding attention only changes the visible suffix, never the
 /// shared-KV source or the write position.
 fn gemma4_attention_key_count(position: usize, sliding: bool, sliding_window: usize) -> usize {
@@ -421,6 +543,31 @@ fn gemma4_attention_key_count(position: usize, sliding: bool, sliding_window: us
     } else {
         position + 1
     }
+}
+
+fn gemma4_attention_key_start(position: usize, sliding: bool, sliding_window: usize) -> usize {
+    if sliding {
+        position.saturating_add(1).saturating_sub(sliding_window)
+    } else {
+        0
+    }
+}
+
+/// Packs the absolute cache start and visible key count into one u32 control
+/// word: `[start: u16 | count: u16]`. Keeping this one control buffer avoids
+/// an extra Resident binding while making SWA read the newest cache suffix.
+fn gemma4_attention_control(position: usize, sliding: bool, sliding_window: usize) -> Result<u32> {
+    let start = gemma4_attention_key_start(position, sliding, sliding_window);
+    let count = gemma4_attention_key_count(position, sliding, sliding_window);
+    ensure!(
+        start <= u16::MAX as usize,
+        "Gemma attention key start exceeds u16 control range"
+    );
+    ensure!(
+        count <= u16::MAX as usize,
+        "Gemma attention key count exceeds u16 control range"
+    );
+    Ok(((start as u32) << 16) | count as u32)
 }
 
 /// Build immutable attention controls for one encoded command.  The table is
@@ -444,11 +591,7 @@ fn gemma4_attention_key_count_table(
             .checked_add(token)
             .context("Gemma attention control position overflow")?;
         for &sliding in sliding_pattern {
-            table.push(u32::try_from(gemma4_attention_key_count(
-                position,
-                sliding,
-                sliding_window,
-            ))?);
+            table.push(gemma4_attention_control(position, sliding, sliding_window)?);
         }
     }
     Ok(table)
@@ -552,6 +695,43 @@ fn gemma4_prefill_path(prompt_tokens: usize) -> &'static str {
     }
 }
 
+/// Diagnostic-only token-major prompt execution. It reuses the established
+/// one-token Resident decode encoder for every prompt token, allowing a
+/// direct comparison with layer-major prefill at an identical context.
+fn gemma4_prefill_uses_token_major_diagnostic() -> bool {
+    std::env::var_os("ATLAS_GEMMA4_TOKEN_MAJOR_PREFILL").is_some()
+}
+
+/// Capture each transformer layer's final hidden state.  This is intentionally
+/// opt-in: it inserts one device-to-device copy per layer and a single small
+/// readback per generated token, so it is a correctness instrument rather
+/// than a production inference feature.
+fn gemma4_traces_layer_states() -> bool {
+    std::env::var_os("ATLAS_GEMMA4_TRACE_LAYER_STATES").is_some()
+}
+
+/// Optional zero-based generated-token selector for activation diagnostics.
+/// Keeping this narrow avoids reading every layer state in a long decode when
+/// a raw-token oracle has already identified one exact divergent context.
+fn gemma4_trace_token_index() -> Result<Option<usize>> {
+    std::env::var("ATLAS_GEMMA4_TRACE_TOKEN_INDEX")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .with_context(|| "ATLAS_GEMMA4_TRACE_TOKEN_INDEX must be a non-negative integer")
+        })
+        .transpose()
+}
+
+fn gemma4_selected_prefill_path(prompt_tokens: usize) -> &'static str {
+    if gemma4_prefill_uses_token_major_diagnostic() {
+        "resident_token_major_diagnostic"
+    } else {
+        gemma4_prefill_path(prompt_tokens)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Gemma4Generation {
     pub generation: Generation,
@@ -561,6 +741,53 @@ pub struct Gemma4Generation {
     /// EOS. This is populated by the diagnostic fixed-workload benchmark even
     /// though that benchmark deliberately continues decoding after EOS.
     pub first_eos_position: Option<usize>,
+    /// Opt-in Flash16-only state summaries, captured when
+    /// `ATLAS_GEMMA4_TRACE_FLASH16` is set. These records are diagnostic and
+    /// intentionally do not require a LegacyFused comparison run.
+    pub flash16_trace: Vec<Gemma4Flash16TokenTrace>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Gemma4Flash16TokenTrace {
+    pub token_index: usize,
+    pub token_id: u32,
+    pub selected_token_matches_top_logit: bool,
+    pub top_token_id: u32,
+    pub top_logit: f32,
+    pub runner_up_token_id: u32,
+    pub runner_up_logit: f32,
+    pub top_logit_margin: f32,
+    pub logits_non_finite: usize,
+    pub logits_digest: [u8; 32],
+    pub q_l2_norm: f64,
+    pub q_max_abs: f32,
+    pub q_non_finite: usize,
+    pub q_digest: [u8; 32],
+    pub attention_l2_norm: f64,
+    pub attention_max_abs: f32,
+    pub attention_non_finite: usize,
+    pub attention_digest: [u8; 32],
+    pub state_l2_norm: f64,
+    pub state_max_abs: f32,
+    pub state_non_finite: usize,
+    pub state_digest: [u8; 32],
+    pub layer_states: Vec<Gemma4LayerStateTrace>,
+    pub output_projection_cpu_top_logit: f32,
+    pub output_projection_cpu_runner_up_logit: f32,
+    pub output_projection_cpu_max_abs_delta: f32,
+    pub detail_triggered: bool,
+}
+
+/// Summary of a layer's final hidden state for one token.  The SHA-256 digest
+/// makes independently captured tensors directly comparable without writing
+/// multi-megabyte activation dumps to the normal diagnosis artifact.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Gemma4LayerStateTrace {
+    pub layer_index: usize,
+    pub l2_norm: f64,
+    pub max_abs: f32,
+    pub non_finite: usize,
+    pub digest: [u8; 32],
 }
 
 /// One exact-timing observation from the diagnostic decode profiler.  The
@@ -901,6 +1128,8 @@ pub struct Gemma4E2bExecutor<'a> {
     rope_full_sin: GpuBuffer,
     rope_swa_cos: GpuBuffer,
     rope_swa_sin: GpuBuffer,
+    layer_state_trace: Option<GpuBuffer>,
+    diagnostic_one: Option<GpuBuffer>,
     rope_freq_factors: Vec<f32>,
     prefill: Gemma4PrefillBuffers,
     pending_weight_upload_bytes: u64,
@@ -1188,6 +1417,18 @@ impl<'a> Gemma4E2bExecutor<'a> {
             ple_projected: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * ple_total)?,
             ple: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * ple_total)?,
         };
+        let (layer_state_trace, diagnostic_one) = if gemma4_traces_layer_states() {
+            (
+                Some(allocate(
+                    c.layers
+                        .checked_mul(h)
+                        .context("Gemma layer-state trace buffer size overflows")?,
+                )?),
+                Some(runtime.upload_f32(&[1.0])?),
+            )
+        } else {
+            (None, None)
+        };
         Ok(Self {
             model,
             max_context,
@@ -1266,6 +1507,8 @@ impl<'a> Gemma4E2bExecutor<'a> {
             rope_full_sin: allocate(head / 2)?,
             rope_swa_cos: allocate(head / 2)?,
             rope_swa_sin: allocate(head / 2)?,
+            layer_state_trace,
+            diagnostic_one,
             rope_freq_factors,
             prefill,
             pending_weight_upload_bytes: weight_upload_bytes,
@@ -1312,6 +1555,11 @@ impl<'a> Gemma4E2bExecutor<'a> {
             .map(|v| v.bytes() as u64)
             .sum::<u64>()
             + self.up.bytes() as u64
+            + self
+                .layer_state_trace
+                .iter()
+                .map(|buffer| buffer.bytes() as u64)
+                .sum::<u64>()
             + [
                 &self.prefill.state,
                 &self.prefill.next_state,
@@ -2039,7 +2287,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
         let prefill_started = Instant::now();
         let prefill_before = runtime.runtime_telemetry();
         let plan = Gemma4PrefillPlan::new(prompt_ids.len(), self.max_context)?;
-        let prefill_path = gemma4_prefill_path(prompt_ids.len());
+        let prefill_path = gemma4_selected_prefill_path(prompt_ids.len());
         let mut selected = 0;
         let mut logit_digests: Vec<[u8; 32]> = Vec::new();
         let chunk_count = plan.chunks;
@@ -2073,6 +2321,18 @@ impl<'a> Gemma4E2bExecutor<'a> {
         let mut decoded = String::new();
         let mut token_latency = prefill;
         let trace_logit_digests = std::env::var_os("ATLAS_GEMMA4_TRACE_LOGIT_DIGESTS").is_some();
+        let trace_flash16 = std::env::var_os("ATLAS_GEMMA4_TRACE_FLASH16").is_some()
+            && self.q4_attention_mode == Gemma4Q4AttentionMode::Flash16;
+        let trace_layer_states = self.layer_state_trace.is_some();
+        let trace_activation_summary = trace_flash16 || trace_layer_states;
+        let trace_token_index = gemma4_trace_token_index()?;
+        let trace_attention_width = self.model.config.attention_heads
+            * self
+                .model
+                .config
+                .key_length
+                .max(self.model.config.key_length_swa);
+        let mut flash16_trace = Vec::new();
         for index in 0..max_new_tokens {
             if cancelled.load(Ordering::Acquire) {
                 finish_reason = Gemma4FinishReason::Cancelled;
@@ -2083,6 +2343,91 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 logit_digests.push(sha256_f32_logits(
                     &runtime.read_f32(&self.logits, self.model.config.vocab_size)?,
                 ));
+            }
+            if trace_activation_summary
+                && trace_token_index.map_or(true, |selected_index| selected_index == index)
+            {
+                let logits = runtime.read_f32(&self.logits, self.model.config.vocab_size)?;
+                let q = runtime.read_f32(&self.q_rot, trace_attention_width)?;
+                let attention = runtime.read_f32(&self.attention, trace_attention_width)?;
+                let state = runtime.read_f32(&self.state, self.model.config.hidden_size)?;
+                let layer_states = if let Some(layer_state_trace) = &self.layer_state_trace {
+                    runtime
+                        .read_f32(
+                            layer_state_trace,
+                            self.model.config.layers * self.model.config.hidden_size,
+                        )?
+                        .chunks_exact(self.model.config.hidden_size)
+                        .enumerate()
+                        .map(|(layer_index, values)| {
+                            let (l2_norm, max_abs, non_finite, digest) =
+                                flash16_tensor_summary(values);
+                            Gemma4LayerStateTrace {
+                                layer_index,
+                                l2_norm,
+                                max_abs,
+                                non_finite,
+                                digest,
+                            }
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let (
+                    top_token_id,
+                    top_logit,
+                    runner_up_token_id,
+                    runner_up_logit,
+                    logits_non_finite,
+                ) = flash16_top_two(&logits);
+                let (q_l2_norm, q_max_abs, q_non_finite, q_digest) = flash16_tensor_summary(&q);
+                let (attention_l2_norm, attention_max_abs, attention_non_finite, attention_digest) =
+                    flash16_tensor_summary(&attention);
+                let (state_l2_norm, state_max_abs, state_non_finite, state_digest) =
+                    flash16_tensor_summary(&state);
+                let cpu_projection = gemma4_cpu_q6_output_logits(
+                    self.model,
+                    &state,
+                    &[top_token_id, runner_up_token_id],
+                )?;
+                let output_projection_cpu_max_abs_delta = (top_logit - cpu_projection[0])
+                    .abs()
+                    .max((runner_up_logit - cpu_projection[1]).abs());
+                let top_logit_margin = top_logit - runner_up_logit;
+                flash16_trace.push(Gemma4Flash16TokenTrace {
+                    token_index: index,
+                    token_id: selected,
+                    selected_token_matches_top_logit: selected == top_token_id,
+                    top_token_id,
+                    top_logit,
+                    runner_up_token_id,
+                    runner_up_logit,
+                    top_logit_margin,
+                    logits_non_finite,
+                    logits_digest: sha256_f32_logits(&logits),
+                    q_l2_norm,
+                    q_max_abs,
+                    q_non_finite,
+                    q_digest,
+                    attention_l2_norm,
+                    attention_max_abs,
+                    attention_non_finite,
+                    attention_digest,
+                    state_l2_norm,
+                    state_max_abs,
+                    state_non_finite,
+                    state_digest,
+                    layer_states,
+                    output_projection_cpu_top_logit: cpu_projection[0],
+                    output_projection_cpu_runner_up_logit: cpu_projection[1],
+                    output_projection_cpu_max_abs_delta,
+                    detail_triggered: logits_non_finite > 0
+                        || q_non_finite > 0
+                        || attention_non_finite > 0
+                        || state_non_finite > 0
+                        || top_logit_margin <= 0.01,
+                });
             }
             let next_decoded = self.model.decode(&generated)?;
             let fragment = next_decoded
@@ -2249,6 +2594,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
             },
             finish_reason,
             first_eos_position,
+            flash16_trace,
         })
     }
 
@@ -2331,6 +2677,13 @@ impl<'a> Gemma4E2bExecutor<'a> {
     }
 
     fn forward_tokens(&mut self, tokens: &[u32], select_last: bool) -> Result<Option<u32>> {
+        if gemma4_prefill_uses_token_major_diagnostic() {
+            let mut selected = None;
+            for token in tokens {
+                selected = Some(self.forward_token(*token)?);
+            }
+            return Ok(select_last.then_some(selected.expect("non-empty token batch")));
+        }
         Ok(self
             .forward_tokens_with_profile(tokens, select_last, false)?
             .0)
@@ -3245,19 +3598,39 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 } else {
                     head / 32
                 };
-                command.dispatch_1d(
-                    gemma4_kv_append_vnorm_kernel(self.kv_cache_type),
-                    &[
-                        &self.k_rot,
-                        &self.v,
-                        cache,
-                        head_width,
-                        &self.capacity,
-                        &self.position_buffer,
-                        &self.epsilon,
-                    ],
-                    append_count,
-                )?;
+                if gemma4_decode_uses_unfused_vnorm() {
+                    command.dispatch_1d(
+                        "rms_norm_groups_in_place_unweighted_f32",
+                        &[&self.v, head_width, &self.one, &self.epsilon],
+                        1,
+                    )?;
+                    command.dispatch_1d(
+                        gemma4_kv_append_kernel(self.kv_cache_type),
+                        &[
+                            &self.k_rot,
+                            &self.v,
+                            cache,
+                            head_width,
+                            &self.capacity,
+                            &self.position_buffer,
+                        ],
+                        append_count,
+                    )?;
+                } else {
+                    command.dispatch_1d(
+                        gemma4_kv_append_vnorm_kernel(self.kv_cache_type),
+                        &[
+                            &self.k_rot,
+                            &self.v,
+                            cache,
+                            head_width,
+                            &self.capacity,
+                            &self.position_buffer,
+                            &self.epsilon,
+                        ],
+                        append_count,
+                    )?;
+                }
             }
             // Gemma's cache source is explicit and observable through kv_sources; the existing resident attention kernel remains valid for one KV head.
             let cache = self.kv[source].as_ref().expect("Gemma KV source has cache");
@@ -3452,6 +3825,24 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 &[&self.state, &self.state, &scale, &self.hidden],
                 h,
             )?;
+            if let (Some(layer_state_trace), Some(diagnostic_one)) =
+                (&self.layer_state_trace, &self.diagnostic_one)
+            {
+                let trace_offset = layer
+                    .checked_mul(h)
+                    .and_then(|offset| offset.checked_mul(std::mem::size_of::<f32>()))
+                    .context("Gemma layer-state trace offset overflows")?;
+                command.dispatch_1d_at(
+                    "scalar_multiply_f32",
+                    &[
+                        (&self.state, 0),
+                        (layer_state_trace, trace_offset),
+                        (diagnostic_one, 0),
+                        (&self.hidden, 0),
+                    ],
+                    h,
+                )?;
+            }
         }
         command.set_layer_index(None);
         if !select_output {
@@ -3492,7 +3883,8 @@ mod tests {
     use super::{
         GEMMA4_SELECTED_GROUP_QKV, GEMMA4_SELECTED_GROUP_VOCAB_EMBEDDINGS,
         GEMMA4_SELECTED_GROUP_VOCAB_OUTPUT, Gemma4KvCacheType, Gemma4PrefillPlan,
-        Gemma4Q4AttentionMode, Gemma4WeightFormat, QuantizationPlan, gemma4_attention_kernel,
+        Gemma4Q4AttentionMode, Gemma4WeightFormat, QuantizationPlan, flash16_tensor_summary,
+        flash16_top_two, gemma4_attention_control, gemma4_attention_kernel,
         gemma4_attention_key_count, gemma4_attention_key_count_table,
         gemma4_decode_profile_targets, gemma4_kernel_family, gemma4_prefill_path,
         gemma4_profile_family, gemma4_q6_k_to_q4_0, gemma4_rms_norm_decode_kernel,
@@ -3512,6 +3904,16 @@ mod tests {
     }
 
     #[test]
+    fn flash16_trace_helpers_preserve_top_two_and_non_finite_state() {
+        let logits = [1.0, 3.0, 2.0, f32::NAN];
+        assert_eq!(flash16_top_two(&logits), (1, 3.0, 2, 2.0, 1));
+        let (l2_norm, max_abs, non_finite, _) = flash16_tensor_summary(&logits);
+        assert!((l2_norm - 14.0f64.sqrt()).abs() < 1e-12);
+        assert_eq!(max_abs, 3.0);
+        assert_eq!(non_finite, 1);
+    }
+
+    #[test]
     fn layer_major_prefill_is_the_normal_multi_token_resident_path() {
         assert_eq!(gemma4_prefill_path(1), "resident_chunked_command");
         assert_eq!(gemma4_prefill_path(2), "resident_layer_major");
@@ -3519,7 +3921,7 @@ mod tests {
     }
 
     #[test]
-    fn q4_attention_mode_defaults_to_flash16_and_keeps_legacy_experiment() {
+    fn q4_attention_mode_defaults_to_legacy_fused_until_flash16_is_accepted() {
         assert_eq!(
             Gemma4Q4AttentionMode::parse("flash16").unwrap(),
             Gemma4Q4AttentionMode::Flash16
@@ -3537,7 +3939,7 @@ mod tests {
                 false,
                 Gemma4Q4AttentionMode::default(),
             ),
-            "attention_decode_gemma4_simd_q4_0_flash16_exact_nb"
+            "attention_decode_fused_gemma4_simd_q4_0"
         );
         assert_eq!(
             gemma4_attention_kernel(
@@ -3571,6 +3973,11 @@ mod tests {
         assert_eq!(gemma4_attention_key_count(2, true, 4), 3);
         assert_eq!(gemma4_attention_key_count(3, true, 4), 4);
         assert_eq!(gemma4_attention_key_count(127, true, 4), 4);
+        assert_eq!(
+            gemma4_attention_control(127, true, 4).unwrap(),
+            (124 << 16) | 4
+        );
+        assert_eq!(gemma4_attention_control(127, false, 4).unwrap(), 128);
     }
 
     #[test]
@@ -3586,7 +3993,10 @@ mod tests {
     fn attention_control_table_keeps_each_token_and_layer_immutable() {
         let controls = gemma4_attention_key_count_table(126, 3, &[false, true, false], 128)
             .expect("build controls");
-        assert_eq!(controls, vec![127, 127, 127, 128, 128, 128, 129, 128, 129]);
+        assert_eq!(
+            controls,
+            vec![127, 127, 127, 128, 128, 128, 129, (1 << 16) | 128, 129]
+        );
     }
 
     #[test]

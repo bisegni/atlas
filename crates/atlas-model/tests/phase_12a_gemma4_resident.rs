@@ -104,7 +104,10 @@ fn flash16_matches_legacy_resident_output_logit_digests() {
     let model = Gemma4E2bModel::load_gguf(fixture_path()).expect("load Gemma E2B GGUF");
     let cancelled = AtomicBool::new(false);
 
-    for (name, prompt) in [("canonical", canonical_prompt), ("long-cpp", code_prompt.as_str())] {
+    for (name, prompt) in [
+        ("canonical", canonical_prompt),
+        ("long-cpp", code_prompt.as_str()),
+    ] {
         let mut fast = Gemma4E2bExecutor::new_with_kv_cache_and_q4_attention_mode(
             &model,
             4096,
@@ -163,10 +166,22 @@ fn flash16_matches_legacy_resident_output_logit_digests() {
     )
     .expect("create long-window legacy executor");
     let fast_generation = fast
-        .generate_greedy_fixed_benchmark_window_stream(&code_prompt, 256, 64, &cancelled, |_| Ok(()))
+        .generate_greedy_fixed_benchmark_window_stream(
+            &code_prompt,
+            256,
+            64,
+            &cancelled,
+            |_| Ok(()),
+        )
         .expect("run long-window flash16 Resident decode");
     let legacy_generation = legacy
-        .generate_greedy_fixed_benchmark_window_stream(&code_prompt, 256, 64, &cancelled, |_| Ok(()))
+        .generate_greedy_fixed_benchmark_window_stream(
+            &code_prompt,
+            256,
+            64,
+            &cancelled,
+            |_| Ok(()),
+        )
         .expect("run long-window legacy Resident decode");
     assert_eq!(
         fast_generation.generation.logit_digests,
@@ -301,7 +316,7 @@ fn q4_kv_flash16_matches_legacy_resident_attention_across_chat_and_long_decode()
         );
         assert_eq!(
             fast_generation.metrics.attention_kernel,
-            "attention_decode_gemma4_simd_q4_0_flash16_exact_nb"
+            "attention_decode_gemma4_simd_q4_0_flash16_exact_runtime"
         );
         assert_eq!(
             legacy_generation.metrics.attention_kernel,

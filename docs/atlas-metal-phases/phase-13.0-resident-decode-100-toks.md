@@ -51,12 +51,11 @@ the first 50 generated tokens and diverge at zero-based generated token 50
 (the 51st generated token).
 
 The slice-merge `_flash16_uw` kernels are therefore retired from the Flash16
-selector. Flash16 now selects head-specialized `_flash16_exact_nb` kernels
-that preserve LegacyFused's four-SIMD score reduction and key-ordered online
-softmax arithmetic while removing only the post-value barrier; the following
-score-reduction barrier still protects the next shared softmax state. They
-remain experimental until the exact GPU stream and matched-performance gates
-pass.
+selector. Flash16 now selects `_flash16_exact_runtime` kernels that preserve
+LegacyFused's runtime FP32 Q·K accumulation, four-SIMD score reduction,
+key-ordered online softmax, and post-value barrier. The no-barrier and
+compile-time head-width candidates remain diagnostic-only. Flash16 remains
+experimental until the exact GPU stream and matched-performance gates pass.
 
 Flash16 cannot be selected for normal Q4-KV inference while this exact-token
 failure exists. `LegacyFused` is now the Resident production default: it is
@@ -80,12 +79,14 @@ Capture the canonical independently before running the full ignored suite:
 bash scripts/capture-gemma4-llama-oracle.sh
 ```
 
-The script runs the identical GGUF and token-identical Gemma protocol prompts
-through llama.cpp greedy Q4-K/V decoding: a short terminal `<turn|>` case and
-a fixed 64-token C++ case. It promotes ignored local fixtures only from the
-Resident `LegacyFused` result after exact prompt-ID, visible-output, and finish
-checks against llama.cpp. It then captures Flash16 separately and writes the
-first divergent generated-token index and both streams under
+The script renders each user message through llama.cpp's Jinja single-turn
+mode, while independently verifying that its expected raw Gemma protocol
+rendering tokenizes identically to Atlas. It uses greedy Q4-K/V decoding for a
+short terminal `<turn|>` case and a fixed 64-token C++ case. It promotes
+ignored local fixtures only from the Resident `LegacyFused` result after exact
+prompt-ID, visible-output, and finish checks against llama.cpp. It then captures Flash16 separately, tokenizes the
+llama.cpp completion independently, and writes both its direct Flash16-versus-llama first divergence and the
+LegacyFused-versus-Flash16 first divergence under
 `artifacts/phase-12a-llama-oracle/`; it exits non-zero while Flash16 differs.
 
 Run the external-oracle gate after the capture has written both verified
@@ -110,7 +111,7 @@ cargo run --release -p atlas-cli -- generate \
 
 To run the exact Flash16 candidate in normal chat while it is under
 validation, add `--q4-attention-mode flash16`; the emitted metrics must name
-`attention_decode_gemma4_simd_q4_0_flash16_exact_nb`.
+`attention_decode_gemma4_simd_q4_0_flash16_exact_runtime`.
 
 The normal `chat`, `benchmark`, and `generate` defaults now use LegacyFused
 and report `q4_attention_mode` with the selected Resident kernel. Flash16 may

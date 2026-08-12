@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicBool, Ordering},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -41,6 +41,7 @@ const MODEL_MANIFEST: &str = "models/manifest.toml";
 const CHAT_PERFORMANCE_LOG: &str = "artifacts/chat-performance.jsonl";
 const GEMMA_DECODE_PROFILE_LOG: &str = "artifacts/phase-12a/gemma4-resident-decode-profile.jsonl";
 const GEMMA_FIXED_BENCHMARK_LOG: &str = "artifacts/phase-12a-perf/gemma4-fixed-workload.jsonl";
+const FLASH16_DIAGNOSIS_DIR: &str = "artifacts/flash16-diagnosis";
 
 #[derive(Debug, PartialEq, Eq)]
 struct GemmaProfileArgs {
@@ -291,6 +292,7 @@ fn run_chat_turn(
     if show_thoughts && !thoughts.is_empty() {
         eprintln!("\nthoughts> {thoughts}");
     }
+    write_flash16_diagnosis(selection, &generation)?;
     println!();
     emit_metrics(
         selection,
@@ -300,6 +302,68 @@ fn run_chat_turn(
         requested.is_none(),
     )?;
     Ok(visible)
+}
+
+fn digest_hex(digest: &[u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn write_flash16_diagnosis(selection: &ModelRecord, generation: &Gemma4Generation) -> Result<()> {
+    if generation.flash16_trace.is_empty() {
+        return Ok(());
+    }
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock predates Unix epoch")?
+        .as_millis();
+    let path = Path::new(FLASH16_DIAGNOSIS_DIR).join(format!("{stamp}-flash16.jsonl"));
+    fs::create_dir_all(FLASH16_DIAGNOSIS_DIR)?;
+    let mut file = fs::File::create(&path)?;
+    writeln!(
+        file,
+        "{}",
+        json!({
+            "event": "flash16_diagnosis",
+            "model_id": selection.id,
+            "executor": "resident",
+            "q4_attention_mode": generation.metrics.q4_attention_mode.as_str(),
+            "attention_kernel": generation.metrics.attention_kernel,
+            "records": generation.flash16_trace.len(),
+        })
+    )?;
+    for record in &generation.flash16_trace {
+        writeln!(
+            file,
+            "{}",
+            json!({
+                "event": "flash16_token",
+                "token_index": record.token_index,
+                "token_id": record.token_id,
+                "selected_token_matches_top_logit": record.selected_token_matches_top_logit,
+                "top_token_id": record.top_token_id,
+                "top_logit": record.top_logit,
+                "runner_up_token_id": record.runner_up_token_id,
+                "runner_up_logit": record.runner_up_logit,
+                "top_logit_margin": record.top_logit_margin,
+                "logits_non_finite": record.logits_non_finite,
+                "logits_digest": digest_hex(&record.logits_digest),
+                "q": {"l2_norm": record.q_l2_norm, "max_abs": record.q_max_abs, "non_finite": record.q_non_finite, "digest": digest_hex(&record.q_digest)},
+                "attention": {"l2_norm": record.attention_l2_norm, "max_abs": record.attention_max_abs, "non_finite": record.attention_non_finite, "digest": digest_hex(&record.attention_digest)},
+                "state": {"l2_norm": record.state_l2_norm, "max_abs": record.state_max_abs, "non_finite": record.state_non_finite, "digest": digest_hex(&record.state_digest)},
+                "layer_states": record.layer_states.iter().map(|layer| json!({
+                    "layer_index": layer.layer_index,
+                    "l2_norm": layer.l2_norm,
+                    "max_abs": layer.max_abs,
+                    "non_finite": layer.non_finite,
+                    "digest": digest_hex(&layer.digest),
+                })).collect::<Vec<_>>(),
+                "output_projection_cpu": {"top_logit": record.output_projection_cpu_top_logit, "runner_up_logit": record.output_projection_cpu_runner_up_logit, "max_abs_delta": record.output_projection_cpu_max_abs_delta},
+                "detail_triggered": record.detail_triggered,
+            })
+        )?;
+    }
+    eprintln!("[atlas][flash16-diagnosis] wrote {}", path.display());
+    Ok(())
 }
 
 #[derive(Default)]
@@ -486,10 +550,8 @@ fn generate(args: &[String]) -> Result<()> {
     let mut chat = false;
     let mut json_output = false;
     let mut kv_cache_type = Gemma4KvCacheType::Q4_0;
-    // This selector exists only for the Resident Q4-KV parity harness. The
-    // Flash16 exact-attention kernel is now the production default; it
-    // preserves LegacyFused's FP32 reduction and online-softmax ordering
-    // byte-for-byte (see the ignored exact-token and logit-digest gates).
+    // Flash16 remains an explicit Resident Q4-KV parity and performance
+    // candidate until its exact-token and logit-digest gates pass on Metal.
     let mut q4_attention_mode = Gemma4Q4AttentionMode::default();
     let mut i = 0;
     while i < args.len() {
@@ -550,6 +612,7 @@ fn generate(args: &[String]) -> Result<()> {
     } else {
         executor.generate_greedy_stream(&prompt, max_tokens, &CHAT_INTERRUPTED, |_| Ok(()))?
     };
+    write_flash16_diagnosis(&selection, &result)?;
     if json_output {
         let visible_text = if chat {
             visible_chat_completion(&result.generation.text, &prompt).to_owned()
@@ -575,6 +638,7 @@ fn generate(args: &[String]) -> Result<()> {
                 "kv_cache_type": result.metrics.kv_cache_type.as_str(),
                 "q4_attention_mode": result.metrics.q4_attention_mode.as_str(),
                 "attention_kernel": result.metrics.attention_kernel,
+                "prefill_path": result.metrics.prefill_path,
                 "resident_bytes": result.metrics.resident_bytes,
                 "readback_bytes": result.metrics.readback_bytes,
             })
@@ -2102,7 +2166,7 @@ mod kv_cache_cli_tests {
         let (_, _, _, _, cache_type, attention_mode) =
             parse_chat_args(&args).expect("parse chat options");
         assert_eq!(cache_type, Gemma4KvCacheType::Q8_0);
-        assert_eq!(attention_mode, Gemma4Q4AttentionMode::Flash16);
+        assert_eq!(attention_mode, Gemma4Q4AttentionMode::LegacyFused);
     }
 
     #[test]
@@ -2161,7 +2225,7 @@ mod kv_cache_cli_tests {
             parse_benchmark_args(&benchmark)
                 .expect("parse benchmark options")
                 .q4_attention_mode,
-            Gemma4Q4AttentionMode::Flash16
+            Gemma4Q4AttentionMode::LegacyFused
         );
 
         let profile = vec!["--model".to_owned(), "gemma4-e2b-q4_0".to_owned()];
@@ -2198,7 +2262,7 @@ mod kv_cache_cli_tests {
         assert_eq!(parsed.warmup_decode_tokens, 32);
         assert_eq!(parsed.max_context, 4096);
         assert_eq!(parsed.kv_cache_type, Gemma4KvCacheType::Q4_0);
-        assert_eq!(parsed.q4_attention_mode, Gemma4Q4AttentionMode::Flash16);
+        assert_eq!(parsed.q4_attention_mode, Gemma4Q4AttentionMode::LegacyFused);
         assert!(parse_benchmark_args(&args[..4]).is_err());
     }
 

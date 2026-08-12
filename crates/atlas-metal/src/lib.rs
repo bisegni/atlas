@@ -902,6 +902,8 @@ mod macos {
                 "attention_decode_gemma4_simd_q4_0_flash16_swa_uw",
                 "attention_decode_gemma4_simd_q4_0_flash16_exact",
                 "attention_decode_gemma4_simd_q4_0_flash16_swa_exact",
+                "attention_decode_gemma4_simd_q4_0_flash16_exact_runtime",
+                "attention_decode_gemma4_simd_q4_0_flash16_swa_exact_runtime",
                 "attention_decode_gemma4_simd_q4_0_flash16_exact_nb",
                 "attention_decode_gemma4_simd_q4_0_flash16_swa_exact_nb",
                 "gelu_multiply_f32",

@@ -708,9 +708,9 @@ kernel void kv_append_decode_q4_0(
     device uchar *out = cache + (position * blocks + block) * 18;
     *((device half *)out) = half(scale);
     for (uint i = 0; i < 16; ++i) {
-        int low = scale == 0.0f ? 0 : int(round(clamp(key[base + i] / scale, -8.0f, 7.0f)));
-        int high = scale == 0.0f ? 0 : int(round(clamp(key[base + i + 16] / scale, -8.0f, 7.0f)));
-        out[2 + i] = uchar((low + 8) | ((high + 8) << 4));
+        int low = scale == 0.0f ? 0 : clamp(int(key[base + i] / scale + 8.5f), 0, 15);
+        int high = scale == 0.0f ? 0 : clamp(int(key[base + i + 16] / scale + 8.5f), 0, 15);
+        out[2 + i] = uchar(low | (high << 4));
     }
     maximum = 0.0f; signed_maximum = 0.0f;
     for (uint i = 0; i < 32; ++i) if (abs(value[base + i]) > maximum) { maximum = abs(value[base + i]); signed_maximum = value[base + i]; }
@@ -718,9 +718,9 @@ kernel void kv_append_decode_q4_0(
     out = cache + (capacity * blocks + position * blocks + block) * 18;
     *((device half *)out) = half(scale);
     for (uint i = 0; i < 16; ++i) {
-        int low = scale == 0.0f ? 0 : int(round(clamp(value[base + i] / scale, -8.0f, 7.0f)));
-        int high = scale == 0.0f ? 0 : int(round(clamp(value[base + i + 16] / scale, -8.0f, 7.0f)));
-        out[2 + i] = uchar((low + 8) | ((high + 8) << 4));
+        int low = scale == 0.0f ? 0 : clamp(int(value[base + i] / scale + 8.5f), 0, 15);
+        int high = scale == 0.0f ? 0 : clamp(int(value[base + i + 16] / scale + 8.5f), 0, 15);
+        out[2 + i] = uchar(low | (high << 4));
     }
 }
 
@@ -795,9 +795,9 @@ kernel void kv_append_decode_q4_0_vnorm(
     device uchar *out = cache + (position * blocks + block) * 18;
     *((device half *)out) = half(scale);
     for (uint i = 0; i < 16; ++i) {
-        int low = scale == 0.0f ? 0 : int(round(clamp(key[base + i] / scale, -8.0f, 7.0f)));
-        int high = scale == 0.0f ? 0 : int(round(clamp(key[base + i + 16] / scale, -8.0f, 7.0f)));
-        out[2 + i] = uchar((low + 8) | ((high + 8) << 4));
+        int low = scale == 0.0f ? 0 : clamp(int(key[base + i] / scale + 8.5f), 0, 15);
+        int high = scale == 0.0f ? 0 : clamp(int(key[base + i + 16] / scale + 8.5f), 0, 15);
+        out[2 + i] = uchar(low | (high << 4));
     }
     maximum = 0.0f; signed_maximum = 0.0f;
     for (uint i = 0; i < 32; ++i) {
@@ -810,9 +810,9 @@ kernel void kv_append_decode_q4_0_vnorm(
     for (uint i = 0; i < 16; ++i) {
         float normalized_low = value[base + i] * inverse_rms;
         float normalized_high = value[base + i + 16] * inverse_rms;
-        int low = scale == 0.0f ? 0 : int(round(clamp(normalized_low / scale, -8.0f, 7.0f)));
-        int high = scale == 0.0f ? 0 : int(round(clamp(normalized_high / scale, -8.0f, 7.0f)));
-        out[2 + i] = uchar((low + 8) | ((high + 8) << 4));
+        int low = scale == 0.0f ? 0 : clamp(int(normalized_low / scale + 8.5f), 0, 15);
+        int high = scale == 0.0f ? 0 : clamp(int(normalized_high / scale + 8.5f), 0, 15);
+        out[2 + i] = uchar(low | (high << 4));
     }
 }
 
@@ -893,11 +893,13 @@ kernel void attention_decode_fused_gemma4_simd_f32(
     device const float *query [[buffer(0)]], device const float *cache [[buffer(1)]],
     device float *output [[buffer(2)]], constant uint &heads [[buffer(3)]],
     constant uint &kv_heads [[buffer(4)]], constant uint &head_dim [[buffer(5)]],
-    constant uint &capacity [[buffer(6)]], constant uint &key_count [[buffer(7)]],
+    constant uint &capacity [[buffer(6)]], constant uint &key_control [[buffer(7)]],
     uint head [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
     uint threads [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
     if (head >= heads) return;
+    uint key_start = key_control >> 16;
+    uint key_count = key_control & 0xffffu;
     uint kv_head = head / (heads / kv_heads);
     uint value_base = capacity * kv_heads * head_dim;
     threadgroup float simd_sums[4];
@@ -909,7 +911,8 @@ kernel void attention_decode_fused_gemma4_simd_f32(
     denominator = 0.0f;
     for (uint d = tid; d < head_dim; d += threads) output[head * head_dim + d] = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint key = 0; key < key_count; ++key) {
+    for (uint key_offset = 0; key_offset < key_count; ++key_offset) {
+        uint key = key_start + key_offset;
         float partial = 0.0f;
         uint key_base = key * kv_heads * head_dim + kv_head * head_dim;
         for (uint d = tid; d < head_dim; d += threads)
@@ -947,11 +950,13 @@ kernel void attention_decode_fused_gemma4_simd_q8_0(
     device const float *query [[buffer(0)]], device const uchar *cache [[buffer(1)]],
     device float *output [[buffer(2)]], constant uint &heads [[buffer(3)]],
     constant uint &kv_heads [[buffer(4)]], constant uint &head_dim [[buffer(5)]],
-    constant uint &capacity [[buffer(6)]], constant uint &key_count [[buffer(7)]],
+    constant uint &capacity [[buffer(6)]], constant uint &key_control [[buffer(7)]],
     uint head [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
     uint threads [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
     if (head >= heads) return;
+    uint key_start = key_control >> 16;
+    uint key_count = key_control & 0xffffu;
     uint kv_head = head / (heads / kv_heads);
     uint blocks_per_position = (kv_heads * head_dim) / 32;
     uint value_base = capacity * blocks_per_position;
@@ -959,7 +964,8 @@ kernel void attention_decode_fused_gemma4_simd_q8_0(
     maximum = -INFINITY; denominator = 0.0f;
     for (uint d = tid; d < head_dim; d += threads) output[head * head_dim + d] = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint key = 0; key < key_count; ++key) {
+    for (uint key_offset = 0; key_offset < key_count; ++key_offset) {
+        uint key = key_start + key_offset;
         float partial = 0.0f;
         uint key_element = key * kv_heads * head_dim + kv_head * head_dim;
         for (uint d = tid; d < head_dim; d += threads) {
@@ -981,11 +987,13 @@ kernel void attention_decode_fused_gemma4_simd_q4_0(
     device const float *query [[buffer(0)]], device const uchar *cache [[buffer(1)]],
     device float *output [[buffer(2)]], constant uint &heads [[buffer(3)]],
     constant uint &kv_heads [[buffer(4)]], constant uint &head_dim [[buffer(5)]],
-    constant uint &capacity [[buffer(6)]], constant uint &key_count [[buffer(7)]],
+    constant uint &capacity [[buffer(6)]], constant uint &key_control [[buffer(7)]],
     uint head [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
     uint threads [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
     if (head >= heads) return;
+    uint key_start = key_control >> 16;
+    uint key_count = key_control & 0xffffu;
     uint kv_head = head / (heads / kv_heads);
     uint blocks_per_position = (kv_heads * head_dim) / 32;
     uint value_base = capacity * blocks_per_position;
@@ -993,7 +1001,8 @@ kernel void attention_decode_fused_gemma4_simd_q4_0(
     maximum = -INFINITY; denominator = 0.0f;
     for (uint d = tid; d < head_dim; d += threads) output[head * head_dim + d] = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint key = 0; key < key_count; ++key) {
+    for (uint key_offset = 0; key_offset < key_count; ++key_offset) {
+        uint key = key_start + key_offset;
         float partial = 0.0f;
         uint key_element = key * kv_heads * head_dim + kv_head * head_dim;
         for (uint d = tid; d < head_dim; d += threads) { uint index = key_element + d; partial += query[head * head_dim + d] * kv_q4_0_value(cache + (index / 32) * 18, index % 32); }
@@ -1011,9 +1020,11 @@ kernel void attention_decode_fused_gemma4_simd_q4_0(
 // Exact-compatible Flash16 replacement. The previous flash16_uw kernels
 // partitioned keys into independently normalized slices and merged them. That
 // is mathematically sound but changes FP32 rounding enough to alter Gemma's
-// greedy stream. Keep the same four-SIMD reduction and key-ordered online
-// softmax sequence as the established Resident Q4 kernel, while specializing
-// the two Gemma head geometries at compile time.
+// greedy stream. Keep the same four-SIMD reduction, runtime Q·K accumulation,
+// and key-ordered online softmax sequence as the established Resident Q4
+// kernel. In particular, do not make the head width compile-time constant:
+// Metal may otherwise unroll or reassociate the partial dot product and alter
+// a later greedy token despite mathematically equivalent attention.
 #define FLASH16_VALUE_BARRIER threadgroup_barrier(mem_flags::mem_threadgroup);
 #define FLASH16_NO_VALUE_BARRIER
 #define DEFINE_FLASH16_EXACT(NAME, HEAD_DIM, VALUE_BARRIER) \
@@ -1021,23 +1032,27 @@ kernel void NAME( \
     device const float *query [[buffer(0)]], device const uchar *cache [[buffer(1)]], \
     device float *output [[buffer(2)]], constant uint &heads [[buffer(3)]], \
     constant uint &kv_heads [[buffer(4)]], constant uint &head_dim [[buffer(5)]], \
-    constant uint &capacity [[buffer(6)]], constant uint &key_count [[buffer(7)]], \
+    constant uint &capacity [[buffer(6)]], constant uint &key_control [[buffer(7)]], \
     uint head [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]], \
+    uint threads [[threads_per_threadgroup]], \
     uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]) { \
-    if (head >= heads || head_dim != HEAD_DIM) return; \
+    if (head >= heads) return; \
+    uint key_start = key_control >> 16; \
+    uint key_count = key_control & 0xffffu; \
     uint kv_head = head / (heads / kv_heads); \
-    uint blocks_per_position = (kv_heads * HEAD_DIM) / 32; \
+    uint blocks_per_position = (kv_heads * head_dim) / 32; \
     uint value_base = capacity * blocks_per_position; \
     threadgroup float simd_sums[4], maximum, denominator, rescale, weight; \
     maximum = -INFINITY; denominator = 0.0f; \
-    for (uint d = tid; d < HEAD_DIM; d += 128) output[head * HEAD_DIM + d] = 0.0f; \
+    for (uint d = tid; d < head_dim; d += threads) output[head * head_dim + d] = 0.0f; \
     threadgroup_barrier(mem_flags::mem_threadgroup); \
-    for (uint key = 0; key < key_count; ++key) { \
+    for (uint key_offset = 0; key_offset < key_count; ++key_offset) { \
+        uint key = key_start + key_offset; \
         float partial = 0.0f; \
-        uint key_element = key * kv_heads * HEAD_DIM + kv_head * HEAD_DIM; \
-        for (uint d = tid; d < HEAD_DIM; d += 128) { \
+        uint key_element = key * kv_heads * head_dim + kv_head * head_dim; \
+        for (uint d = tid; d < head_dim; d += threads) { \
             uint index = key_element + d; \
-            partial += query[head * HEAD_DIM + d] * kv_q4_0_value(cache + (index / 32) * 18, index % 32); \
+            partial += query[head * head_dim + d] * kv_q4_0_value(cache + (index / 32) * 18, index % 32); \
         } \
         float simd_total = simd_sum(partial); \
         if (lane == 0) simd_sums[simd_group] = simd_total; \
@@ -1051,18 +1066,22 @@ kernel void NAME( \
             } \
         } \
         threadgroup_barrier(mem_flags::mem_threadgroup); \
-        for (uint d = tid; d < HEAD_DIM; d += 128) { \
+        for (uint d = tid; d < head_dim; d += threads) { \
             uint index = key_element + d; \
-            output[head * HEAD_DIM + d] = output[head * HEAD_DIM + d] * rescale \
+            output[head * head_dim + d] = output[head * head_dim + d] * rescale \
                 + weight * kv_q4_0_value(cache + (value_base + index / 32) * 18, index % 32); \
         } \
         VALUE_BARRIER \
     } \
-    for (uint d = tid; d < HEAD_DIM; d += 128) output[head * HEAD_DIM + d] /= denominator; \
+    for (uint d = tid; d < head_dim; d += threads) output[head * head_dim + d] /= denominator; \
 }
 
 DEFINE_FLASH16_EXACT(attention_decode_gemma4_simd_q4_0_flash16_exact, 512, FLASH16_VALUE_BARRIER)
 DEFINE_FLASH16_EXACT(attention_decode_gemma4_simd_q4_0_flash16_swa_exact, 256, FLASH16_VALUE_BARRIER)
+// Keep these separately named exports while validating the runtime-loop
+// implementation. Generation metrics must identify the binary that ran.
+DEFINE_FLASH16_EXACT(attention_decode_gemma4_simd_q4_0_flash16_exact_runtime, 512, FLASH16_VALUE_BARRIER)
+DEFINE_FLASH16_EXACT(attention_decode_gemma4_simd_q4_0_flash16_swa_exact_runtime, 256, FLASH16_VALUE_BARRIER)
 DEFINE_FLASH16_EXACT(attention_decode_gemma4_simd_q4_0_flash16_exact_nb, 512, FLASH16_NO_VALUE_BARRIER)
 DEFINE_FLASH16_EXACT(attention_decode_gemma4_simd_q4_0_flash16_swa_exact_nb, 256, FLASH16_NO_VALUE_BARRIER)
 
