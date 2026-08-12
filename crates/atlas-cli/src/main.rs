@@ -81,6 +81,18 @@ struct GemmaBenchmarkArgs {
     q4_attention_mode: Gemma4Q4AttentionMode,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct GemmaMatchedBenchmarkArgs {
+    model_id: String,
+    prompt_tokens: usize,
+    decode_tokens: usize,
+    warmup_runs: usize,
+    runs: usize,
+    max_context: usize,
+    kv_cache_type: Gemma4KvCacheType,
+    q4_attention_mode: Gemma4Q4AttentionMode,
+}
+
 #[derive(Debug)]
 struct ModelManifest {
     models: Vec<ModelRecord>,
@@ -1388,6 +1400,9 @@ fn attention_dimensions(family: &str) -> (Option<AttentionKind>, Option<Attentio
 /// different EOS behavior still receive identical decode work.
 fn benchmark(args: &[String]) -> Result<()> {
     CHAT_INTERRUPTED.store(false, Ordering::Release);
+    if args.first().map(String::as_str) == Some("matched") {
+        return benchmark_matched(&args[1..]);
+    }
     let args = parse_benchmark_args(args)?;
     let record = resolve_model(&args.model_id)?;
     let model = load_verified_model(&record)?;
@@ -1503,6 +1518,127 @@ fn benchmark(args: &[String]) -> Result<()> {
     println!("{record}");
     eprintln!("Gemma fixed-workload benchmark: {GEMMA_FIXED_BENCHMARK_LOG}");
     Ok(())
+}
+
+fn benchmark_matched(args: &[String]) -> Result<()> {
+    CHAT_INTERRUPTED.store(false, Ordering::Release);
+    let args = parse_matched_benchmark_args(args)?;
+    let record = resolve_model(&args.model_id)?;
+    let model = load_verified_model(&record)?;
+    let mut executor = Gemma4E2bExecutor::new_with_kv_cache_and_q4_attention_mode(
+        &model,
+        args.max_context,
+        args.kv_cache_type,
+        args.q4_attention_mode,
+    )?;
+    let prompt = synthetic_prompt_of_token_count(&model, args.prompt_tokens)?;
+    let prompt_ids = model.tokenize(&prompt)?;
+    ensure!(
+        prompt_ids.len() == args.prompt_tokens,
+        "matched prompt synthesis produced {} tokens, expected {}",
+        prompt_ids.len(),
+        args.prompt_tokens
+    );
+    let prompt_token_digest = token_ids_sha256(&prompt_ids);
+    for run in 0..(args.warmup_runs + args.runs) {
+        executor.reset();
+        let generation = executor.generate_greedy_fixed_benchmark_window_stream(
+            &prompt,
+            0,
+            args.decode_tokens,
+            &CHAT_INTERRUPTED,
+            |_| Ok(()),
+        )?;
+        if run >= args.warmup_runs {
+            let measured = &generation.metrics.measured_scope;
+            let prefill_tok_s = rate(
+                generation.generation.prompt_token_ids.len(),
+                generation.metrics.prefill,
+            );
+            let decode_tok_s = rate(measured.completed_tokens, measured.wall_time);
+            let record = json!({
+                "event": "gemma4_matched_benchmark",
+                "benchmark_kind": "matched_engine_comparison",
+                "engine": "atlas",
+                "executor": "resident",
+                "model_id": record.id,
+                "format": "gguf-gemma4-q4_0",
+                "run_index": run - args.warmup_runs,
+                "prompt_tokens": generation.generation.prompt_token_ids.len(),
+                "decode_tokens": measured.completed_tokens,
+                "measured_generated_tokens": measured.completed_tokens,
+                "warmup_runs": args.warmup_runs,
+                "measured_runs": args.runs,
+                "kv_cache_type": generation.metrics.kv_cache_type.as_str(),
+                "q4_attention_mode": generation.metrics.q4_attention_mode.as_str(),
+                "attention_kernel": generation.metrics.attention_kernel,
+                "prompt_token_sha256": prompt_token_digest,
+                "generated_token_sha256": token_ids_sha256(&generation.generation.generated_token_ids),
+                "first_eos_position": generation.first_eos_position,
+                "prefill_tok_s": prefill_tok_s,
+                "decode_tok_s": decode_tok_s,
+                "prefill_ms": generation.metrics.prefill.as_secs_f64() * 1000.0,
+                "decode_ms": measured.wall_time.as_secs_f64() * 1000.0,
+                "host_wall_time_ms": generation.metrics.host_wall_time.as_secs_f64() * 1000.0,
+                "resident_bytes": generation.metrics.resident_bytes,
+                "kv_cache_bytes": generation.metrics.kv_cache_bytes,
+                "weight_upload_bytes": generation.metrics.weight_upload_bytes,
+                "readback_bytes": generation.metrics.readback_bytes,
+                "command_buffers": generation.metrics.command_buffers,
+                "measured_decode_command_buffers": measured.telemetry.command_buffers,
+                "measured_decode_dispatch_calls": measured.telemetry.dispatches,
+                "measured_decode_gpu_ms": measured.telemetry.gpu_execution_nanos as f64 / 1_000_000.0,
+                "prefill_path": generation.metrics.prefill_path,
+                "prefill_chunk_size": generation.metrics.prefill_chunk_size,
+                "prefill_chunks": generation.metrics.prefill_chunks,
+                "timing": {
+                    "prefill_ms": generation.metrics.prefill.as_secs_f64() * 1000.0,
+                    "decode_ms": measured.wall_time.as_secs_f64() * 1000.0,
+                    "host_ms": generation.metrics.host_wall_time.as_secs_f64() * 1000.0,
+                },
+            });
+            println!("{record}");
+        }
+    }
+    eprintln!(
+        "Gemma matched benchmark: {} runs ({} warmup + {} measured) at pp={} tg={}",
+        args.runs + args.warmup_runs,
+        args.warmup_runs,
+        args.runs,
+        args.prompt_tokens,
+        args.decode_tokens
+    );
+    Ok(())
+}
+
+/// Build a deterministic synthetic prompt that tokenizes to exactly `target`
+/// tokens. llama-bench drives both engines with a synthetic prompt of the
+/// requested length, so the matched Atlas workload uses the same shape rather
+/// than a natural-language prompt whose token count is only approximate.
+fn synthetic_prompt_of_token_count(model: &Gemma4E2bModel, target: usize) -> Result<String> {
+    ensure!(target > 0, "matched prompt token count must be positive");
+    let filler = "quality";
+    let mut text = String::new();
+    let mut guard = 0usize;
+    loop {
+        let count = model.tokenize(&text)?.len();
+        match count.cmp(&target) {
+            std::cmp::Ordering::Less => {
+                text.push(' ');
+                text.push_str(filler);
+            }
+            std::cmp::Ordering::Greater => {
+                text.truncate(text.len().saturating_sub(filler.len() + 1));
+            }
+            std::cmp::Ordering::Equal => break,
+        }
+        guard += 1;
+        ensure!(
+            guard < 100_000,
+            "synthetic prompt synthesis did not converge"
+        );
+    }
+    Ok(text)
 }
 
 fn token_ids_sha256(tokens: &[u32]) -> String {
@@ -1702,6 +1838,104 @@ fn parse_benchmark_args(args: &[String]) -> Result<GemmaBenchmarkArgs> {
         prompt: prompt.context("--prompt is required")?,
         warmup_decode_tokens,
         measured_decode_tokens: decode_tokens.context("--decode-tokens is required")?,
+        max_context,
+        kv_cache_type,
+        q4_attention_mode,
+    })
+}
+
+fn parse_matched_benchmark_args(args: &[String]) -> Result<GemmaMatchedBenchmarkArgs> {
+    let mut model = None;
+    let mut prompt_tokens = None;
+    let mut decode_tokens = None;
+    let mut warmup_runs = 1;
+    let mut runs = 5;
+    let mut max_context = 4096;
+    let mut kv_cache_type = Gemma4KvCacheType::Q4_0;
+    let mut q4_attention_mode = Gemma4Q4AttentionMode::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--model" => {
+                i += 1;
+                model = args.get(i).cloned();
+            }
+            "--prompt-tokens" => {
+                i += 1;
+                prompt_tokens = Some(
+                    args.get(i)
+                        .context("--prompt-tokens needs a value")?
+                        .parse()?,
+                );
+            }
+            "--decode-tokens" => {
+                i += 1;
+                let value: usize = args
+                    .get(i)
+                    .context("--decode-tokens needs a value")?
+                    .parse()?;
+                ensure!(value > 0, "--decode-tokens must be positive");
+                decode_tokens = Some(value);
+            }
+            "--warmup-runs" => {
+                i += 1;
+                warmup_runs = args
+                    .get(i)
+                    .context("--warmup-runs needs a value")?
+                    .parse()?;
+            }
+            "--runs" => {
+                i += 1;
+                runs = args.get(i).context("--runs needs a value")?.parse()?;
+            }
+            "--greedy" => {}
+            "--output-format" => {
+                i += 1;
+                let format = args.get(i).context("--output-format needs a value")?;
+                ensure!(
+                    format == "json",
+                    "matched benchmark supports --output-format json"
+                );
+            }
+            "--max-context" => {
+                i += 1;
+                max_context = args
+                    .get(i)
+                    .context("--max-context needs a value")?
+                    .parse()?;
+            }
+            "--kv-cache-type" => {
+                i += 1;
+                kv_cache_type = Gemma4KvCacheType::parse(
+                    args.get(i).context("--kv-cache-type needs a value")?,
+                )?;
+            }
+            "--q4-attention-mode" => {
+                i += 1;
+                q4_attention_mode = Gemma4Q4AttentionMode::parse(
+                    args.get(i).context("--q4-attention-mode needs a value")?,
+                )?;
+            }
+            flag => bail!("unknown matched benchmark option: {flag}"),
+        }
+        i += 1;
+    }
+    ensure!(
+        prompt_tokens.is_some(),
+        "--prompt-tokens is required for the matched benchmark"
+    );
+    ensure!(
+        decode_tokens.is_some(),
+        "--decode-tokens is required for the matched benchmark"
+    );
+    ensure!(runs > 0, "--runs must be positive");
+    ensure!(max_context > 0, "--max-context must be positive");
+    Ok(GemmaMatchedBenchmarkArgs {
+        model_id: model.context("--model is required")?,
+        prompt_tokens: prompt_tokens.context("--prompt-tokens is required")?,
+        decode_tokens: decode_tokens.context("--decode-tokens is required")?,
+        warmup_runs,
+        runs,
         max_context,
         kv_cache_type,
         q4_attention_mode,
@@ -2072,8 +2306,8 @@ fn metal_info() -> Result<()> {
 mod kv_cache_cli_tests {
     use super::{
         Gemma4KvCacheType, Gemma4Q4AttentionMode, GpuCountersMode, ThoughtFilter,
-        attention_dimensions, parse_benchmark_args, parse_chat_args, parse_profile_args,
-        profiler_operation_family, token_ids_sha256, visible_chat_completion,
+        attention_dimensions, parse_benchmark_args, parse_chat_args, parse_matched_benchmark_args,
+        parse_profile_args, profiler_operation_family, token_ids_sha256, visible_chat_completion,
     };
     use atlas_profiler::{AttentionKind, AttentionScanPass, OperationFamily};
 
@@ -2329,5 +2563,64 @@ mod kv_cache_cli_tests {
             visible_chat_completion(&format!("{prompt}Hello.<turn|>"), prompt),
             "Hello."
         );
+    }
+
+    #[test]
+    fn matched_benchmark_requires_prompt_and_decode_counts() {
+        let full = vec![
+            "--model".to_owned(),
+            "gemma4-e2b-q4_0".to_owned(),
+            "--prompt-tokens".to_owned(),
+            "512".to_owned(),
+            "--decode-tokens".to_owned(),
+            "128".to_owned(),
+            "--warmup-runs".to_owned(),
+            "1".to_owned(),
+            "--runs".to_owned(),
+            "5".to_owned(),
+            "--greedy".to_owned(),
+            "--kv-cache-type".to_owned(),
+            "q4_0".to_owned(),
+            "--output-format".to_owned(),
+            "json".to_owned(),
+        ];
+        let parsed = parse_matched_benchmark_args(&full).expect("parse matched benchmark");
+        assert_eq!(parsed.model_id, "gemma4-e2b-q4_0");
+        assert_eq!(parsed.prompt_tokens, 512);
+        assert_eq!(parsed.decode_tokens, 128);
+        assert_eq!(parsed.warmup_runs, 1);
+        assert_eq!(parsed.runs, 5);
+        assert_eq!(parsed.kv_cache_type, Gemma4KvCacheType::Q4_0);
+
+        let missing_prompt = vec![
+            "--model".to_owned(),
+            "gemma4-e2b-q4_0".to_owned(),
+            "--decode-tokens".to_owned(),
+            "128".to_owned(),
+        ];
+        assert!(parse_matched_benchmark_args(&missing_prompt).is_err());
+
+        let missing_decode = vec![
+            "--model".to_owned(),
+            "gemma4-e2b-q4_0".to_owned(),
+            "--prompt-tokens".to_owned(),
+            "512".to_owned(),
+        ];
+        assert!(parse_matched_benchmark_args(&missing_decode).is_err());
+    }
+
+    #[test]
+    fn matched_benchmark_rejects_non_json_output_format() {
+        let args = vec![
+            "--model".to_owned(),
+            "gemma4-e2b-q4_0".to_owned(),
+            "--prompt-tokens".to_owned(),
+            "512".to_owned(),
+            "--decode-tokens".to_owned(),
+            "128".to_owned(),
+            "--output-format".to_owned(),
+            "csv".to_owned(),
+        ];
+        assert!(parse_matched_benchmark_args(&args).is_err());
     }
 }
