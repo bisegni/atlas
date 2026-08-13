@@ -147,3 +147,76 @@ fn batch_16row_matches_cpu_oracle() {
         );
     }
 }
+
+#[test]
+fn batch_32row_matches_batch_16row_within_tolerance() {
+    let runtime = match MetalRuntime::new() {
+        Ok(runtime) => runtime,
+        Err(MetalError::NoDevice) => {
+            eprintln!("skipping: no Metal device is available to this process");
+            return;
+        }
+        Err(error) => panic!("Metal runtime should initialize: {error}"),
+    };
+    let mut state = 0x2f6b_a1c9u32;
+    // Same geometries as the CPU-oracle test plus the real 2304/16384 shapes.
+    // The weight-stationary tile interleaves four per-token accumulator chains,
+    // which changes Metal's instruction selection by ~1 ulp (measured max-abs
+    // ~4.7e-10) while keeping each token's block-sequential accumulation order.
+    // This is well inside the phase contract (max-abs < 1e-3) shared with the
+    // CPU-oracle test; the greedy stream hash on the matched pp512 workload was
+    // verified byte-identical (`f23c2962…`).
+    for (batch, input_width, output_width) in [
+        (8u32, 128u32, 128u32),
+        (8u32, 256u32, 512u32),
+        (8u32, 2048u32, 128u32),
+        (16u32, 2048u32, 2304u32),
+        (4u32, 2304u32, 4096u32),
+        (2u32, 16384u32, 2304u32),
+        (3u32, 2048u32, 137u32),
+        (1u32, 512u32, 96u32),
+    ] {
+        let blocks = (input_width / 32) as usize;
+        let mut input = vec![0.0f32; (batch * input_width) as usize];
+        fill_f32(&mut input, &mut state);
+        let weights = build_q4_weights(output_width as usize, blocks, &mut state);
+        let input_buf = runtime.upload_f32(&input).unwrap();
+        let weights_buf = runtime.upload_bytes(&weights).unwrap();
+        let input_width_buf = runtime.upload_u32(&[input_width]).unwrap();
+        let output_width_buf = runtime.upload_u32(&[output_width]).unwrap();
+        let batch_buf = runtime.upload_u32(&[batch]).unwrap();
+        let output_len = (batch * output_width) as usize;
+
+        let run =
+            |kernel: &'static str, tile_tokens: usize, rows_per_group: usize, threads: usize| {
+                let out_buf = runtime.upload_f32(&vec![0.0f32; output_len]).unwrap();
+                let mut command = runtime.begin_resident_command().unwrap();
+                command
+                    .dispatch_threadgroups_1d_at(
+                        kernel,
+                        &[
+                            (&input_buf, 0),
+                            (&weights_buf, 0),
+                            (&out_buf, 0),
+                            (&input_width_buf, 0),
+                            (&output_width_buf, 0),
+                            (&batch_buf, 0),
+                        ],
+                        (batch as usize).div_ceil(tile_tokens)
+                            * (output_width as usize).div_ceil(rows_per_group),
+                        threads,
+                    )
+                    .unwrap();
+                command.finish().unwrap();
+                runtime.read_f32(&out_buf, output_len).unwrap()
+            };
+
+        let reference = run("matmul_q4_0_batch_16row", 1, 16, 128);
+        let candidate = run("matmul_q4_0_batch_32row", 4, 32, 256);
+        compare(
+            &format!("batch_32row batch={batch} input={input_width} output={output_width}"),
+            &reference,
+            &candidate,
+        );
+    }
+}

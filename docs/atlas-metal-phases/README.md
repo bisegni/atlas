@@ -6,6 +6,14 @@ Silicon with the required numerical or performance evidence recorded.
 
 ## Current phase
 
+- [phase-13.6-prefill-batched-gemm.md](phase-13.6-prefill-batched-gemm.md) —
+  Weight-stationary q4 batched GEMM for prefill: `matmul_q4_0_batch_32row`
+  tiles 4 tokens × 32 rows per threadgroup so each weight block is read once
+  and reused in registers, cutting prefill weight traffic ~4×. Prefill +60–70%
+  (~190 → ~308–322 tok/s flat at pp100/512/1024), closing the llama.cpp prefill
+  gap from ~8× to ~4–5× with a byte-identical greedy stream hash. Parity is
+  tolerance-level (max-abs ~4.7e-10, user-approved; the bitwise token-major
+  variant measured only +5%).
 - [phase-13.3-flash16-staged-kv-scan.md](phase-13.3-flash16-staged-kv-scan.md) —
   Decode improvement D2 (gap analysis): staged, chunked, exact-ordered decode
   attention KV scan with wide (512 full / 256 swa) threadgroups. Acceptance

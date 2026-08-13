@@ -1045,8 +1045,16 @@ pub(crate) fn gemma4_q4_gate_up_projection_kernel() -> &'static str {
 }
 
 fn gemma4_q4_batch_projection_kernel() -> &'static str {
-    "matmul_q4_0_batch_16row"
+    "matmul_q4_0_batch_32row"
 }
+
+/// Rows per threadgroup (and matching thread count) for the Q4 batched
+/// prefill GEMM, plus the weight-stationary batch tile (tokens per
+/// threadgroup).  Must stay in sync with `gemma4_q4_batch_projection_kernel`
+/// and the kernel's own layout constants.
+const GEMMA4_Q4_BATCH_ROWS_PER_GROUP: usize = 32;
+const GEMMA4_Q4_BATCH_THREADS: usize = 256;
+const GEMMA4_BATCH_TILE_TOKENS: usize = 4;
 
 pub(crate) fn gemma4_ffn_down_projection_kernel() -> &'static str {
     "matvec_q4_0_64row_mv"
@@ -1849,8 +1857,11 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 kernel,
                 Some("layer_major_batched_projection"),
                 buffers,
-                batch_value * output_width_value.div_ceil(16),
-                128,
+                batch_value
+                    .div_ceil(GEMMA4_BATCH_TILE_TOKENS)
+                    .checked_mul(output_width_value.div_ceil(GEMMA4_Q4_BATCH_ROWS_PER_GROUP))
+                    .context("Gemma batched Q4 projection grid overflows")?,
+                GEMMA4_Q4_BATCH_THREADS,
             )?,
             GgufTensorType::Q6K => command.dispatch_threadgroups_1d_labeled(
                 kernel,
@@ -1887,8 +1898,11 @@ impl<'a> Gemma4E2bExecutor<'a> {
             kernel,
             Some("layer_major_batched_ffn_down_projection"),
             &[input, weight, output, input_width, output_width, batch],
-            batch_value * output_width_value.div_ceil(16),
-            128,
+            batch_value
+                .div_ceil(GEMMA4_BATCH_TILE_TOKENS)
+                .checked_mul(output_width_value.div_ceil(GEMMA4_Q4_BATCH_ROWS_PER_GROUP))
+                .context("Gemma batched Q4 ffn-down grid overflows")?,
+            GEMMA4_Q4_BATCH_THREADS,
         )?;
         Ok(())
     }

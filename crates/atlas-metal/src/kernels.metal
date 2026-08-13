@@ -318,6 +318,84 @@ kernel void matmul_q4_0_batch_16row(
         output[token * output_width + row] = sum;
 }
 
+// Batched prefill GEMM with a weight-stationary batch tile (phase 13.6).
+// The reference (matmul_q4_0_batch_16row) reads each weight row once per
+// token, so a pp512 prompt reads the whole weight matrix 512 times.  This
+// kernel instead has each threadgroup compute GEMMA4_BATCH_TILE_TOKENS tokens
+// for its 32 output rows, reading the shared weight block once and reusing it
+// across those tokens.  Each token's dot product still accumulates
+// block-sequentially with the identical `in * q * scale` expression and the
+// identical shuffle_xor(4,2,1) butterfly, so the per-token FP32 output is
+// bitwise-identical to the reference (verified by batch_matmul_parity.rs).
+// Out-of-range token pointers are clamped so the reads stay in bounds; their
+// results are discarded by the per-token write guard.
+#define GEMMA4_BATCH_TILE_TOKENS 4
+kernel void matmul_q4_0_batch_32row(
+    device const float *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
+    constant uint &output_width [[buffer(4)]], constant uint &batch [[buffer(5)]],
+    uint group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    uint simdgroup = tid / 32;
+    uint lane = tid % 32;
+    uint row_in_simd = lane / 8;
+    uint column = lane % 8;
+    uint rows_per_batch = (output_width + 31) / 32;
+    uint token_group = group / rows_per_batch;
+    uint group_row = group % rows_per_batch;
+    uint row = group_row * 32 + simdgroup * 4 + row_in_simd;
+    uint base_token = token_group * GEMMA4_BATCH_TILE_TOKENS;
+    uint last = batch - 1;
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+    if (row < output_width) {
+        uint blocks = input_width / 32;
+        device const float *tin0 = input + min(base_token + 0, last) * input_width;
+        device const float *tin1 = input + min(base_token + 1, last) * input_width;
+        device const float *tin2 = input + min(base_token + 2, last) * input_width;
+        device const float *tin3 = input + min(base_token + 3, last) * input_width;
+        for (uint block = 0; block < blocks; ++block) {
+            device const uchar *base = weights + (row * blocks + block) * 18;
+            float scale = float(*(device const half *)base);
+            uchar packed0 = base[2 + column];
+            uchar packed1 = base[2 + column + 8];
+            uint off = block * 32 + column;
+            sum0 += tin0[off] * float(int(packed0 & 15) - 8) * scale;
+            sum0 += tin0[off + 8] * float(int(packed1 & 15) - 8) * scale;
+            sum0 += tin0[off + 16] * float(int(packed0 >> 4) - 8) * scale;
+            sum0 += tin0[off + 24] * float(int(packed1 >> 4) - 8) * scale;
+            sum1 += tin1[off] * float(int(packed0 & 15) - 8) * scale;
+            sum1 += tin1[off + 8] * float(int(packed1 & 15) - 8) * scale;
+            sum1 += tin1[off + 16] * float(int(packed0 >> 4) - 8) * scale;
+            sum1 += tin1[off + 24] * float(int(packed1 >> 4) - 8) * scale;
+            sum2 += tin2[off] * float(int(packed0 & 15) - 8) * scale;
+            sum2 += tin2[off + 8] * float(int(packed1 & 15) - 8) * scale;
+            sum2 += tin2[off + 16] * float(int(packed0 >> 4) - 8) * scale;
+            sum2 += tin2[off + 24] * float(int(packed1 >> 4) - 8) * scale;
+            sum3 += tin3[off] * float(int(packed0 & 15) - 8) * scale;
+            sum3 += tin3[off + 8] * float(int(packed1 & 15) - 8) * scale;
+            sum3 += tin3[off + 16] * float(int(packed0 >> 4) - 8) * scale;
+            sum3 += tin3[off + 24] * float(int(packed1 >> 4) - 8) * scale;
+        }
+    }
+    sum0 += simd_shuffle_xor(sum0, 4);
+    sum0 += simd_shuffle_xor(sum0, 2);
+    sum0 += simd_shuffle_xor(sum0, 1);
+    sum1 += simd_shuffle_xor(sum1, 4);
+    sum1 += simd_shuffle_xor(sum1, 2);
+    sum1 += simd_shuffle_xor(sum1, 1);
+    sum2 += simd_shuffle_xor(sum2, 4);
+    sum2 += simd_shuffle_xor(sum2, 2);
+    sum2 += simd_shuffle_xor(sum2, 1);
+    sum3 += simd_shuffle_xor(sum3, 4);
+    sum3 += simd_shuffle_xor(sum3, 2);
+    sum3 += simd_shuffle_xor(sum3, 1);
+    if (column == 0 && row < output_width) {
+        if (base_token + 0 < batch) output[(base_token + 0) * output_width + row] = sum0;
+        if (base_token + 1 < batch) output[(base_token + 1) * output_width + row] = sum1;
+        if (base_token + 2 < batch) output[(base_token + 2) * output_width + row] = sum2;
+        if (base_token + 3 < batch) output[(base_token + 3) * output_width + row] = sum3;
+    }
+}
+
 
 
 
