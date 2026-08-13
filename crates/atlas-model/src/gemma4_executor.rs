@@ -1076,7 +1076,7 @@ fn gemma4_q4_batch_projection_kernel() -> &'static str {
 /// and the kernel's own layout constants.
 const GEMMA4_Q4_BATCH_ROWS_PER_GROUP: usize = 32;
 const GEMMA4_Q4_BATCH_THREADS: usize = 256;
-const GEMMA4_BATCH_TILE_TOKENS: usize = 4;
+const GEMMA4_BATCH_TILE_TOKENS: usize = 8;
 
 pub(crate) fn gemma4_ffn_down_projection_kernel() -> &'static str {
     "matvec_q4_0_64row_mv"

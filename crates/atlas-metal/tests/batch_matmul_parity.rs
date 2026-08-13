@@ -212,7 +212,7 @@ fn batch_32row_matches_batch_16row_within_tolerance() {
             };
 
         let reference = run("matmul_q4_0_batch_16row", 1, 16, 128);
-        let candidate = run("matmul_q4_0_batch_32row", 4, 32, 256);
+        let candidate = run("matmul_q4_0_batch_32row", 8, 32, 256);
         compare(
             &format!("batch_32row batch={batch} input={input_width} output={output_width}"),
             &reference,
