@@ -321,13 +321,15 @@ combination with R2/R3.
 
 Status as of phase-13.3 (D1 + D2 landed): prefill is ~200 tok/s flat across
 prompt sizes, and decode attention is now the staged exact-ordered v3 kernel
-(D2, −12.7% decode GPU at pp512) on top of the no-value-barrier default (D1,
-−8.6%). **Decode is the remaining gap** — ~24.0 tok/s at the matched pp512
-workload (was 19.6 at phase-13.1 / 21.4 at phase-13.2). This
-section re-measures the decode baseline and prioritizes the concrete work,
-superseding the generic R2–R5 ordering for decode.
+with wide threadgroups (D2, −31.6% decode GPU at pp512) on top of the
+no-value-barrier default (D1, −8.6%). **Decode is the remaining gap** — ~31.0
+tok/s at the matched pp512 workload (was 19.6 at phase-13.1 / 21.4 at
+phase-13.2). This section re-measures the decode baseline and prioritizes the
+concrete work, superseding the generic R2–R5 ordering for decode.
 
 ### Measured decode baseline (matched pp512, tg128, q4_0 KV, Resident)
+
+Historical phase-13.1 baseline (the pre-D1/D2 root cause):
 
 | Metric | Atlas | llama.cpp (`tg`) | Ratio |
 |---|---:|---:|---:|
@@ -338,6 +340,19 @@ superseding the generic R2–R5 ordering for decode.
 
 Source: `artifacts/phase-13.1/matched-benchmark-pp512-tg128.jsonl` (five-run;
 19.59–19.79 tok/s, decode GPU 6403–6471 ms/128 tokens, 70,104 dispatches).
+
+Current decode baseline after D2 (phase-13.3, wide v3 kernel, five-run):
+
+| Metric | Atlas | llama.cpp (`tg`) | Ratio |
+|---|---:|---:|---:|
+| Decode tok/s | 31.0 | 80.7 | 2.6× |
+| Decode ms/128 tokens (GPU) | 4034.6 | 1585.6 | 2.5× |
+| Dispatches/token | 547.7 | — | — |
+| × memory-bandwidth floor (5.8 ms/token) | ~6.9× | ~2.1× | — |
+
+The dispatch count is unchanged (kernel swap only); the win is per-kernel
+latency. The honest ratio is below 2.6× because llama-bench `tg` decodes from
+an empty context (see caveats).
 
 ### Kernel breakdown (decode profile, per token)
 
@@ -456,6 +471,37 @@ The 64-row family cut threadgroups 18% but moved GPU ~1%. Re-measure only
 after D1–D3; the floor becomes the limit when the small-kernel overhead is
 gone.
 
+### Next improvements (decision 2026-08-12): prefill-first vs decode-first
+
+Two candidate improvements remain. Measured time share at the matched
+workload (same GGUF, `q4_0` KV, `artifacts/atlas-vs-llama/` re-measured after
+R1/D1/D2):
+
+| Workload | Atlas total | Prefill share | Decode share | Absolute gap vs llama: prefill | decode |
+|---|---:|---:|---:|---:|---:|
+| pp512 + tg128 | 6.9s | 39% | 61% | 2.38s | 2.65s |
+| pp1024 + tg128 | 10.5s | 54% | 46% | 4.98s | 3.16s |
+
+- **Decode is the closer, cheaper gap (recommended next).** The hard part of
+  decode — the exact-FP32 greedy-parity constraint — is already solved by D2;
+  the remaining **D3** (dispatch fusion: PLE batching 106 → ~2 disp/token,
+  attn-out/ffn-down epilogue fusion) is well-specified with the parity-gate
+  infrastructure in place, and decode dominates generation wall time.
+- **Prefill has a cheap quick-win available: stage the prefill batched
+  attention kernel.** `attention_decode_fused_gemma4_simd_q4_0_batch`
+  (`kernels.metal`, `DEFINE_SIMD_ATTENTION_BATCH`) still scans keys serially
+  with the per-key barrier pair that D2 removed from decode. Applying the same
+  staged, exact-ordered chunked scan keeps the token-batched grid while cutting
+  the per-key barriers; this is the same low-risk technique, not a new GEMM.
+  Closing the *rest* of the prefill gap (Atlas ~190 tok/s vs llama.cpp
+  ~1150–1670 tok/s, `n_ubatch=512`) would require a from-scratch
+  llama.cpp-grade high-occupancy q4 batched GEMM, since
+  `matmul_q4_0_batch_16row` runs at roughly 1/9 the effective FLOP rate.
+- **Decision:** pursue **decode D3** for generation wall time; the **prefill
+  attention staging** quick-win can be done in parallel or first if TTFT /
+  long-prompt latency is the priority. Prefill-first is only justified for
+  large-prompt workloads, where the prefill absolute gap dominates.
+
 ### Execution order (decode)
 
 **D1 first** — ~8%, parity-proven, one-line binding change. **D2** when
@@ -474,6 +520,8 @@ decode GPU −8.6%. **D2 (landed, phase-13.3)** — staged, chunked, exact-order
 attention KV scan with wide threadgroups; decode GPU −31.6% at pp512 with a
 byte-identical stream (24 → 31 tok/s at pp512). **Decode dispatch count
 (547/token) and the remaining matvec/epilogue kernels are now the bottleneck**:
-follow **D3** next. **R2** is already in production. **R4/R5** map to D2/D4.
-Any new decode kernel must keep the exact FP32 accumulation order (greedy-stream
-hash `f23c2962…` is the drift sentinel).
+follow **D3** next, with the prefill batched-attention staging quick-win as the
+parallel/alternative prefill-first option (see "Next improvements" above).
+**R2** is already in production. **R4/R5** map to D2/D4. Any new decode kernel
+must keep the exact FP32 accumulation order (greedy-stream hash `f23c2962…` is
+the drift sentinel).
