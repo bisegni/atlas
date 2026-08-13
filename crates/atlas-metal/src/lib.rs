@@ -914,6 +914,8 @@ mod macos {
                 "attention_decode_gemma4_simd_q4_0_flash16_swa_exact_runtime",
                 "attention_decode_gemma4_simd_q4_0_flash16_exact_nb",
                 "attention_decode_gemma4_simd_q4_0_flash16_swa_exact_nb",
+                "attention_decode_gemma4_simd_q4_0_flash16_exact_v3",
+                "attention_decode_gemma4_simd_q4_0_flash16_swa_exact_v3",
                 "gelu_multiply_f32",
                 "matvec_q4_0_64row_mv",
                 "matvec_q4_0_64row_mv_rms",

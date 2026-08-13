@@ -1350,6 +1350,127 @@ DEFINE_FLASH16_EXACT(attention_decode_gemma4_simd_q4_0_flash16_swa_exact_runtime
 DEFINE_FLASH16_EXACT(attention_decode_gemma4_simd_q4_0_flash16_exact_nb, 512, FLASH16_NO_VALUE_BARRIER)
 DEFINE_FLASH16_EXACT(attention_decode_gemma4_simd_q4_0_flash16_swa_exact_nb, 256, FLASH16_NO_VALUE_BARRIER)
 
+// Flash16 v3 (gap-analysis D2): staged, chunked, exact-ordered KV scan.  The
+// reference kernels scan keys serially with two threadgroup barriers per key
+// and a device-memory output round trip per key.  This version keeps the exact
+// FP32 arithmetic -- per-thread dims d = tid + k*threads, the same simd_sum,
+// the same p0+p1+p2+p3 fold, the same key-ordered online softmax, and the same
+// per-dim value chain -- but stages the per-key SIMD partials and the
+// online-softmax rescale/weight sequence through threadgroup memory so the
+// score reduction covers the full key range under a single running
+// maximum/denominator (no slice merging, no rounding change).  A chunk of
+// FLASH16_V3_CHUNK keys is scanned in three barrier-separated passes: (A) all
+// threads compute raw per-key partials, (B) thread 0 folds and runs the online
+// softmax, (C) all threads apply the register-resident value chain.  Per-key
+// barriers drop from ~2 to ~3 per chunk and the value accumulator stays in
+// registers across the whole scan, so the output is byte-identical to the
+// reference while memory latency is hidden across keys.  Requires exactly 128
+// threads per threadgroup (4 SIMD groups per key), matching the resident
+// dispatch; head_dim is runtime so Metal cannot unroll or reassociate the
+// partial dot products.
+#define FLASH16_V3_CHUNK 128
+#define DEFINE_FLASH16_EXACT_V3(NAME) \
+kernel void NAME( \
+    device const float *query [[buffer(0)]], device const uchar *cache [[buffer(1)]], \
+    device float *output [[buffer(2)]], constant uint &heads [[buffer(3)]], \
+    constant uint &kv_heads [[buffer(4)]], constant uint &head_dim [[buffer(5)]], \
+    constant uint &capacity [[buffer(6)]], constant uint &key_control [[buffer(7)]], \
+    uint head [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]], \
+    uint threads [[threads_per_threadgroup]], \
+    uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]) { \
+    if (head >= heads) return; \
+    uint key_start = key_control >> 16; \
+    uint key_count = key_control & 0xffffu; \
+    uint kv_head = head / (heads / kv_heads); \
+    uint blocks_per_position = (kv_heads * head_dim) / 32; \
+    uint value_base = capacity * blocks_per_position; \
+    if (key_count == 0) { \
+        for (uint d = tid; d < head_dim; d += threads) output[head * head_dim + d] = 0.0f; \
+        return; \
+    } \
+    threadgroup float partials[FLASH16_V3_CHUNK][4]; \
+    threadgroup float rescale[FLASH16_V3_CHUNK]; \
+    threadgroup float weight[FLASH16_V3_CHUNK]; \
+    threadgroup float maximum, denominator; \
+    maximum = -INFINITY; denominator = 0.0f; \
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f; \
+    float acc4 = 0.0f, acc5 = 0.0f, acc6 = 0.0f, acc7 = 0.0f; \
+    uint key_offset = 0; \
+    while (key_offset < key_count) { \
+        uint chunk = (key_count - key_offset) < FLASH16_V3_CHUNK ? (key_count - key_offset) : FLASH16_V3_CHUNK; \
+        for (uint c = 0; c < chunk; ++c) { \
+            uint key = key_start + key_offset + c; \
+            float partial = 0.0f; \
+            uint key_element = key * kv_heads * head_dim + kv_head * head_dim; \
+            for (uint d = tid; d < head_dim; d += threads) { \
+                uint index = key_element + d; \
+                partial += query[head * head_dim + d] * kv_q4_0_value(cache + (index / 32) * 18, index % 32); \
+            } \
+            float simd_total = simd_sum(partial); \
+            if (lane == 0 && simd_group < 4) partials[c][simd_group] = simd_total; \
+        } \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+        if (tid == 0) { \
+            for (uint c = 0; c < chunk; ++c) { \
+                float score = partials[c][0] + partials[c][1] + partials[c][2] + partials[c][3]; \
+                float r, w; \
+                if (score > maximum) { \
+                    r = exp(maximum - score); w = 1.0f; maximum = score; denominator = denominator * r + w; \
+                } else { \
+                    r = 1.0f; w = exp(score - maximum); denominator += w; \
+                } \
+                rescale[c] = r; weight[c] = w; \
+            } \
+        } \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+        for (uint c = 0; c < chunk; ++c) { \
+            uint key = key_start + key_offset + c; \
+            float r = rescale[c]; \
+            float w = weight[c]; \
+            uint key_element = key * kv_heads * head_dim + kv_head * head_dim; \
+            uint d = tid; \
+            acc0 = acc0 * r + w * kv_q4_0_value(cache + (value_base + (key_element + d) / 32) * 18, (key_element + d) % 32); \
+            d += threads; \
+            if (d < head_dim) acc1 = acc1 * r + w * kv_q4_0_value(cache + (value_base + (key_element + d) / 32) * 18, (key_element + d) % 32); \
+            d += threads; \
+            if (d < head_dim) acc2 = acc2 * r + w * kv_q4_0_value(cache + (value_base + (key_element + d) / 32) * 18, (key_element + d) % 32); \
+            d += threads; \
+            if (d < head_dim) acc3 = acc3 * r + w * kv_q4_0_value(cache + (value_base + (key_element + d) / 32) * 18, (key_element + d) % 32); \
+            d += threads; \
+            if (d < head_dim) acc4 = acc4 * r + w * kv_q4_0_value(cache + (value_base + (key_element + d) / 32) * 18, (key_element + d) % 32); \
+            d += threads; \
+            if (d < head_dim) acc5 = acc5 * r + w * kv_q4_0_value(cache + (value_base + (key_element + d) / 32) * 18, (key_element + d) % 32); \
+            d += threads; \
+            if (d < head_dim) acc6 = acc6 * r + w * kv_q4_0_value(cache + (value_base + (key_element + d) / 32) * 18, (key_element + d) % 32); \
+            d += threads; \
+            if (d < head_dim) acc7 = acc7 * r + w * kv_q4_0_value(cache + (value_base + (key_element + d) / 32) * 18, (key_element + d) % 32); \
+        } \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+        key_offset += chunk; \
+    } \
+    { \
+        uint d = tid; \
+        if (d < head_dim) output[head * head_dim + d] = acc0 / denominator; \
+        d += threads; \
+        if (d < head_dim) output[head * head_dim + d] = acc1 / denominator; \
+        d += threads; \
+        if (d < head_dim) output[head * head_dim + d] = acc2 / denominator; \
+        d += threads; \
+        if (d < head_dim) output[head * head_dim + d] = acc3 / denominator; \
+        d += threads; \
+        if (d < head_dim) output[head * head_dim + d] = acc4 / denominator; \
+        d += threads; \
+        if (d < head_dim) output[head * head_dim + d] = acc5 / denominator; \
+        d += threads; \
+        if (d < head_dim) output[head * head_dim + d] = acc6 / denominator; \
+        d += threads; \
+        if (d < head_dim) output[head * head_dim + d] = acc7 / denominator; \
+    } \
+}
+
+DEFINE_FLASH16_EXACT_V3(attention_decode_gemma4_simd_q4_0_flash16_exact_v3)
+DEFINE_FLASH16_EXACT_V3(attention_decode_gemma4_simd_q4_0_flash16_swa_exact_v3)
+
 
 
 

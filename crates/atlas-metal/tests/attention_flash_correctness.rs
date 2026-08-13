@@ -253,6 +253,12 @@ fn flash16_exact_variants_match_legacy_fused_bitwise() {
             &[48, 256, 1024, 2048][..],
         ),
         (
+            "full-512-exact-v3",
+            512u32,
+            "attention_decode_gemma4_simd_q4_0_flash16_exact_v3",
+            &[48, 256, 1024, 2048][..],
+        ),
+        (
             "swa-256-exact",
             256u32,
             "attention_decode_gemma4_simd_q4_0_flash16_swa_exact_runtime",
@@ -262,6 +268,12 @@ fn flash16_exact_variants_match_legacy_fused_bitwise() {
             "swa-256-exact-no-value-barrier",
             256u32,
             "attention_decode_gemma4_simd_q4_0_flash16_swa_exact_nb",
+            &[48, 128, 256][..],
+        ),
+        (
+            "swa-256-exact-v3",
+            256u32,
+            "attention_decode_gemma4_simd_q4_0_flash16_swa_exact_v3",
             &[48, 128, 256][..],
         ),
     ];

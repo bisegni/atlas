@@ -303,10 +303,11 @@ combination with R2/R3.
 
 ## Decode improvement recommendations (measured 2026-08-12, phase 13.2+)
 
-Status as of phase-13.2 (D1 landed): prefill is ~200 tok/s flat across prompt
-sizes and the q4 attention default is the no-value-barrier flash16 kernel
-(~8.6% decode GPU, byte-identical stream). **Decode is the remaining gap** —
-~21.4 tok/s at the matched pp512 workload (was 19.6 tok/s at phase-13.1). This
+Status as of phase-13.3 (D1 + D2 landed): prefill is ~200 tok/s flat across
+prompt sizes, and decode attention is now the staged exact-ordered v3 kernel
+(D2, −12.7% decode GPU at pp512) on top of the no-value-barrier default (D1,
+−8.6%). **Decode is the remaining gap** — ~24.0 tok/s at the matched pp512
+workload (was 19.6 at phase-13.1 / 21.4 at phase-13.2). This
 section re-measures the decode baseline and prioritizes the concrete work,
 superseding the generic R2–R5 ordering for decode.
 
@@ -378,6 +379,19 @@ at `attention_decode_gemma4_simd_q4_0_flash16_exact_nb` /
 
 ### D2 — Vectorize the attention KV scan (R4, the largest lever)
 
+> Status 2026-08-12: **D2 is implemented** (phase-13.3). The default q4 decode
+> attention is now the staged, chunked v3 kernel
+> (`attention_decode_gemma4_simd_q4_0_flash16_exact_v3` /
+> `_swa_exact_v3`): three barrier-separated passes per 128-key chunk (score →
+> fold/online-softmax → register-resident value chain) eliminate the ~2
+> per-key threadgroup barriers and the per-key device output round trip while
+> preserving LegacyFused's exact FP32 order byte-for-byte. Decode GPU −12.7%
+> at the matched pp512/tg128 workload (5900.5 → 5150.2 ms/128 tokens, 21.4 →
+> 24.0 tok/s) with a byte-identical greedy stream (`f23c2962…`); decode is
+> 47/24/20 tok/s at pp100/512/1024 (was 41/19/16). The `_nb` kernel stays
+> reachable via `--q4-attention-mode flash16_exact`. Evidence under
+> `artifacts/phase-13.3/`.
+
 **Problem.** The dominant cost. Both attention kernels scan keys serially with
 a per-key threadgroup barrier and online-softmax value update, re-reading the
 KV range per slice; cost grows with context (decode 41→19→16 tok/s at
@@ -437,7 +451,9 @@ the floor measurement is honest.
 **R1 (landed, phase-13.1)** — batched prefill kernels; prefill 49.6 → ~200
 tok/s at pp512 with a byte-identical greedy stream. **D1 (landed,
 phase-13.2)** — q4 attention defaults to the no-value-barrier flash16 kernel,
-decode GPU −8.6%. **Decode work is now the bottleneck**: follow **D2** →
-**D3** above. **R2** is already in production. **R4/R5** map to D2/D4. Any new
+decode GPU −8.6%. **D2 (landed, phase-13.3)** — staged, chunked, exact-ordered
+attention KV scan; decode GPU −12.7% more at pp512 with a byte-identical
+stream. **Decode dispatch count (547/token) is now the bottleneck**: follow
+**D3** next. **R2** is already in production. **R4/R5** map to D2/D4. Any new
 decode kernel must keep the exact FP32 accumulation order (greedy-stream hash
 `f23c2962…` is the drift sentinel).

@@ -419,7 +419,8 @@ fn gemma4_decode_uses_unfused_vnorm() -> bool {
 /// dot-product, reduction, and key-ordered online-softmax ordering. The
 /// no-value-barrier (`_nb`) variants drop only the redundant per-key
 /// `threadgroup_barrier` after the value update, so they produce byte-identical
-/// output to the `_exact_runtime` and LegacyFused kernels.
+/// output to the `_exact_runtime` and LegacyFused kernels. Kept selectable as
+/// the `flash16_exact` diagnostic path.
 fn gemma4_q4_flash16_binding(sliding: bool) -> (&'static str, &'static str, u32) {
     if sliding {
         (
@@ -430,6 +431,25 @@ fn gemma4_q4_flash16_binding(sliding: bool) -> (&'static str, &'static str, u32)
     } else {
         (
             "attention_decode_gemma4_simd_q4_0_flash16_exact_nb",
+            "gemma_attention_flash16",
+            128,
+        )
+    }
+}
+
+/// Flash16 v3 (gap-analysis D2) bindings: the staged, chunked KV scan that is
+/// byte-identical to `_nb`/LegacyFused while eliminating the ~2 per-key
+/// threadgroup barriers and the per-key device-memory output round trip.
+fn gemma4_q4_flash16_v3_binding(sliding: bool) -> (&'static str, &'static str, u32) {
+    if sliding {
+        (
+            "attention_decode_gemma4_simd_q4_0_flash16_swa_exact_v3",
+            "gemma_attention_flash16_swa",
+            128,
+        )
+    } else {
+        (
+            "attention_decode_gemma4_simd_q4_0_flash16_exact_v3",
             "gemma_attention_flash16",
             128,
         )
@@ -483,14 +503,17 @@ impl Gemma4KvCacheType {
 
 /// Decode attention implementation for Q4 KV caches.
 ///
-/// `Flash16` is the production Resident default: the no-value-barrier
-/// flash16 kernel preserves LegacyFused's four-SIMD reduction and key-ordered
-/// online softmax byte-for-byte while dropping the redundant per-key value
-/// barrier (~8% decode GPU, see phase 13.2). `LegacyFused` remains selectable
-/// as the explicit diagnostic path; neither mode is a CPU fallback.
+/// `Flash16` is the production Resident default: the staged v3 flash16 kernel
+/// preserves LegacyFused's four-SIMD reduction and key-ordered online softmax
+/// byte-for-byte while dropping the ~2 per-key threadgroup barriers and the
+/// per-key device output round trip (phase 13.3, gap-analysis D2).
+/// `Flash16Exact` selects the `_nb` no-value-barrier kernel (the phase-13.2
+/// default) as the explicit diagnostic path, and `LegacyFused` remains the
+/// diagnostic reference; neither is a CPU fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gemma4Q4AttentionMode {
     Flash16,
+    Flash16Exact,
     LegacyFused,
 }
 
@@ -504,10 +527,11 @@ impl Gemma4Q4AttentionMode {
     pub fn parse(value: &str) -> Result<Self> {
         match value {
             "flash16" => Ok(Self::Flash16),
+            "flash16_exact" => Ok(Self::Flash16Exact),
             "legacy_fused" => Ok(Self::LegacyFused),
             _ => {
                 anyhow::bail!(
-                    "unknown Gemma Q4 attention mode `{value}`; expected flash16 or legacy_fused"
+                    "unknown Gemma Q4 attention mode `{value}`; expected flash16, flash16_exact, or legacy_fused"
                 )
             }
         }
@@ -516,6 +540,7 @@ impl Gemma4Q4AttentionMode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Flash16 => "flash16",
+            Self::Flash16Exact => "flash16_exact",
             Self::LegacyFused => "legacy_fused",
         }
     }
@@ -985,11 +1010,18 @@ fn gemma4_attention_kernel(
     sliding: bool,
     q4_attention_mode: Gemma4Q4AttentionMode,
 ) -> &'static str {
-    if q4_attention_mode == Gemma4Q4AttentionMode::Flash16
-        && cache_type == Gemma4KvCacheType::Q4_0
+    if cache_type == Gemma4KvCacheType::Q4_0
         && gemma4_q4_flash16_supported(attention_heads, full_head_dim)
     {
-        return gemma4_q4_flash16_binding(sliding).0;
+        match q4_attention_mode {
+            Gemma4Q4AttentionMode::Flash16 => {
+                return gemma4_q4_flash16_v3_binding(sliding).0;
+            }
+            Gemma4Q4AttentionMode::Flash16Exact => {
+                return gemma4_q4_flash16_binding(sliding).0;
+            }
+            Gemma4Q4AttentionMode::LegacyFused => {}
+        }
     }
     gemma4_attention_binding(cache_type).0
 }
@@ -2349,7 +2381,10 @@ impl<'a> Gemma4E2bExecutor<'a> {
         let mut token_latency = prefill;
         let trace_logit_digests = std::env::var_os("ATLAS_GEMMA4_TRACE_LOGIT_DIGESTS").is_some();
         let trace_flash16 = std::env::var_os("ATLAS_GEMMA4_TRACE_FLASH16").is_some()
-            && self.q4_attention_mode == Gemma4Q4AttentionMode::Flash16;
+            && matches!(
+                self.q4_attention_mode,
+                Gemma4Q4AttentionMode::Flash16 | Gemma4Q4AttentionMode::Flash16Exact
+            );
         let trace_layer_states = self.layer_state_trace.is_some();
         let trace_activation_summary = trace_flash16 || trace_layer_states;
         let trace_token_index = gemma4_trace_token_index()?;
@@ -3663,11 +3698,14 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 .context("Gemma attention control-table offset overflows")?;
             let (attention_kernel, attention_threads) =
                 gemma4_attention_binding(self.kv_cache_type);
-            let flash16_binding = if self.q4_attention_mode == Gemma4Q4AttentionMode::Flash16
-                && self.kv_cache_type == Gemma4KvCacheType::Q4_0
+            let flash16_binding = if self.kv_cache_type == Gemma4KvCacheType::Q4_0
                 && gemma4_q4_flash16_supported(c.attention_heads, head)
             {
-                Some(gemma4_q4_flash16_binding(sliding))
+                match self.q4_attention_mode {
+                    Gemma4Q4AttentionMode::Flash16 => Some(gemma4_q4_flash16_v3_binding(sliding)),
+                    Gemma4Q4AttentionMode::Flash16Exact => Some(gemma4_q4_flash16_binding(sliding)),
+                    Gemma4Q4AttentionMode::LegacyFused => None,
+                }
             } else {
                 None
             };
@@ -3945,10 +3983,14 @@ mod tests {
     }
 
     #[test]
-    fn q4_attention_mode_defaults_to_flash16_with_legacy_fused_diagnostic() {
+    fn q4_attention_mode_defaults_to_flash16_with_diagnostic_variants() {
         assert_eq!(
             Gemma4Q4AttentionMode::parse("flash16").unwrap(),
             Gemma4Q4AttentionMode::Flash16
+        );
+        assert_eq!(
+            Gemma4Q4AttentionMode::parse("flash16_exact").unwrap(),
+            Gemma4Q4AttentionMode::Flash16Exact
         );
         assert_eq!(
             Gemma4Q4AttentionMode::parse("legacy_fused").unwrap(),
@@ -3966,6 +4008,16 @@ mod tests {
                 512,
                 false,
                 Gemma4Q4AttentionMode::default(),
+            ),
+            "attention_decode_gemma4_simd_q4_0_flash16_exact_v3"
+        );
+        assert_eq!(
+            gemma4_attention_kernel(
+                Gemma4KvCacheType::Q4_0,
+                8,
+                512,
+                false,
+                Gemma4Q4AttentionMode::Flash16Exact,
             ),
             "attention_decode_gemma4_simd_q4_0_flash16_exact_nb"
         );

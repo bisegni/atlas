@@ -316,7 +316,7 @@ fn q4_kv_flash16_matches_legacy_resident_attention_across_chat_and_long_decode()
         );
         assert_eq!(
             fast_generation.metrics.attention_kernel,
-            "attention_decode_gemma4_simd_q4_0_flash16_exact_nb"
+            "attention_decode_gemma4_simd_q4_0_flash16_exact_v3"
         );
         assert_eq!(
             legacy_generation.metrics.attention_kernel,
