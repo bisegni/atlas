@@ -439,19 +439,21 @@ fn gemma4_q4_flash16_binding(sliding: bool) -> (&'static str, &'static str, u32)
 
 /// Flash16 v3 (gap-analysis D2) bindings: the staged, chunked KV scan that is
 /// byte-identical to `_nb`/LegacyFused while eliminating the ~2 per-key
-/// threadgroup barriers and the per-key device-memory output round trip.
+/// threadgroup barriers and the per-key device-memory output round trip.  The
+/// wide threadgroups (512 full / 256 swa threads per head) give the staged
+/// kernel several independent key chains in flight to hide KV memory latency.
 fn gemma4_q4_flash16_v3_binding(sliding: bool) -> (&'static str, &'static str, u32) {
     if sliding {
         (
             "attention_decode_gemma4_simd_q4_0_flash16_swa_exact_v3",
             "gemma_attention_flash16_swa",
-            128,
+            256,
         )
     } else {
         (
             "attention_decode_gemma4_simd_q4_0_flash16_exact_v3",
             "gemma_attention_flash16",
-            128,
+            512,
         )
     }
 }

@@ -382,14 +382,17 @@ at `attention_decode_gemma4_simd_q4_0_flash16_exact_nb` /
 > Status 2026-08-12: **D2 is implemented** (phase-13.3). The default q4 decode
 > attention is now the staged, chunked v3 kernel
 > (`attention_decode_gemma4_simd_q4_0_flash16_exact_v3` /
-> `_swa_exact_v3`): three barrier-separated passes per 128-key chunk (score →
-> fold/online-softmax → register-resident value chain) eliminate the ~2
-> per-key threadgroup barriers and the per-key device output round trip while
-> preserving LegacyFused's exact FP32 order byte-for-byte. Decode GPU −12.7%
-> at the matched pp512/tg128 workload (5900.5 → 5150.2 ms/128 tokens, 21.4 →
-> 24.0 tok/s) with a byte-identical greedy stream (`f23c2962…`); decode is
-> 47/24/20 tok/s at pp100/512/1024 (was 41/19/16). The `_nb` kernel stays
-> reachable via `--q4-attention-mode flash16_exact`. Evidence under
+> `_swa_exact_v3`) with wide threadgroups (512 full / 256 swa per head):
+> three barrier-separated passes per 128-key chunk (score → fold/online-softmax
+> → register-resident value chain) eliminate the ~2 per-key threadgroup
+> barriers and the per-key device output round trip while preserving
+> LegacyFused's exact FP32 order byte-for-byte, and the wide launch keeps
+> several independent key chains in flight to hide KV memory latency. Decode
+> GPU −31.6% at the matched pp512/tg128 workload (5900.5 → 4034.6 ms/128
+> tokens, 21.4 → 31.0 tok/s) with a byte-identical greedy stream
+> (`f23c2962…`); decode is 53.6/31.0/27.4 tok/s at pp100/512/1024 (was
+> 41/19/16). The `_nb` kernel stays reachable via
+> `--q4-attention-mode flash16_exact`. Evidence under
 > `artifacts/phase-13.3/`.
 
 **Problem.** The dominant cost. Both attention kernels scan keys serially with
@@ -452,8 +455,9 @@ the floor measurement is honest.
 tok/s at pp512 with a byte-identical greedy stream. **D1 (landed,
 phase-13.2)** — q4 attention defaults to the no-value-barrier flash16 kernel,
 decode GPU −8.6%. **D2 (landed, phase-13.3)** — staged, chunked, exact-ordered
-attention KV scan; decode GPU −12.7% more at pp512 with a byte-identical
-stream. **Decode dispatch count (547/token) is now the bottleneck**: follow
-**D3** next. **R2** is already in production. **R4/R5** map to D2/D4. Any new
-decode kernel must keep the exact FP32 accumulation order (greedy-stream hash
-`f23c2962…` is the drift sentinel).
+attention KV scan with wide threadgroups; decode GPU −31.6% at pp512 with a
+byte-identical stream (24 → 31 tok/s at pp512). **Decode dispatch count
+(547/token) and the remaining matvec/epilogue kernels are now the bottleneck**:
+follow **D3** next. **R2** is already in production. **R4/R5** map to D2/D4.
+Any new decode kernel must keep the exact FP32 accumulation order (greedy-stream
+hash `f23c2962…` is the drift sentinel).

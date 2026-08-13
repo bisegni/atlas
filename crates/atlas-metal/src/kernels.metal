@@ -1353,21 +1353,23 @@ DEFINE_FLASH16_EXACT(attention_decode_gemma4_simd_q4_0_flash16_swa_exact_nb, 256
 // Flash16 v3 (gap-analysis D2): staged, chunked, exact-ordered KV scan.  The
 // reference kernels scan keys serially with two threadgroup barriers per key
 // and a device-memory output round trip per key.  This version keeps the exact
-// FP32 arithmetic -- per-thread dims d = tid + k*threads, the same simd_sum,
-// the same p0+p1+p2+p3 fold, the same key-ordered online softmax, and the same
-// per-dim value chain -- but stages the per-key SIMD partials and the
-// online-softmax rescale/weight sequence through threadgroup memory so the
-// score reduction covers the full key range under a single running
-// maximum/denominator (no slice merging, no rounding change).  A chunk of
-// FLASH16_V3_CHUNK keys is scanned in three barrier-separated passes: (A) all
-// threads compute raw per-key partials, (B) thread 0 folds and runs the online
-// softmax, (C) all threads apply the register-resident value chain.  Per-key
-// barriers drop from ~2 to ~3 per chunk and the value accumulator stays in
-// registers across the whole scan, so the output is byte-identical to the
-// reference while memory latency is hidden across keys.  Requires exactly 128
-// threads per threadgroup (4 SIMD groups per key), matching the resident
-// dispatch; head_dim is runtime so Metal cannot unroll or reassociate the
-// partial dot products.
+// FP32 arithmetic -- per-thread dims d = t128 + k*128 within each 128-thread
+// score group, the same simd_sum, the same p0+p1+p2+p3 fold, the same
+// key-ordered online softmax, and the same per-dim value chain -- but stages
+// the per-key SIMD partials and the online-softmax rescale/weight sequence
+// through threadgroup memory so the score reduction covers the full key range
+// under a single running maximum/denominator (no slice merging, no rounding
+// change).  A chunk of FLASH16_V3_CHUNK keys is scanned in three
+// barrier-separated passes: (A) all threads compute raw per-key partials with
+// `threads / 128` keys in parallel per iteration (the query is cached in
+// registers), (B) thread 0 folds and runs the online softmax, (C) all threads
+// apply the register-resident value chain spread over the full threadgroup
+// width.  Per-key barriers drop from ~2 to ~3 per chunk, the value accumulator
+// stays in registers, and the wide threadgroup gives several independent key
+// chains in flight, so the output is byte-identical to the reference while
+// memory latency is hidden across keys and threads.  Requires threads to be a
+// positive multiple of 128 (128/256/512 per the resident dispatch); head_dim
+// is runtime so Metal cannot unroll or reassociate the partial dot products.
 #define FLASH16_V3_CHUNK 128
 #define DEFINE_FLASH16_EXACT_V3(NAME) \
 kernel void NAME( \
@@ -1393,21 +1395,48 @@ kernel void NAME( \
     threadgroup float weight[FLASH16_V3_CHUNK]; \
     threadgroup float maximum, denominator; \
     maximum = -INFINITY; denominator = 0.0f; \
+    const uint wide = threads / 128; \
+    const uint t_key = tid / 128; \
+    const uint t128 = tid % 128; \
+    uint head_base = head * head_dim; \
+    float q0 = query[head_base + t128]; \
+    float q1 = (t128 + 128 < head_dim) ? query[head_base + t128 + 128] : 0.0f; \
+    float q2 = (t128 + 256 < head_dim) ? query[head_base + t128 + 256] : 0.0f; \
+    float q3 = (t128 + 384 < head_dim) ? query[head_base + t128 + 384] : 0.0f; \
+    float q4 = (t128 + 512 < head_dim) ? query[head_base + t128 + 512] : 0.0f; \
+    float q5 = (t128 + 640 < head_dim) ? query[head_base + t128 + 640] : 0.0f; \
+    float q6 = (t128 + 768 < head_dim) ? query[head_base + t128 + 768] : 0.0f; \
+    float q7 = (t128 + 896 < head_dim) ? query[head_base + t128 + 896] : 0.0f; \
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f; \
     float acc4 = 0.0f, acc5 = 0.0f, acc6 = 0.0f, acc7 = 0.0f; \
     uint key_offset = 0; \
     while (key_offset < key_count) { \
         uint chunk = (key_count - key_offset) < FLASH16_V3_CHUNK ? (key_count - key_offset) : FLASH16_V3_CHUNK; \
-        for (uint c = 0; c < chunk; ++c) { \
-            uint key = key_start + key_offset + c; \
-            float partial = 0.0f; \
-            uint key_element = key * kv_heads * head_dim + kv_head * head_dim; \
-            for (uint d = tid; d < head_dim; d += threads) { \
-                uint index = key_element + d; \
-                partial += query[head * head_dim + d] * kv_q4_0_value(cache + (index / 32) * 18, index % 32); \
+        for (uint c = 0; c < chunk; c += wide) { \
+            uint batch = (chunk - c) < wide ? (chunk - c) : wide; \
+            if (t_key < batch) { \
+                uint key = key_start + key_offset + c + t_key; \
+                float partial = 0.0f; \
+                uint key_element = key * kv_heads * head_dim + kv_head * head_dim; \
+                uint d = t128; \
+                partial += q0 * kv_q4_0_value(cache + ((key_element + d) / 32) * 18, (key_element + d) % 32); \
+                d += 128; \
+                if (d < head_dim) partial += q1 * kv_q4_0_value(cache + ((key_element + d) / 32) * 18, (key_element + d) % 32); \
+                d += 128; \
+                if (d < head_dim) partial += q2 * kv_q4_0_value(cache + ((key_element + d) / 32) * 18, (key_element + d) % 32); \
+                d += 128; \
+                if (d < head_dim) partial += q3 * kv_q4_0_value(cache + ((key_element + d) / 32) * 18, (key_element + d) % 32); \
+                d += 128; \
+                if (d < head_dim) partial += q4 * kv_q4_0_value(cache + ((key_element + d) / 32) * 18, (key_element + d) % 32); \
+                d += 128; \
+                if (d < head_dim) partial += q5 * kv_q4_0_value(cache + ((key_element + d) / 32) * 18, (key_element + d) % 32); \
+                d += 128; \
+                if (d < head_dim) partial += q6 * kv_q4_0_value(cache + ((key_element + d) / 32) * 18, (key_element + d) % 32); \
+                d += 128; \
+                if (d < head_dim) partial += q7 * kv_q4_0_value(cache + ((key_element + d) / 32) * 18, (key_element + d) % 32); \
+                float simd_total = simd_sum(partial); \
+                if (lane == 0) partials[c + t_key][simd_group % 4] = simd_total; \
             } \
-            float simd_total = simd_sum(partial); \
-            if (lane == 0 && simd_group < 4) partials[c][simd_group] = simd_total; \
         } \
         threadgroup_barrier(mem_flags::mem_threadgroup); \
         if (tid == 0) { \
@@ -1450,21 +1479,21 @@ kernel void NAME( \
     } \
     { \
         uint d = tid; \
-        if (d < head_dim) output[head * head_dim + d] = acc0 / denominator; \
+        if (d < head_dim) output[head_base + d] = acc0 / denominator; \
         d += threads; \
-        if (d < head_dim) output[head * head_dim + d] = acc1 / denominator; \
+        if (d < head_dim) output[head_base + d] = acc1 / denominator; \
         d += threads; \
-        if (d < head_dim) output[head * head_dim + d] = acc2 / denominator; \
+        if (d < head_dim) output[head_base + d] = acc2 / denominator; \
         d += threads; \
-        if (d < head_dim) output[head * head_dim + d] = acc3 / denominator; \
+        if (d < head_dim) output[head_base + d] = acc3 / denominator; \
         d += threads; \
-        if (d < head_dim) output[head * head_dim + d] = acc4 / denominator; \
+        if (d < head_dim) output[head_base + d] = acc4 / denominator; \
         d += threads; \
-        if (d < head_dim) output[head * head_dim + d] = acc5 / denominator; \
+        if (d < head_dim) output[head_base + d] = acc5 / denominator; \
         d += threads; \
-        if (d < head_dim) output[head * head_dim + d] = acc6 / denominator; \
+        if (d < head_dim) output[head_base + d] = acc6 / denominator; \
         d += threads; \
-        if (d < head_dim) output[head * head_dim + d] = acc7 / denominator; \
+        if (d < head_dim) output[head_base + d] = acc7 / denominator; \
     } \
 }
 

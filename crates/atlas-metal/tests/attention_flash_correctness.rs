@@ -245,39 +245,59 @@ fn flash16_exact_variants_match_legacy_fused_bitwise() {
             512u32,
             "attention_decode_gemma4_simd_q4_0_flash16_exact_runtime",
             &[48, 256, 1024, 2048][..],
+            128,
         ),
         (
             "full-512-exact-no-value-barrier",
             512u32,
             "attention_decode_gemma4_simd_q4_0_flash16_exact_nb",
             &[48, 256, 1024, 2048][..],
+            128,
         ),
         (
             "full-512-exact-v3",
             512u32,
             "attention_decode_gemma4_simd_q4_0_flash16_exact_v3",
             &[48, 256, 1024, 2048][..],
+            128,
+        ),
+        (
+            "full-512-exact-v3-wide512",
+            512u32,
+            "attention_decode_gemma4_simd_q4_0_flash16_exact_v3",
+            &[48, 256, 1024, 2048][..],
+            512,
         ),
         (
             "swa-256-exact",
             256u32,
             "attention_decode_gemma4_simd_q4_0_flash16_swa_exact_runtime",
             &[48, 128, 256][..],
+            128,
         ),
         (
             "swa-256-exact-no-value-barrier",
             256u32,
             "attention_decode_gemma4_simd_q4_0_flash16_swa_exact_nb",
             &[48, 128, 256][..],
+            128,
         ),
         (
             "swa-256-exact-v3",
             256u32,
             "attention_decode_gemma4_simd_q4_0_flash16_swa_exact_v3",
             &[48, 128, 256][..],
+            128,
+        ),
+        (
+            "swa-256-exact-v3-wide256",
+            256u32,
+            "attention_decode_gemma4_simd_q4_0_flash16_swa_exact_v3",
+            &[48, 128, 256][..],
+            256,
         ),
     ];
-    for (label, head_dim, flash_kernel, key_counts) in scenarios {
+    for (label, head_dim, flash_kernel, key_counts, threads) in scenarios {
         let query = build_query(head_dim);
         for key_count in key_counts {
             for rising in [false, true] {
@@ -294,7 +314,7 @@ fn flash16_exact_variants_match_legacy_fused_bitwise() {
                 let exact = run_flash16(
                     &runtime,
                     flash_kernel,
-                    128,
+                    threads,
                     &query,
                     &cache,
                     head_dim,
