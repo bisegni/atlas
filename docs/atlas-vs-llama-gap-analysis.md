@@ -516,20 +516,26 @@ R1/D1/D2):
   "Dispatch-fusion verdict" under D3). The remaining decode levers are the
   attention KV scan at longer context (D2 re-run at 8k+) and the matvec
   bandwidth after the small-kernel overhead is removed.
-- **Prefill has a cheap quick-win available: stage the prefill batched
-  attention kernel.** `attention_decode_fused_gemma4_simd_q4_0_batch`
-  (`kernels.metal`, `DEFINE_SIMD_ATTENTION_BATCH`) still scans keys serially
-  with the per-key barrier pair that D2 removed from decode. Applying the same
-  staged, exact-ordered chunked scan keeps the token-batched grid while cutting
-  the per-key barriers; this is the same low-risk technique, not a new GEMM.
-  Closing the *rest* of the prefill gap (Atlas ~190 tok/s vs llama.cpp
-  ~1150–1670 tok/s, `n_ubatch=512`) would require a from-scratch
-  llama.cpp-grade high-occupancy q4 batched GEMM, since
-  `matmul_q4_0_batch_16row` runs at roughly 1/9 the effective FLOP rate.
-- **Decision:** pursue **decode D3** for generation wall time; the **prefill
-  attention staging** quick-win can be done in parallel or first if TTFT /
-  long-prompt latency is the priority. Prefill-first is only justified for
-  large-prompt workloads, where the prefill absolute gap dominates.
+- **Prefill attention staging (attempted, phase-13.5, reverted): measured as a
+  regression.** The staged flash16 batch kernel
+  (`attention_decode_gemma4_simd_q4_0_flash16_batch_exact_v3`, byte-identical
+  to `…_q4_0_batch`) replaced the per-key barrier pair with ~3 per 128-key
+  chunk, but prefill *fell* 190 → 170 tok/s (256-thread launch) and 190 → 181
+  tok/s (128-thread) at matched pp512. **Root cause: prefill's grid is already
+  batch × heads (4096 threadgroups at pp512), so the GPU hides per-key latency
+  across tokens; the staged kernel's ~3 KiB threadgroup-memory footprint only
+  reduces occupancy.** The prefill gap is not attention-barrier-bound — it is
+  the q4 batched-GEMM efficiency (`matmul_q4_0_batch_16row` runs at roughly
+  1/9 llama.cpp's effective FLOP rate). That is the only remaining prefill
+  lever, and it is a from-scratch high-occupancy q4 batched matmul, not a
+  dispatch/barrier change.
+- **Decision:** with both D3 (decode dispatch fusion) and the prefill attention
+  staging measured as regressions/washes, the remaining levers are: (1) the
+  **decode attention KV scan at longer context** (D2 re-run at 8k+, where
+  attention is O(n) and dominates), and (2) a **from-scratch high-occupancy q4
+  batched GEMM** for prefill (the only way to close the 8× prefill gap).
+  Prefill-first is only justified for large-prompt workloads, where the
+  prefill absolute gap dominates.
 
 ### Execution order (decode)
 
@@ -552,8 +558,11 @@ attention KV scan with wide threadgroups; decode GPU −31.6% at pp512 with a
 byte-identical stream (24 → 31 tok/s at pp512). **D3 (attempted, phase-13.4,
 reverted)** — dispatch fusion is a measured wash: decode is GPU-latency-bound
 (attention ~60% + matvec family), so removing dispatches only trims the
-host-encode that is already hidden behind GPU wait. The next levers are the
-**prefill batched-attention staging** quick-win (same staged technique as D2)
-and attention at longer context. **R2** is already in production. **R4/R5**
-map to D2/D4. Any new decode kernel must keep the exact FP32 accumulation order
+host-encode that is already hidden behind GPU wait. **Prefill attention
+staging (attempted, phase-13.5, reverted)** — measured as a regression: the
+prefill grid already hides per-key latency across its 4096 threadgroups, so
+the staged scan's threadgroup footprint only reduces occupancy. The remaining
+levers are attention at longer context and a from-scratch high-occupancy q4
+batched GEMM for prefill. **R2** is already in production. **R4/R5** map to
+D2/D4. Any new decode kernel must keep the exact FP32 accumulation order
 (greedy-stream hash `f23c2962…` is the drift sentinel).
