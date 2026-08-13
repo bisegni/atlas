@@ -7,15 +7,47 @@ remaining gap after decode reached ~1.1–1.3× (phase-13.7 Path B). Target:
 prefill ~311 → **~600–1000+ tok/s** (gap → ~1.5–2.5×), keeping the Path B
 max-abs < 1e-3 tolerance contract.
 
-## Current bottleneck
+## Current bottleneck (measured per-kernel profile, 454-token prompt)
 
-`matmul_q4_0_batch_32row` (phase-13.6) is a weight-stationary 4-token × 32-row
-tile that reads each weight block once and reuses it in registers across four
-tokens (4 independent accumulator chains). It cut prefill weight re-reads 4×
-and gave real ILP, but prefill is still compute/latency-bound (≈570× the pure
-read floor): the K-reduction is scalar FMAs, while llama.cpp's Metal backend
-uses **hardware `simdgroup_matrix_multiply`** with dequantized fp16 blocks and
-fp32 accumulation — the fundamental ~4–6× GEMM throughput advantage.
+| Prefill family | GPU ms | Share |
+|---|---:|---:|
+| `layer_major_batched_projection` (qkv, gate_up, attn_out) | 938 | 65.6% |
+| `layer_major_batched_ffn_down_projection` | 289 | 20.2% |
+| `layer_major_batched_attention` | 165 | 11.5% |
+| everything else | ~1% | |
+
+The q4 batched GEMM (`matmul_q4_0_batch_32row`) is **86% of prefill GPU**. It
+runs at ~4× the weight-bandwidth floor (~370 ms: weights read once per 8-token
+tile) and ~4× the compute floor (~350 ms with the dequant CSE'd across the 8
+tokens). It is latency/occupancy-bound.
+
+## Levers measured (2026-08-13)
+
+| Approach | Prefill tok/s (pp512) | Verdict |
+|---|---:|---|
+| weight-stationary tile-4 (phase-13.6) | ~311 | +60% landed |
+| tile-8 | ~318 | +2% landed (best scalar) |
+| tile-16 | ~263 | −17% register-pressure spills |
+| tile-8 + software prefetch | ~280 | −12% compiler already pipelines |
+| matrix units fp32 8×8 | ~199 | slower + max-abs 7e-3 > 1e-3 |
+| matrix units fp16 8×8 (Option B) | ~224 | slower + max-abs 2.6–6.5e-2, stream drifts |
+
+## Conclusion
+
+Every structural lever is exhausted within the 1e-3 contract: wider tiles and
+prefetch regress (registers/pipeline), and the M2's 8×8 matrix units (the only
+size this toolchain exposes) are slower than the scalar tile once q4
+dequant + threadgroup staging + barriers are paid, and fp16 breaks the
+tolerance. The realistic remaining options are:
+
+1. **Accept ~4–5× prefill gap** (decode is at parity; prefill 318 tok/s is a
+   defensible stopping point).
+2. **fp16 pre-dequantized weights + fp16 matrix path** (llama-grade): dequantize
+   q4 → fp16 once per prompt into a device buffer so the GEMM needs no
+   per-chunk dequant/barrier, and accept a ~1e-2 prefill tolerance (llama.cpp's
+   own accuracy level). This is a firm contract decision and the only route to
+   llama-grade prefill numbers.
+3. **Scalar micro-tuning** (occupancy/register reduction) — marginal, ~5–15%.
 
 ## Steps
 
