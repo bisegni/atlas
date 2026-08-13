@@ -871,7 +871,6 @@ mod macos {
                 "matvec_q4_0_blocked",
                 "matmul_q4_0_batch_16row",
                 "matmul_q4_0_batch_32row",
-                "matmul_q4_0_batch_mm64",
                 "matmul_f16_batch",
                 "matvec_q8_0",
                 "embedding_lookup_q4_0",
