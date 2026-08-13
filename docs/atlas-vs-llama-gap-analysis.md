@@ -444,6 +444,21 @@ decode win at 512+ context.
 
 ### D3 — Cut decode dispatches from ~552 to ~180/token (R3, refined)
 
+> Status 2026-08-12: **D3 attempted and reverted — measured as a net wash.**
+> Phase-13.4 implemented the three clean per-layer fusions (FFN gate/up+GELU,
+> PLE inp-gate+GELU/offset, PLE add+scale) as bitwise-exact kernels (kernel
+> parity + digest + exact-token gates all green, stream hash `f23c2962…`
+> byte-identical). Dispatches dropped 70,104 → 56,769/128 tokens (−105/token),
+> **but decode GPU rose** 4034.6 → 4201.5 ms (−4.1%) and decode tok/s fell
+> ~31.0 → ~29.5 at matched pp512/tg128. A/B without the gate/up+GELU fusion
+> (the biggest regressor, from halved threadgroups and doubled per-thread
+> register pressure) still left decode slightly below baseline (~30.2 tok/s,
+> GPU 4076–4089 vs 4034 ms). The fusions were reverted to keep the phase-13.3
+> baseline. **Root cause: post-D2 decode is GPU-latency-bound (attention ~60%
+> + matvec family), not dispatch-bound; removing dispatches only trims the
+> ~16% host-encode, which is already hidden behind GPU wait.** See
+> "Dispatch-fusion verdict" below.
+
 **Problem.** 547.7 dispatches/token ≈ 16.3/layer/token is the latency binding
 behind the 8.7× floor distance; host-encode is ~2.1 ms/token (~16%).
 
@@ -465,6 +480,20 @@ behind the 8.7× floor distance; host-encode is ~2.1 ms/token (~16%).
 **Expected impact.** 10–30% decode plus most of the host-encode component;
 35 layers × ~5 fused dispatches ≈ ~180/token.
 
+#### Dispatch-fusion verdict (measured 2026-08-12)
+
+The epilogue fusions do not deliver the projected 10–30%: the RMS-output
+fusions (attn-out / ffn-down / PLE-projection + output-RMS + residual) are
+structurally infeasible while keeping the grid-parallel matvec AND bitwise
+parity — `gemma4_rms_residual_f32` needs the full 2304-wide output (and the
+volatile `normalized` rounding boundary), which a grid-distributed matvec
+cannot see, and a single-threadgroup wide matvec (attn-out input 4096,
+ffn-down input 16384) would be a GPU regression. The clean per-layer fusions
+that were implemented save ~105 dispatches/token but move decode tok/s
+*down*, because decode is GPU-latency-bound. **Dispatch-count reduction is not
+the binding lever post-D2; attention and the matvec family are.** Re-focus on
+attention (context scaling) and prefill attention staging.
+
 ### D4 — Do not tune matvec breadth further (R5)
 
 The 64-row family cut threadgroups 18% but moved GPU ~1%. Re-measure only
@@ -482,11 +511,11 @@ R1/D1/D2):
 | pp512 + tg128 | 6.9s | 39% | 61% | 2.38s | 2.65s |
 | pp1024 + tg128 | 10.5s | 54% | 46% | 4.98s | 3.16s |
 
-- **Decode is the closer, cheaper gap (recommended next).** The hard part of
-  decode — the exact-FP32 greedy-parity constraint — is already solved by D2;
-  the remaining **D3** (dispatch fusion: PLE batching 106 → ~2 disp/token,
-  attn-out/ffn-down epilogue fusion) is well-specified with the parity-gate
-  infrastructure in place, and decode dominates generation wall time.
+- **Decode is the closer, cheaper gap, but D3 (dispatch fusion) is measured
+  as a wash** — decode is GPU-latency-bound, not dispatch-bound (see
+  "Dispatch-fusion verdict" under D3). The remaining decode levers are the
+  attention KV scan at longer context (D2 re-run at 8k+) and the matvec
+  bandwidth after the small-kernel overhead is removed.
 - **Prefill has a cheap quick-win available: stage the prefill batched
   attention kernel.** `attention_decode_fused_gemma4_simd_q4_0_batch`
   (`kernels.metal`, `DEFINE_SIMD_ATTENTION_BATCH`) still scans keys serially
@@ -505,9 +534,11 @@ R1/D1/D2):
 ### Execution order (decode)
 
 **D1 first** — ~8%, parity-proven, one-line binding change. **D2** when
-context-length decode is the bottleneck (it is, at pp512). **D3** in
-parallel with D2 (independent dispatch plumbing). **D4** only after D1–D3 so
-the floor measurement is honest.
+context-length decode is the bottleneck (it is, at pp512). **D3 (attempted,
+phase-13.4, reverted)** — dispatch fusion measured as a wash: decode is
+GPU-latency-bound, not dispatch-bound (see "Dispatch-fusion verdict"). **D4**
+only after the GPU-latency levers are spent, so the floor measurement is
+honest.
 
 ---
 
@@ -518,10 +549,11 @@ tok/s at pp512 with a byte-identical greedy stream. **D1 (landed,
 phase-13.2)** — q4 attention defaults to the no-value-barrier flash16 kernel,
 decode GPU −8.6%. **D2 (landed, phase-13.3)** — staged, chunked, exact-ordered
 attention KV scan with wide threadgroups; decode GPU −31.6% at pp512 with a
-byte-identical stream (24 → 31 tok/s at pp512). **Decode dispatch count
-(547/token) and the remaining matvec/epilogue kernels are now the bottleneck**:
-follow **D3** next, with the prefill batched-attention staging quick-win as the
-parallel/alternative prefill-first option (see "Next improvements" above).
-**R2** is already in production. **R4/R5** map to D2/D4. Any new decode kernel
-must keep the exact FP32 accumulation order (greedy-stream hash `f23c2962…` is
-the drift sentinel).
+byte-identical stream (24 → 31 tok/s at pp512). **D3 (attempted, phase-13.4,
+reverted)** — dispatch fusion is a measured wash: decode is GPU-latency-bound
+(attention ~60% + matvec family), so removing dispatches only trims the
+host-encode that is already hidden behind GPU wait. The next levers are the
+**prefill batched-attention staging** quick-win (same staged technique as D2)
+and attention at longer context. **R2** is already in production. **R4/R5**
+map to D2/D4. Any new decode kernel must keep the exact FP32 accumulation order
+(greedy-stream hash `f23c2962…` is the drift sentinel).
