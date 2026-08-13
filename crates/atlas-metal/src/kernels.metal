@@ -385,8 +385,81 @@ kernel void matmul_q4_0_batch_32row(
 
 
 
-kernel void matmul_f16_batch(
-    device const float *input [[buffer(0)]], device const half *weights [[buffer(1)]],
+// Phase B (Path B extension): tuned 64-token x 64-row fp16 matrix-unit GEMM.
+// Each threadgroup stages one 64-dim K-chunk of q4_0-dequantized weights (fp16)
+// and the 64-token input slice (cast to fp16) in threadgroup memory (one
+// barrier per chunk), then loops 8 token-sub-tiles x 8 k-sub-chunks with
+// simdgroup_multiply_accumulate (fp16 inputs, fp32 accumulate).  The dequant is
+// amortized over 64 tokens and weight DRAM traffic is read once per threadgroup
+// (8x less than the 8-token scalar tile).  NOT within the max-abs 1e-3 contract
+// (fp16 cast); Phase B accepts ~1e-2 for prefill speed.  Requires batch % 64
+// == 0, output_width % 64 == 0, input_width % 64 == 0 (executor falls back to
+// matmul_q4_0_batch_32row otherwise).  d = b * a with d (out_row x token),
+// b (out_row x k), a (k x token).
+inline float simd_q4_0_dequant(device const uchar *weights, uint row, uint blocks, uint dim) {
+    uint block = dim / 32;
+    uint within = dim % 32;
+    device const uchar *base = weights + (row * blocks + block) * 18;
+    float scale = float(*(device const half *)base);
+    uchar packed = base[2 + (within & 15)];
+    uchar nibble = within < 16 ? packed & 15 : packed >> 4;
+    return scale * float(int(nibble) - 8);
+}
+kernel void matmul_q4_0_batch_mm64(
+    device const float *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
+    constant uint &output_width [[buffer(4)]], constant uint &batch [[buffer(5)]],
+    uint group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    const uint TOKENS = 32;
+    const uint ROWS = 64;
+    const uint CHUNK = 64;
+    uint simdgroup = tid / 32;
+    uint lane = tid % 32;
+    uint row_tiles = output_width / ROWS;
+    uint token_tile = group / row_tiles;
+    uint row_tile = group % row_tiles;
+    uint base_token = token_tile * TOKENS;
+    uint base_row = row_tile * ROWS;
+    uint blocks = input_width / 32;
+    threadgroup half wb[ROWS * CHUNK];
+    threadgroup half ib[TOKENS * CHUNK];
+    for (uint kc = 0; kc < input_width; kc += CHUNK) {
+        for (uint e = 0; e < ROWS * CHUNK / 256; ++e) {
+            uint idx = tid * (ROWS * CHUNK / 256) + e;
+            uint r = idx / CHUNK;
+            uint k = idx % CHUNK;
+            uint row = base_row + r;
+            wb[idx] = (row < output_width) ? half(simd_q4_0_dequant(weights, row, blocks, kc + k)) : 0.0f;
+        }
+        for (uint e = 0; e < TOKENS * CHUNK / 256; ++e) {
+            uint idx = tid * (TOKENS * CHUNK / 256) + e;
+            uint t = idx / CHUNK;
+            uint k = idx % CHUNK;
+            uint token = base_token + t;
+            ib[idx] = (token < batch) ? half(input[token * input_width + kc + k]) : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint tt = 0; tt < TOKENS / 8; ++tt) {
+            simdgroup_float8x8 d(0.0f);
+            for (uint sub = 0; sub < CHUNK / 8; ++sub) {
+                uint k_off = sub * 8;
+                simdgroup_half8x8 a, b;
+                simdgroup_load(a, ib + tt * 8 * CHUNK + k_off, CHUNK, ulong2(0, 0), true);
+                simdgroup_load(b, wb + simdgroup * 8 * CHUNK + k_off, CHUNK, ulong2(0, 0), false);
+                simdgroup_multiply_accumulate(d, a, b, d);
+            }
+            simdgroup_store(
+                d,
+                output + (base_token + tt * 8) * output_width + base_row + simdgroup * 8,
+                output_width,
+                ulong2(0, 0),
+                true);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+kernel void matmul_f16_batch(    device const float *input [[buffer(0)]], device const half *weights [[buffer(1)]],
     device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
     constant uint &output_width [[buffer(4)]], constant uint &batch [[buffer(5)]],
     uint id [[thread_position_in_grid]]) {
