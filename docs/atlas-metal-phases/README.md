@@ -6,6 +6,12 @@ Silicon with the required numerical or performance evidence recorded.
 
 ## Current phase
 
+- [phase-13.2-flash16-default-attention.md](phase-13.2-flash16-default-attention.md) —
+  Decode improvement D1 (gap analysis): q4 attention defaults to the
+  no-value-barrier flash16 variant. Acceptance gate met: per-token fp32
+  logit-digest and exact-token parity with LegacyFused preserved, decode GPU
+  −8.6% at matched pp512/tg128, greedy stream hash byte-identical (artifact
+  under `artifacts/phase-13.2/`).
 - [phase-13.1-batched-prefill-kernels.md](phase-13.1-batched-prefill-kernels.md) —
   Token-batched prefill kernels (gap-analysis R1). Acceptance gate met: per-token
   qk/rope, V-RMS, KV-append, attention, and PLE loops collapsed into single

@@ -303,11 +303,12 @@ combination with R2/R3.
 
 ## Decode improvement recommendations (measured 2026-08-12, phase 13.2+)
 
-Status as of phase-13.1 (R1 landed): prefill is now ~200 tok/s flat across
-prompt sizes. **Decode is the remaining gap** — 19.6 tok/s at the matched
-pp512 workload, unchanged since this analysis. This section re-measures the
-decode baseline and prioritizes the concrete work, superseding the generic
-R2–R5 ordering for decode.
+Status as of phase-13.2 (D1 landed): prefill is ~200 tok/s flat across prompt
+sizes and the q4 attention default is the no-value-barrier flash16 kernel
+(~8.6% decode GPU, byte-identical stream). **Decode is the remaining gap** —
+~21.4 tok/s at the matched pp512 workload (was 19.6 tok/s at phase-13.1). This
+section re-measures the decode baseline and prioritizes the concrete work,
+superseding the generic R2–R5 ordering for decode.
 
 ### Measured decode baseline (matched pp512, tg128, q4_0 KV, Resident)
 
@@ -351,6 +352,13 @@ deliberately preserve LegacyFused's per-key serial scan and value barrier, so
 they are parity-equivalent by design, not faster.
 
 ### D1 — Default the q4 attention to the no-value-barrier flash16 variant
+
+> Status 2026-08-12: **D1 is implemented** (phase-13.2). Default is now
+> `Flash16` (`attention_decode_gemma4_simd_q4_0_flash16_exact_nb` /
+> `_swa_exact_nb`). Decode GPU 6455.1 → 5900.5 ms/128 tokens (−8.6%) at the
+> matched pp512/tg128 workload with a byte-identical greedy stream
+> (`f23c2962…`); per-token fp32 logit-digest and exact-token parity gates pass.
+> Evidence under `artifacts/phase-13.2/`.
 
 **Problem.** The production default (`LegacyFused`) and the
 `_flash16_exact_runtime` binding both hold a `threadgroup_barrier` after every
@@ -427,7 +435,9 @@ the floor measurement is honest.
 ### Execution order (overall)
 
 **R1 (landed, phase-13.1)** — batched prefill kernels; prefill 49.6 → ~200
-tok/s at pp512 with a byte-identical greedy stream. **Decode work is now the
-bottleneck**: follow D1 → D2/D3 above. **R2** is already in production.
-**R4/R5** map to D2/D4. Any new decode kernel must keep the exact FP32
-accumulation order (greedy-stream hash `f23c2962…` is the drift sentinel).
+tok/s at pp512 with a byte-identical greedy stream. **D1 (landed,
+phase-13.2)** — q4 attention defaults to the no-value-barrier flash16 kernel,
+decode GPU −8.6%. **Decode work is now the bottleneck**: follow **D2** →
+**D3** above. **R2** is already in production. **R4/R5** map to D2/D4. Any new
+decode kernel must keep the exact FP32 accumulation order (greedy-stream hash
+`f23c2962…` is the drift sentinel).

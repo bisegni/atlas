@@ -416,17 +416,20 @@ fn gemma4_decode_uses_unfused_vnorm() -> bool {
 
 /// Exact-compatible Flash16 attention bindings. They retain Flash16's
 /// explicit Resident dispatches while preserving LegacyFused's runtime FP32
-/// dot-product, reduction, online-softmax ordering, and value-update barrier.
+/// dot-product, reduction, and key-ordered online-softmax ordering. The
+/// no-value-barrier (`_nb`) variants drop only the redundant per-key
+/// `threadgroup_barrier` after the value update, so they produce byte-identical
+/// output to the `_exact_runtime` and LegacyFused kernels.
 fn gemma4_q4_flash16_binding(sliding: bool) -> (&'static str, &'static str, u32) {
     if sliding {
         (
-            "attention_decode_gemma4_simd_q4_0_flash16_swa_exact_runtime",
+            "attention_decode_gemma4_simd_q4_0_flash16_swa_exact_nb",
             "gemma_attention_flash16_swa",
             128,
         )
     } else {
         (
-            "attention_decode_gemma4_simd_q4_0_flash16_exact_runtime",
+            "attention_decode_gemma4_simd_q4_0_flash16_exact_nb",
             "gemma_attention_flash16",
             128,
         )
@@ -480,10 +483,11 @@ impl Gemma4KvCacheType {
 
 /// Decode attention implementation for Q4 KV caches.
 ///
-/// `LegacyFused` is the production Resident default until Flash16 passes the
-/// ignored exact-token and per-token logit-digest parity gates on Apple
-/// Silicon. `Flash16` remains an explicit diagnostic and performance path;
-/// neither mode is a CPU fallback.
+/// `Flash16` is the production Resident default: the no-value-barrier
+/// flash16 kernel preserves LegacyFused's four-SIMD reduction and key-ordered
+/// online softmax byte-for-byte while dropping the redundant per-key value
+/// barrier (~8% decode GPU, see phase 13.2). `LegacyFused` remains selectable
+/// as the explicit diagnostic path; neither mode is a CPU fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gemma4Q4AttentionMode {
     Flash16,
@@ -492,7 +496,7 @@ pub enum Gemma4Q4AttentionMode {
 
 impl Default for Gemma4Q4AttentionMode {
     fn default() -> Self {
-        Self::LegacyFused
+        Self::Flash16
     }
 }
 
@@ -3941,7 +3945,7 @@ mod tests {
     }
 
     #[test]
-    fn q4_attention_mode_defaults_to_legacy_fused_until_flash16_is_accepted() {
+    fn q4_attention_mode_defaults_to_flash16_with_legacy_fused_diagnostic() {
         assert_eq!(
             Gemma4Q4AttentionMode::parse("flash16").unwrap(),
             Gemma4Q4AttentionMode::Flash16
@@ -3952,6 +3956,10 @@ mod tests {
         );
         assert!(Gemma4Q4AttentionMode::parse("fast").is_err());
         assert_eq!(
+            Gemma4Q4AttentionMode::default(),
+            Gemma4Q4AttentionMode::Flash16
+        );
+        assert_eq!(
             gemma4_attention_kernel(
                 Gemma4KvCacheType::Q4_0,
                 8,
@@ -3959,7 +3967,7 @@ mod tests {
                 false,
                 Gemma4Q4AttentionMode::default(),
             ),
-            "attention_decode_fused_gemma4_simd_q4_0"
+            "attention_decode_gemma4_simd_q4_0_flash16_exact_nb"
         );
         assert_eq!(
             gemma4_attention_kernel(

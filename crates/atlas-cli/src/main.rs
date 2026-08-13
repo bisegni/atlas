@@ -562,8 +562,9 @@ fn generate(args: &[String]) -> Result<()> {
     let mut chat = false;
     let mut json_output = false;
     let mut kv_cache_type = Gemma4KvCacheType::Q4_0;
-    // Flash16 remains an explicit Resident Q4-KV parity and performance
-    // candidate until its exact-token and logit-digest gates pass on Metal.
+    // Flash16 (the no-value-barrier exact-compatible kernel) is the Resident
+    // Q4-KV default; `--q4-attention-mode legacy_fused` selects the diagnostic
+    // kernel.
     let mut q4_attention_mode = Gemma4Q4AttentionMode::default();
     let mut i = 0;
     while i < args.len() {
@@ -2400,7 +2401,7 @@ mod kv_cache_cli_tests {
         let (_, _, _, _, cache_type, attention_mode) =
             parse_chat_args(&args).expect("parse chat options");
         assert_eq!(cache_type, Gemma4KvCacheType::Q8_0);
-        assert_eq!(attention_mode, Gemma4Q4AttentionMode::LegacyFused);
+        assert_eq!(attention_mode, Gemma4Q4AttentionMode::Flash16);
     }
 
     #[test]
@@ -2459,7 +2460,7 @@ mod kv_cache_cli_tests {
             parse_benchmark_args(&benchmark)
                 .expect("parse benchmark options")
                 .q4_attention_mode,
-            Gemma4Q4AttentionMode::LegacyFused
+            Gemma4Q4AttentionMode::Flash16
         );
 
         let profile = vec!["--model".to_owned(), "gemma4-e2b-q4_0".to_owned()];
@@ -2496,7 +2497,7 @@ mod kv_cache_cli_tests {
         assert_eq!(parsed.warmup_decode_tokens, 32);
         assert_eq!(parsed.max_context, 4096);
         assert_eq!(parsed.kv_cache_type, Gemma4KvCacheType::Q4_0);
-        assert_eq!(parsed.q4_attention_mode, Gemma4Q4AttentionMode::LegacyFused);
+        assert_eq!(parsed.q4_attention_mode, Gemma4Q4AttentionMode::Flash16);
         assert!(parse_benchmark_args(&args[..4]).is_err());
     }
 

@@ -51,21 +51,25 @@ the first 50 generated tokens and diverge at zero-based generated token 50
 (the 51st generated token).
 
 The slice-merge `_flash16_uw` kernels are therefore retired from the Flash16
-selector. Flash16 now selects `_flash16_exact_runtime` kernels that preserve
+selector. Flash16 selects `_flash16_exact_nb` kernels that preserve
 LegacyFused's runtime FP32 Q·K accumulation, four-SIMD score reduction,
-key-ordered online softmax, and post-value barrier. The no-barrier and
-compile-time head-width candidates remain diagnostic-only. Flash16 remains
-experimental until the exact GPU stream and matched-performance gates pass.
+key-ordered online softmax, and per-token fp32 logit arithmetic, dropping only
+the redundant per-key value barrier (phase 13.2). The
+`_exact_runtime` variants retain the value barrier and remain diagnostic-only;
+the compile-time head-width candidates remain diagnostic-only too.
 
-Flash16 cannot be selected for normal Q4-KV inference while this exact-token
-failure exists. `LegacyFused` is now the Resident production default: it is
-the known-correct GPU path, not a CPU fallback. Flash16 remains selectable
-only through the explicit `--q4-attention-mode flash16` diagnostic and
-performance interfaces. The ignored Gemma test
+Flash16 (the `_nb` no-value-barrier kernel) is the Resident production default
+for Q4-KV decode, accepted in phase 13.2 once the per-token logit-digest and
+exact-token parity gates passed on Apple Silicon. `LegacyFused` remains
+selectable through the explicit `--q4-attention-mode legacy_fused` diagnostic
+and performance interfaces. The ignored Gemma test
 `q4_kv_flash16_matches_legacy_resident_attention_across_chat_and_long_decode`
 is self-contained: it requires Flash16 exact token/finish parity with
 Resident LegacyFused for canonical and C++ chat prompts plus a 256+64 long
-decode window. It must pass on Apple Silicon before Flash16 is accepted.
+decode window, and the digest gate
+`flash16_matches_legacy_resident_output_logit_digests` requires byte-identical
+per-token fp32 logits. Both pass on Apple Silicon; they remain the parity
+sentinel for any future attention-kernel change.
 
 External-oracle acceptance is deliberately separate. After fixture capture,
 `legacy_fused_matches_captured_llama_oracles` requires Resident LegacyFused to
@@ -109,13 +113,10 @@ cargo run --release -p atlas-cli -- generate \
   --q4-attention-mode legacy_fused --json
 ```
 
-To run the exact Flash16 candidate in normal chat while it is under
-validation, add `--q4-attention-mode flash16`; the emitted metrics must name
-`attention_decode_gemma4_simd_q4_0_flash16_exact_runtime`.
-
-The normal `chat`, `benchmark`, and `generate` defaults now use LegacyFused
-and report `q4_attention_mode` with the selected Resident kernel. Flash16 may
-only be restored as default after the exact Resident parity test passes.
+The normal `chat`, `benchmark`, `generate`, `profile`, and `matched` defaults
+now use Flash16 (the `_nb` no-value-barrier kernel, phase 13.2) and report
+`q4_attention_mode` and `attention_kernel` with the selected Resident kernel.
+`--q4-attention-mode legacy_fused` selects the diagnostic kernel explicitly.
 
 ## Measured hotspot baseline (new phase baseline)
 
