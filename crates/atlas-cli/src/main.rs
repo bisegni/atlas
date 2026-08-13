@@ -727,6 +727,20 @@ fn profile(args: &[String]) -> Result<()> {
             })
         })
         .collect::<Vec<_>>();
+    let prefill_kernels = profile
+        .prefill_kernels
+        .iter()
+        .map(|kernel| {
+            json!({
+                "family": kernel.family,
+                "kernel_name": kernel.kernel_name,
+                "dispatches": kernel.dispatches,
+                "gpu_ms": kernel.gpu_nanos as f64 / 1_000_000.0,
+                "cpu_encode_ms": kernel.cpu_encode_nanos as f64 / 1_000_000.0,
+                "threadgroups": kernel.threadgroups,
+            })
+        })
+        .collect::<Vec<_>>();
     let output = json!({
         "event": "gemma4_resident_decode_profile",
         "model_id": record.id,
@@ -744,6 +758,7 @@ fn profile(args: &[String]) -> Result<()> {
         "attention_kernel": profile.attention_kernel,
         "kv_cache_type": profile.kv_cache_type.as_str(),
         "kv_cache_bytes": executor.kv_cache_bytes(),
+        "prefill_kernels": prefill_kernels,
         "samples": samples,
     });
     append_jsonl_at(GEMMA_DECODE_PROFILE_LOG, &output)?;
