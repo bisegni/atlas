@@ -1815,6 +1815,108 @@ kernel void NAME( \
 DEFINE_FLASH_ATTENTION_V2(attention_decode_gemma4_simd_q4_0_flash16_uw, 512, 16, 12)
 DEFINE_FLASH_ATTENTION_V2(attention_decode_gemma4_simd_q4_0_flash16_swa_uw, 256, 8, 24)
 
+// Flash16 v4 (Path B): merged-slice flash attention wired for the Resident
+// key_control contract.  The "_uw" design (SLICES disjoint key ranges scanned
+// with per-simdgroup register online-softmax and value accumulators, then
+// merged in threadgroup memory) has no per-key barriers and is several times
+// faster than the exact-ordered v3 scan, but it is NOT bitwise: the slice
+// split and merge change the FP32 reduction order.  Under the Path B tolerance
+// contract (max-abs < 1e-3) this is the intended decode default.  Unlike the
+// "_uw" kernels it reads the packed `key_control` (key_start << 16 | key_count)
+// so sliding-window heads scan the correct absolute key range.
+#define DEFINE_FLASH_ATTENTION_V4(NAME, HEAD_DIM, BLOCKS, SLICES) \
+kernel void NAME( \
+    device const float *query [[buffer(0)]], device const uchar *cache [[buffer(1)]], \
+    device float *output [[buffer(2)]], constant uint &heads [[buffer(3)]], \
+    constant uint &kv_heads [[buffer(4)]], constant uint &head_dim [[buffer(5)]], \
+    constant uint &capacity [[buffer(6)]], constant uint &key_control [[buffer(7)]], \
+    uint head [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]], \
+    uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]) { \
+    if (head >= heads) return; \
+    if (head_dim != HEAD_DIM) return; \
+    if (simd_group >= SLICES) return; \
+    uint key_start = key_control >> 16; \
+    uint key_count = key_control & 0xffffu; \
+    uint kv_head = head / (heads / kv_heads); \
+    uint blocks_per_position = kv_heads * BLOCKS; \
+    uint value_base = capacity * blocks_per_position; \
+    if (key_count == 0) { \
+        for (uint b = 0; b < BLOCKS; ++b) { \
+            uint dim = 32 * b + lane; \
+            if (dim < HEAD_DIM) output[head * HEAD_DIM + dim] = 0.0f; \
+        } \
+        return; \
+    } \
+    uint start = key_start + simd_group * key_count / SLICES; \
+    uint end = key_start + (simd_group + 1) * key_count / SLICES; \
+    float maximum = -INFINITY; \
+    float denominator = 0.0f; \
+    FLASH_ACC_DECLS \
+    FLASH_QUERY_CACHE(q_cache, HEAD_DIM, BLOCKS) \
+    for (uint key = start; key < end; ++key) { \
+        uint key_element = key * kv_heads * HEAD_DIM + kv_head * HEAD_DIM; \
+        uint key_block_base = key_element / 32; \
+        float partial = 0.0f; \
+        _Pragma("unroll") \
+        for (uint b = 0; b < BLOCKS; ++b) { \
+            device const uchar *base = cache + (key_block_base + b) * 18; \
+            float scale = simd_broadcast(float(*(device const half *)base), 0); \
+            uchar packed = base[2 + (lane & 15)]; \
+            uchar nibble = lane < 16 ? packed & 15 : packed >> 4; \
+            partial += q_cache[b] * scale * float(int(nibble) - 8); \
+        } \
+        float score = simd_sum(partial); \
+        float rescale = 1.0f; \
+        float weight; \
+        if (score > maximum) { \
+            rescale = exp(maximum - score); \
+            weight = 1.0f; \
+            maximum = score; \
+            denominator = denominator * rescale + weight; \
+        } else { \
+            weight = exp(score - maximum); \
+            denominator += weight; \
+        } \
+        uint value_block_base = value_base + key_block_base; \
+        _Pragma("unroll") \
+        for (uint b = 0; b < BLOCKS; ++b) { \
+            device const uchar *base = cache + (value_block_base + b) * 18; \
+            float scale = simd_broadcast(float(*(device const half *)base), 0); \
+            uchar packed = base[2 + (lane & 15)]; \
+            uchar nibble = lane < 16 ? packed & 15 : packed >> 4; \
+            float value = scale * float(int(nibble) - 8); \
+            if (b == 0) acc0 = acc0 * rescale + weight * value; \
+            FLASH_ACC_UPDATES \
+        } \
+    } \
+    threadgroup float merg_max[SLICES]; \
+    threadgroup float merg_sum[SLICES]; \
+    threadgroup float merg_out[SLICES * HEAD_DIM]; \
+    if (lane == 0) { \
+        merg_max[simd_group] = maximum; \
+        merg_sum[simd_group] = denominator; \
+    } \
+    FLASH_ACC_STORES(HEAD_DIM, BLOCKS) \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+    threadgroup float global_max, global_sum; \
+    if (tid == 0) { \
+        global_max = -INFINITY; \
+        for (uint g = 0; g < SLICES; ++g) global_max = max(global_max, merg_max[g]); \
+        global_sum = 0.0f; \
+        for (uint g = 0; g < SLICES; ++g) global_sum += merg_sum[g] * exp(merg_max[g] - global_max); \
+    } \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+    for (uint b = 0; b < BLOCKS; ++b) { \
+        uint dim = 32 * b + lane; \
+        float value = 0.0f; \
+        for (uint g = 0; g < SLICES; ++g) value += merg_out[g * HEAD_DIM + dim] * exp(merg_max[g] - global_max); \
+        output[head * HEAD_DIM + dim] = value / global_sum; \
+    } \
+}
+
+DEFINE_FLASH_ATTENTION_V4(attention_decode_gemma4_simd_q4_0_flash16_v4, 512, 16, 12)
+DEFINE_FLASH_ATTENTION_V4(attention_decode_gemma4_simd_q4_0_flash16_swa_v4, 256, 8, 24)
+
 
 
 

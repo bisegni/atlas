@@ -196,10 +196,22 @@ fn flash16_uw_matches_cpu_oracle() {
             "attention_decode_gemma4_simd_q4_0_flash16_uw",
         ),
         (
+            "full-512-v4",
+            512u32,
+            384usize,
+            "attention_decode_gemma4_simd_q4_0_flash16_v4",
+        ),
+        (
             "swa-256-uw",
             256u32,
             768usize,
             "attention_decode_gemma4_simd_q4_0_flash16_swa_uw",
+        ),
+        (
+            "swa-256-v4",
+            256u32,
+            768usize,
+            "attention_decode_gemma4_simd_q4_0_flash16_swa_v4",
         ),
     ];
     for (label, head_dim, threads, kernel) in scenarios {

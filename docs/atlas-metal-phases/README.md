@@ -6,6 +6,14 @@ Silicon with the required numerical or performance evidence recorded.
 
 ## Current phase
 
+- [phase-13.7-flash16-v4-decode-attention.md](phase-13.7-flash16-v4-decode-attention.md) —
+  Path B merged-slice decode flash attention: `Flash16` now binds the
+  non-bitwise v4 kernels (no per-key barriers; slice-merge in threadgroup
+  memory), covered by the max-abs < 1e-3 tolerance contract. Decode more than
+  doubled (30.5 → 64.9 tok/s at matched pp512/tg128; ~0.8× llama.cpp's
+  empty-context decode), attention ~19 → ~2.5 ms/token, stream hash still
+  `f23c2962…` on the matched workloads (drifts at token 50 on the chat prompt —
+  the approved Path B tradeoff).
 - [phase-13.6-prefill-batched-gemm.md](phase-13.6-prefill-batched-gemm.md) —
   Weight-stationary q4 batched GEMM for prefill: `matmul_q4_0_batch_32row`
   tiles 4 tokens × 32 rows per threadgroup so each weight block is read once

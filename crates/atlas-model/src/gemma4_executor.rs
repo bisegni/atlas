@@ -458,6 +458,28 @@ fn gemma4_q4_flash16_v3_binding(sliding: bool) -> (&'static str, &'static str, u
     }
 }
 
+/// Flash16 v4 (Path B) bindings: the merged-slice flash attention that scans
+/// disjoint key ranges per SIMD group with register online-softmax and value
+/// accumulators, then merges in threadgroup memory (no per-key barriers).  It
+/// is NOT bitwise (the slice split/merge change the FP32 reduction order) but
+/// is covered by the max-abs < 1e-3 tolerance contract; threads are
+/// `SLICES * 32` (12 slices for 512-wide full heads, 24 for 256-wide swa).
+fn gemma4_q4_flash16_v4_binding(sliding: bool) -> (&'static str, &'static str, u32) {
+    if sliding {
+        (
+            "attention_decode_gemma4_simd_q4_0_flash16_swa_v4",
+            "gemma_attention_flash16_swa",
+            768,
+        )
+    } else {
+        (
+            "attention_decode_gemma4_simd_q4_0_flash16_v4",
+            "gemma_attention_flash16",
+            384,
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gemma4KvCacheType {
     F32,
@@ -1017,7 +1039,7 @@ fn gemma4_attention_kernel(
     {
         match q4_attention_mode {
             Gemma4Q4AttentionMode::Flash16 => {
-                return gemma4_q4_flash16_v3_binding(sliding).0;
+                return gemma4_q4_flash16_v4_binding(sliding).0;
             }
             Gemma4Q4AttentionMode::Flash16Exact => {
                 return gemma4_q4_flash16_binding(sliding).0;
@@ -3718,7 +3740,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 && gemma4_q4_flash16_supported(c.attention_heads, head)
             {
                 match self.q4_attention_mode {
-                    Gemma4Q4AttentionMode::Flash16 => Some(gemma4_q4_flash16_v3_binding(sliding)),
+                    Gemma4Q4AttentionMode::Flash16 => Some(gemma4_q4_flash16_v4_binding(sliding)),
                     Gemma4Q4AttentionMode::Flash16Exact => Some(gemma4_q4_flash16_binding(sliding)),
                     Gemma4Q4AttentionMode::LegacyFused => None,
                 }
@@ -4025,7 +4047,7 @@ mod tests {
                 false,
                 Gemma4Q4AttentionMode::default(),
             ),
-            "attention_decode_gemma4_simd_q4_0_flash16_exact_v3"
+            "attention_decode_gemma4_simd_q4_0_flash16_v4"
         );
         assert_eq!(
             gemma4_attention_kernel(

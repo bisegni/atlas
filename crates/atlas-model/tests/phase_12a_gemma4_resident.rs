@@ -112,7 +112,7 @@ fn flash16_matches_legacy_resident_output_logit_digests() {
             &model,
             4096,
             Gemma4KvCacheType::Q4_0,
-            Gemma4Q4AttentionMode::Flash16,
+            Gemma4Q4AttentionMode::Flash16Exact,
         )
         .expect("create flash16 Resident executor");
         let mut legacy = Gemma4E2bExecutor::new_with_kv_cache_and_q4_attention_mode(
@@ -155,7 +155,7 @@ fn flash16_matches_legacy_resident_output_logit_digests() {
         &model,
         4096,
         Gemma4KvCacheType::Q4_0,
-        Gemma4Q4AttentionMode::Flash16,
+        Gemma4Q4AttentionMode::Flash16Exact,
     )
     .expect("create long-window flash16 executor");
     let mut legacy = Gemma4E2bExecutor::new_with_kv_cache_and_q4_attention_mode(
@@ -274,7 +274,7 @@ fn q4_kv_flash16_matches_legacy_resident_attention_across_chat_and_long_decode()
             &model,
             4096,
             Gemma4KvCacheType::Q4_0,
-            Gemma4Q4AttentionMode::Flash16,
+            Gemma4Q4AttentionMode::Flash16Exact,
         )
         .expect("create flash16 Resident executor");
         let mut legacy = Gemma4E2bExecutor::new_with_kv_cache_and_q4_attention_mode(
@@ -308,7 +308,7 @@ fn q4_kv_flash16_matches_legacy_resident_attention_across_chat_and_long_decode()
         );
         assert_eq!(
             fast_generation.metrics.q4_attention_mode,
-            Gemma4Q4AttentionMode::Flash16
+            Gemma4Q4AttentionMode::Flash16Exact
         );
         assert_eq!(
             legacy_generation.metrics.q4_attention_mode,
@@ -316,7 +316,7 @@ fn q4_kv_flash16_matches_legacy_resident_attention_across_chat_and_long_decode()
         );
         assert_eq!(
             fast_generation.metrics.attention_kernel,
-            "attention_decode_gemma4_simd_q4_0_flash16_exact_v3"
+            "attention_decode_gemma4_simd_q4_0_flash16_exact_nb"
         );
         assert_eq!(
             legacy_generation.metrics.attention_kernel,
@@ -340,7 +340,7 @@ fn q4_kv_flash16_matches_legacy_resident_attention_across_chat_and_long_decode()
         &model,
         4096,
         Gemma4KvCacheType::Q4_0,
-        Gemma4Q4AttentionMode::Flash16,
+        Gemma4Q4AttentionMode::Flash16Exact,
     )
     .expect("create long-window flash16 executor");
     let mut legacy = Gemma4E2bExecutor::new_with_kv_cache_and_q4_attention_mode(
