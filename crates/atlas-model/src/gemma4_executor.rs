@@ -1057,6 +1057,37 @@ const GEMMA4_Q4_BATCH_ROWS_PER_GROUP: usize = 32;
 const GEMMA4_Q4_BATCH_THREADS: usize = 256;
 const GEMMA4_BATCH_TILE_TOKENS: usize = 8;
 
+/// Opt-in gate for the Phase B fp16 matrix-unit prefill GEMM
+/// (`matmul_q4_0_batch_mm64`). Off by default so the byte-fixed scalar tile
+/// stays the production path (the fp16 kernel is tolerance-level and drifts
+/// the greedy stream); set `ATLAS_GEMMA4_MM64` to enable it for
+/// benchmark-style workloads.
+fn gemma4_q4_batch_uses_mm64() -> bool {
+    std::env::var_os("ATLAS_GEMMA4_MM64").is_some()
+}
+
+/// Q4 batched GEMM binding.  The 32-token x 64-row fp16 matrix-unit kernel
+/// (`matmul_q4_0_batch_mm64`, Phase B) applies only when enabled via
+/// `ATLAS_GEMMA4_MM64` and the geometry divides evenly (batch % 32 == 0,
+/// output_width % 64 == 0; Gemma4 input widths are all multiples of 64);
+/// otherwise fall back to the scalar 32-row tile.  Returns
+/// (kernel, tokens per group, rows per group, threads).
+fn gemma4_q4_batch_geometry(
+    batch_value: usize,
+    output_width_value: usize,
+) -> (&'static str, usize, usize, usize) {
+    if gemma4_q4_batch_uses_mm64() && batch_value % 32 == 0 && output_width_value % 64 == 0 {
+        ("matmul_q4_0_batch_mm64", 32, 64, 256)
+    } else {
+        (
+            "matmul_q4_0_batch_32row",
+            GEMMA4_BATCH_TILE_TOKENS,
+            GEMMA4_Q4_BATCH_ROWS_PER_GROUP,
+            GEMMA4_Q4_BATCH_THREADS,
+        )
+    }
+}
+
 pub(crate) fn gemma4_ffn_down_projection_kernel() -> &'static str {
     "matvec_q4_0_64row_mv"
 }
@@ -1854,16 +1885,20 @@ impl<'a> Gemma4E2bExecutor<'a> {
         };
         let buffers = &[input, weight, output, input_width, output_width, batch];
         match format {
-            GgufTensorType::Q4_0 => command.dispatch_threadgroups_1d_labeled(
-                kernel,
-                Some("layer_major_batched_projection"),
-                buffers,
-                batch_value
-                    .div_ceil(GEMMA4_BATCH_TILE_TOKENS)
-                    .checked_mul(output_width_value.div_ceil(GEMMA4_Q4_BATCH_ROWS_PER_GROUP))
-                    .context("Gemma batched Q4 projection grid overflows")?,
-                GEMMA4_Q4_BATCH_THREADS,
-            )?,
+            GgufTensorType::Q4_0 => {
+                let (kernel, tile_tokens, rows_per_group, threads) =
+                    gemma4_q4_batch_geometry(batch_value, output_width_value);
+                command.dispatch_threadgroups_1d_labeled(
+                    kernel,
+                    Some("layer_major_batched_projection"),
+                    buffers,
+                    batch_value
+                        .div_ceil(tile_tokens)
+                        .checked_mul(output_width_value.div_ceil(rows_per_group))
+                        .context("Gemma batched Q4 projection grid overflows")?,
+                    threads,
+                )?
+            }
             GgufTensorType::Q6K => command.dispatch_threadgroups_1d_labeled(
                 kernel,
                 Some("layer_major_batched_projection"),
@@ -1894,16 +1929,17 @@ impl<'a> Gemma4E2bExecutor<'a> {
         output_width_value: usize,
         batch_value: usize,
     ) -> Result<()> {
-        let kernel = gemma4_q4_batch_projection_kernel();
+        let (kernel, tile_tokens, rows_per_group, threads) =
+            gemma4_q4_batch_geometry(batch_value, output_width_value);
         command.dispatch_threadgroups_1d_labeled(
             kernel,
             Some("layer_major_batched_ffn_down_projection"),
             &[input, weight, output, input_width, output_width, batch],
             batch_value
-                .div_ceil(GEMMA4_BATCH_TILE_TOKENS)
-                .checked_mul(output_width_value.div_ceil(GEMMA4_Q4_BATCH_ROWS_PER_GROUP))
+                .div_ceil(tile_tokens)
+                .checked_mul(output_width_value.div_ceil(rows_per_group))
                 .context("Gemma batched Q4 ffn-down grid overflows")?,
-            GEMMA4_Q4_BATCH_THREADS,
+            threads,
         )?;
         Ok(())
     }
