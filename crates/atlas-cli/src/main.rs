@@ -47,6 +47,7 @@ const FLASH16_DIAGNOSIS_DIR: &str = "artifacts/flash16-diagnosis";
 struct GemmaProfileArgs {
     model_id: String,
     prompt: String,
+    prompt_tokens: Option<usize>,
     warmup_decode_tokens: usize,
     decode_tokens: usize,
     max_context: usize,
@@ -695,10 +696,13 @@ fn profile(args: &[String]) -> Result<()> {
         args.kv_cache_type,
         args.q4_attention_mode,
     )?;
-    let prompt = render_gemma4_chat(&[Gemma4ChatMessage::new(
-        Gemma4ChatRole::User,
-        args.prompt.clone(),
-    )])?;
+    let prompt = match args.prompt_tokens {
+        Some(target) => synthetic_prompt_of_token_count(&model, target)?,
+        None => render_gemma4_chat(&[Gemma4ChatMessage::new(
+            Gemma4ChatRole::User,
+            args.prompt.clone(),
+        )])?,
+    };
     let profile = executor.profile_decode_with_timing(
         &prompt,
         args.warmup_decode_tokens,
@@ -1724,6 +1728,7 @@ fn parse_profile_args(args: &[String]) -> Result<GemmaProfileArgs> {
     let mut prompt =
         "Atlas Resident decode profile: summarize GPU-resident inference in one sentence."
             .to_owned();
+    let mut prompt_tokens = None;
     let mut decode_tokens = 128;
     let mut warmup_decode_tokens = 32;
     let mut max_context = 4096;
@@ -1739,6 +1744,14 @@ fn parse_profile_args(args: &[String]) -> Result<GemmaProfileArgs> {
             "--prompt" => {
                 i += 1;
                 prompt = args.get(i).context("--prompt needs a value")?.clone();
+            }
+            "--prompt-tokens" => {
+                i += 1;
+                prompt_tokens = Some(
+                    args.get(i)
+                        .context("--prompt-tokens needs a value")?
+                        .parse()?,
+                );
             }
             "--decode-tokens" => {
                 i += 1;
@@ -1779,9 +1792,14 @@ fn parse_profile_args(args: &[String]) -> Result<GemmaProfileArgs> {
     }
     ensure!(decode_tokens >= 128, "--decode-tokens must be at least 128");
     ensure!(max_context > 0, "--max-context must be positive");
+    ensure!(
+        prompt_tokens.map_or(true, |tokens| tokens > 0 && tokens <= max_context),
+        "--prompt-tokens must be positive and at most --max-context"
+    );
     Ok(GemmaProfileArgs {
         model_id: model_id.context("--model is required")?,
         prompt,
+        prompt_tokens,
         warmup_decode_tokens,
         decode_tokens,
         max_context,
