@@ -27,12 +27,30 @@ fn fill_f32(values: &mut [f32], state: &mut u32) {
     }
 }
 
+fn half_bits_of(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = (bits >> 16) as u16 & 0x8000;
+    let exp32 = ((bits >> 23) & 0xFF) as i32 - 127 + 15;
+    let mant = (bits & 0x7F_FFFF) >> 13;
+    if exp32 <= 0 {
+        sign
+    } else if exp32 >= 31 {
+        sign | 0x7C00
+    } else {
+        sign | ((exp32 as u16) << 10) | mant as u16
+    }
+}
+
 fn build_q4_weights(rows: usize, blocks: usize, state: &mut u32) -> Vec<u8> {
     let mut weights = vec![0u8; rows * blocks * 18];
     for (i, chunk) in weights.chunks_mut(18).enumerate() {
-        let scale = (0.005 + (i as f32 % 101.0) * 0.0003) as f32;
-        let half = (scale * 32768.0).round() as u16;
-        chunk[..2].copy_from_slice(&half.to_le_bytes());
+        // Realistic per-block scales encoded as genuine half bit patterns.
+        // (The previous version wrote tiny raw bit values that decoded as
+        // subnormal halves ~1e-5, which made dot products ~1000x smaller than
+        // model-realistic and let structurally wrong kernels pass loose
+        // absolute-error assertions.)
+        let scale = 0.05 + (i as f32 % 101.0) * 0.003;
+        chunk[..2].copy_from_slice(&half_bits_of(scale).to_le_bytes());
         for (j, byte) in chunk[2..].iter_mut().enumerate() {
             let nibble = ((i * 7 + j * 13) % 16) as u8;
             *byte = nibble | (nibble << 4);
@@ -232,10 +250,12 @@ fn batch_mm64_measures_accuracy() {
         Err(error) => panic!("Metal runtime should initialize: {error}"),
     };
     let mut state = 0xc3b1_9f71u32;
-    // Phase B measurement: report the 64-token fp16 matrix-unit kernel's
-    // max-abs error vs the fp32 reference across the Gemma4 shapes (batch % 64
-    // == 0, output % 64 == 0). Expected to exceed 1e-3 (fp16 cast); assert a
-    // loose coherence bound and print the measured error for the decision.
+    // Phase B gate: the fp16 matrix-unit kernel's error vs the fp32 reference
+    // across the Gemma4 shapes (batch % 32 == 0, output % 64 == 0), asserted
+    // RELATIVE to the reference magnitude.  The fp16 cast is expected to give
+    // ~1e-3..1e-2 relative error; the old absolute bound (max_abs < 0.5)
+    // could not distinguish a correct kernel from one that only computed the
+    // final K-chunk, because the reference values themselves were small.
     for (batch, input_width, output_width) in [
         (64u32, 2304u32, 4096u32),
         (64u32, 2048u32, 2304u32),
@@ -246,51 +266,72 @@ fn batch_mm64_measures_accuracy() {
         let mut input = vec![0.0f32; (batch * input_width) as usize];
         fill_f32(&mut input, &mut state);
         let weights = build_q4_weights(output_width as usize, blocks, &mut state);
-        let input_buf = runtime.upload_f32(&input).unwrap();
         let weights_buf = runtime.upload_bytes(&weights).unwrap();
         let input_width_buf = runtime.upload_u32(&[input_width]).unwrap();
         let output_width_buf = runtime.upload_u32(&[output_width]).unwrap();
         let batch_buf = runtime.upload_u32(&[batch]).unwrap();
         let output_len = (batch * output_width) as usize;
-        let run =
-            |kernel: &'static str, tile_tokens: usize, rows_per_group: usize, threads: usize| {
-                let out_buf = runtime.upload_f32(&vec![0.0f32; output_len]).unwrap();
-                let mut command = runtime.begin_resident_command().unwrap();
-                command
-                    .dispatch_threadgroups_1d_at(
-                        kernel,
-                        &[
-                            (&input_buf, 0),
-                            (&weights_buf, 0),
-                            (&out_buf, 0),
-                            (&input_width_buf, 0),
-                            (&output_width_buf, 0),
-                            (&batch_buf, 0),
-                        ],
-                        (batch as usize).div_ceil(tile_tokens)
-                            * (output_width as usize).div_ceil(rows_per_group),
-                        threads,
-                    )
-                    .unwrap();
-                command.finish().unwrap();
-                runtime.read_f32(&out_buf, output_len).unwrap()
-            };
-        let reference = run("matmul_q4_0_batch_16row", 1, 16, 128);
-        let candidate = run("matmul_q4_0_batch_mm64", 32, 64, 256);
-        let mut max_abs = 0.0f32;
-        let mut mean_abs = 0.0f32;
-        for (c, r) in candidate.iter().zip(&reference) {
-            let diff = (c - r).abs();
-            max_abs = max_abs.max(diff);
-            mean_abs += diff;
+        let run = |kernel: &'static str,
+                   tile_tokens: usize,
+                   rows_per_group: usize,
+                   threads: usize,
+                   input_slice: &[f32]| {
+            let input_buf = runtime.upload_f32(input_slice).unwrap();
+            let out_buf = runtime.upload_f32(&vec![0.0f32; output_len]).unwrap();
+            let mut command = runtime.begin_resident_command().unwrap();
+            command
+                .dispatch_threadgroups_1d_at(
+                    kernel,
+                    &[
+                        (&input_buf, 0),
+                        (&weights_buf, 0),
+                        (&out_buf, 0),
+                        (&input_width_buf, 0),
+                        (&output_width_buf, 0),
+                        (&batch_buf, 0),
+                    ],
+                    (batch as usize).div_ceil(tile_tokens)
+                        * (output_width as usize).div_ceil(rows_per_group),
+                    threads,
+                )
+                .unwrap();
+            command.finish().unwrap();
+            runtime.read_f32(&out_buf, output_len).unwrap()
+        };
+        let errors = |label: &str, reference: &[f32], candidate: &[f32]| {
+            let mut max_abs = 0.0f32;
+            let mut max_ref = 0.0f32;
+            for (c, r) in candidate.iter().zip(reference) {
+                max_abs = max_abs.max((c - r).abs());
+                max_ref = max_ref.max(r.abs());
+            }
+            let relative = max_abs / max_ref;
+            eprintln!(
+                "{label} batch={batch} input={input_width} output={output_width}: max_abs={max_abs:.3e} max_ref={max_ref:.3e} relative={relative:.3e}"
+            );
+            assert!(
+                relative < 5e-2,
+                "{label} diverges beyond the fp16 tile contract: relative={relative:.3e} (max_abs={max_abs:.3e}, max_ref={max_ref:.3e})"
+            );
+        };
+        let reference = run("matmul_q4_0_batch_16row", 1, 16, 128, &input);
+        let candidate = run("matmul_q4_0_batch_mm64", 32, 64, 256, &input);
+        errors("batch_mm64", &reference, &candidate);
+        // Accumulation regression guard: zero the final 64-dim K-chunk.  A
+        // kernel that keeps only the last chunk produces an all-zero output
+        // here (relative error ~1); a correct reducer keeps the rest.
+        let mut input_no_last = input.clone();
+        for token in 0..batch as usize {
+            for k in (input_width as usize - 64)..input_width as usize {
+                input_no_last[token * input_width as usize + k] = 0.0;
+            }
         }
-        mean_abs /= output_len as f32;
-        eprintln!(
-            "batch_mm64 batch={batch} input={input_width} output={output_width}: max_abs={max_abs:.3e} mean_abs={mean_abs:.3e}"
-        );
-        assert!(
-            max_abs < 0.5,
-            "mm64 diverges beyond a coherent bound: max_abs={max_abs:.3e}"
+        let reference_no_last = run("matmul_q4_0_batch_16row", 1, 16, 128, &input_no_last);
+        let candidate_no_last = run("matmul_q4_0_batch_mm64", 32, 64, 256, &input_no_last);
+        errors(
+            "batch_mm64_last_chunk_zeroed",
+            &reference_no_last,
+            &candidate_no_last,
         );
     }
 }

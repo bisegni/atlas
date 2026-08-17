@@ -31,7 +31,7 @@ tokens). It is latency/occupancy-bound.
 | tile-8 + software prefetch | ~280 | −12% compiler already pipelines |
 | matrix units fp32 8×8 | ~199 | slower + max-abs 7e-3 > 1e-3 |
 | matrix units fp16 8×8 (Option B) | ~224 | slower + max-abs 2.6–6.5e-2, stream drifts |
-| mm64 fp16 32-token tile (opt-in, 2bcb321) | ~373 / ~340 | landed opt-in (pp512/pp1024); gap 4.6× |
+| mm64 fp16 32-token tile (opt-in, 2bcb321) | ~386 / ~353 (after fix) | landed opt-in; gap ~4.5×; shipped kernel was numerically broken until the 2026-08-17 fix (pre-fix speed ~373 / ~340; pre-fix accuracy claims void) |
 | mm64v2 64-token tile (2026-08-17) | ~368 / ~338 | wash (−1% vs mm64), reverted |
 | mm64v2 + double-buffered staging (2026-08-17) | ~314 / ~290 | regression (32KB threadgroup → 1 tg/core), reverted |
 
@@ -132,10 +132,44 @@ base pointers — offsets 2/4/8/64 all behaved exactly as addressed):
 5. `simdgroup_store(..., transpose = true)` writes the transposed register:
    `mem[y*S + x + r*S + c] = reg[c][r]`.
 
-The production `mm64` combo follows directly: weights staged row-major are
-loaded with `transpose = false` (register = row×k), the staged input slice
-is loaded with `transpose = true` (register = k×token), the mma gives
-row×token, and the transposed store lands it token-major in the output.
+The GEMM combo that is correct for the production staging (both blocks
+row-major, output token-major) — pinned down on 2026-08-17 by an impulse
+test against the fp32 reference after the parity suite exposed the shipped
+combination (below):
+
+- `a` (token slice, token×k) loaded with `transpose = false` (row-major),
+- `b` (weight slice, row×k) loaded with `transpose = true` (column-major
+  read, i.e. the register holds k×row),
+- mma accumulates `d = a_reg · b_reg` in fp32 across ALL K-chunks
+  (persistent per-token-subtile accumulators, one store after the loop),
+- store with `transpose = false` writes `d[r][c]` to
+  `output[token r][row c]` row-major.
+
+**The shipped mm64 kernel was wrong until this was found.** The original
+kernel used load flags `(true, false)` with a `transpose = true` store —
+a garbled, transposed contraction under the semantics above — AND reset
+its accumulator per K-chunk, silently keeping only the final 64-dim
+chunk's contribution. It still "passed" `batch_mm64_measures_accuracy`
+(max-abs 1.9e-2..4.7e-2) for two compounding reasons: the test's q4
+weight scales were encoded as raw half bit patterns that decoded to
+subnormal halves ~1e-5, making every dot product ~1000× smaller than
+model-realistic, and the assertion was an absolute `max_abs < 0.5` that
+no bounded output could fail. All "mm64 accuracy" claims before
+2026-08-17 (including the commit message of 2bcb321) were artifacts of
+that test; the kernel's measured *speed* numbers remain valid. The fix:
+correct load/store combo, persistent accumulators, realistic half-encoded
+weight scales in the test, a relative-error assertion (measured
+2.8e-4..3.4e-4 vs the fp32 reference), and a zeroed-final-K-chunk
+regression guard that fails any kernel that does not accumulate across
+chunks.
+
+Re-measured after the fix (same session, release, 1 warmup + 5 measured
+runs, tg128): pp512 ~386 tok/s (scalar 322, broken-kernel mm64 373),
+pp1024 ~353 (scalar 299.6, broken 340), decode unchanged (~64 / ~61).
+The persistent accumulators removed four simdgroup stores per chunk, so
+the correct kernel is also the fastest mm64 variant measured. E2E sanity:
+`ATLAS_GEMMA4_MM64=1` chat now generates coherent text (it silently
+produced garbage prefill before the fix).
 
 Harness post-mortem (why earlier bisects looked broken — no hardware
 weirdness was found for in-bounds use):
@@ -166,8 +200,10 @@ Design consequences for the next iteration:
   scalar baseline re-measured the same session at 322 / 299.6 tok/s):
   - 64-token tile (`matmul_q4_0_batch_mm64v2`, halves per-token dequant
     and threadgroups): pp512 ~368, pp1024 ~338 tok/s — a wash vs mm64
-    (373 / 340), parity max-abs in the same 1.6e-2..6.6e-2 fp16 class.
-    Widening the tile alone is not the lever.
+    (373 / 340). Widening the tile alone is not the lever. (Its parity
+    runs were later found to have compared broken kernels against the
+    broken test; the timing conclusion is unaffected — the contraction
+    bug does not change the work performed.)
   - Same tile with double-buffered staging (next chunk dequantized into
     the alternate buffer during compute, one barrier per chunk): pp512
     ~314, pp1024 ~290 tok/s — a regression. The double buffers take

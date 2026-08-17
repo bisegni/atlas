@@ -394,10 +394,12 @@ kernel void matmul_q4_0_batch_32row(
 // (8x less than the 8-token scalar tile).  NOT within the max-abs 1e-3 contract
 // (fp16 cast); Phase B accepts ~1e-2 for prefill speed.  Requires batch % 32
 // == 0, output_width % 64 == 0, input_width % 64 == 0 (executor falls back to
-// matmul_q4_0_batch_32row otherwise).  simdgroup register semantics on this
-// toolchain are recorded in docs/plan-close-prefill-gap.md: transpose=true
-// loads read column-major, transpose=false row-major, the mma computes
-// a_reg * b_reg, and transpose=true stores write the transposed register.
+// matmul_q4_0_batch_32row otherwise).  Correct simdgroup combo (pinned down
+// 2026-08-17 after the original load/store flags + per-chunk accumulators
+// were found to compute a garbled last-chunk-only result): a-load
+// transpose=false, b-load transpose=true, fp32 accumulators persist across
+// K-chunks, single transpose=false store per sub-tile.  Semantics details in
+// docs/plan-close-prefill-gap.md.
 inline float simd_q4_0_dequant(device const uchar *weights, uint row, uint blocks, uint dim) {
     uint block = dim / 32;
     uint within = dim % 32;
@@ -425,6 +427,17 @@ kernel void matmul_q4_0_batch_mm64(
     uint blocks = input_width / 32;
     threadgroup half wb[ROWS * CHUNK];
     threadgroup half ib[TOKENS * CHUNK];
+    // Persistent per-token-subtile accumulators: every K-chunk adds into them
+    // and the output is written once after the full reduction.  (An earlier
+    // revision reset and stored these inside the chunk loop, silently keeping
+    // only the last chunk's contribution.)  The loops over `d` must stay
+    // fully unrolled so every simdgroup-matrix index is a compile-time
+    // constant; dynamic indexing into a simdgroup-matrix array does not
+    // lower to valid fragment storage.
+    simdgroup_float8x8 d[TOKENS / 8];
+    _Pragma("clang loop unroll(full)") for (uint tt = 0; tt < TOKENS / 8; ++tt) {
+        d[tt] = simdgroup_float8x8(0.0f);
+    }
     for (uint kc = 0; kc < input_width; kc += CHUNK) {
         for (uint e = 0; e < ROWS * CHUNK / 256; ++e) {
             uint idx = tid * (ROWS * CHUNK / 256) + e;
@@ -441,23 +454,32 @@ kernel void matmul_q4_0_batch_mm64(
             ib[idx] = (token < batch) ? half(input[token * input_width + kc + k]) : 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint tt = 0; tt < TOKENS / 8; ++tt) {
-            simdgroup_float8x8 d(0.0f);
+        _Pragma("clang loop unroll(full)") for (uint tt = 0; tt < TOKENS / 8; ++tt) {
             for (uint sub = 0; sub < CHUNK / 8; ++sub) {
                 uint k_off = sub * 8;
                 simdgroup_half8x8 a, b;
-                simdgroup_load(a, ib + tt * 8 * CHUNK + k_off, CHUNK, ulong2(0, 0), true);
-                simdgroup_load(b, wb + simdgroup * 8 * CHUNK + k_off, CHUNK, ulong2(0, 0), false);
-                simdgroup_multiply_accumulate(d, a, b, d);
+                // Probe-verified contraction (artifacts/mm64-layout + impulse
+                // test): both blocks staged row-major, load flags (a=false,
+                // b=true) give d[r][c] = sum_k A[r][k]*B[c][k]; a
+                // transpose=false store then writes it row-major.  Here A is
+                // the token slice (r=token, k=dim) and B the weight slice
+                // (c=row), so the memory cell is output[token][row].  The
+                // original (true, false) loads with a transpose=true store
+                // computed a garbled, transposed contraction.
+                simdgroup_load(a, ib + tt * 8 * CHUNK + k_off, CHUNK, ulong2(0, 0), false);
+                simdgroup_load(b, wb + simdgroup * 8 * CHUNK + k_off, CHUNK, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(d[tt], a, b, d[tt]);
             }
-            simdgroup_store(
-                d,
-                output + (base_token + tt * 8) * output_width + base_row + simdgroup * 8,
-                output_width,
-                ulong2(0, 0),
-                true);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    _Pragma("clang loop unroll(full)") for (uint tt = 0; tt < TOKENS / 8; ++tt) {
+        simdgroup_store(
+            d[tt],
+            output + (base_token + tt * 8) * output_width + base_row + simdgroup * 8,
+            output_width,
+            ulong2(0, 0),
+            false);
     }
 }
 
