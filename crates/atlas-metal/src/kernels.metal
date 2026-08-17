@@ -385,17 +385,19 @@ kernel void matmul_q4_0_batch_32row(
 
 
 
-// Phase B (Path B extension): tuned 64-token x 64-row fp16 matrix-unit GEMM.
+// Phase B (Path B extension): tuned 32-token x 64-row fp16 matrix-unit GEMM.
 // Each threadgroup stages one 64-dim K-chunk of q4_0-dequantized weights (fp16)
-// and the 64-token input slice (cast to fp16) in threadgroup memory (one
-// barrier per chunk), then loops 8 token-sub-tiles x 8 k-sub-chunks with
+// and the 32-token input slice (cast to fp16) in threadgroup memory (one
+// barrier per chunk), then loops 4 token-sub-tiles x 8 k-sub-chunks with
 // simdgroup_multiply_accumulate (fp16 inputs, fp32 accumulate).  The dequant is
-// amortized over 64 tokens and weight DRAM traffic is read once per threadgroup
+// amortized over 32 tokens and weight DRAM traffic is read once per threadgroup
 // (8x less than the 8-token scalar tile).  NOT within the max-abs 1e-3 contract
-// (fp16 cast); Phase B accepts ~1e-2 for prefill speed.  Requires batch % 64
+// (fp16 cast); Phase B accepts ~1e-2 for prefill speed.  Requires batch % 32
 // == 0, output_width % 64 == 0, input_width % 64 == 0 (executor falls back to
-// matmul_q4_0_batch_32row otherwise).  d = b * a with d (out_row x token),
-// b (out_row x k), a (k x token).
+// matmul_q4_0_batch_32row otherwise).  simdgroup register semantics on this
+// toolchain are recorded in docs/plan-close-prefill-gap.md: transpose=true
+// loads read column-major, transpose=false row-major, the mma computes
+// a_reg * b_reg, and transpose=true stores write the transposed register.
 inline float simd_q4_0_dequant(device const uchar *weights, uint row, uint blocks, uint dim) {
     uint block = dim / 32;
     uint within = dim % 32;
