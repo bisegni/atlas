@@ -6,6 +6,11 @@ Silicon with the required numerical or performance evidence recorded.
 
 ## Current phase
 
+- [phase-13.13-flash16-v5-shared-head-prefill-attention.md](phase-13.13-flash16-v5-shared-head-prefill-attention.md) —
+  Flash16-v5 prefill attention: one threadgroup per token with one SIMD group
+  per head, sharing the K/V q4_0 dequant across heads (kv_heads == 1). Prefill
+  attention ~163 → ~80 ms; prefill ~1132 → ~1356 tok/s; gap to llama.cpp ~1.4×
+  → ~1.25×; hash preserved.
 - [phase-13.12-fast-f16-prefill-mul-mm.md](phase-13.12-fast-f16-prefill-mul-mm.md) —
   Vendored llama.cpp's `kernel_mul_mm_f16_f32` (direct `half4x4` load, no
   dequant) for Gemma 4's fp16 `per_layer_model_proj`. The single naive
