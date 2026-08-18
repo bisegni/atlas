@@ -1034,7 +1034,11 @@ fn gemma4_q6_projection_kernel() -> &'static str {
 }
 
 pub(crate) fn gemma4_q4_projection_kernel() -> &'static str {
-    "matvec_q4_0_64row_mv"
+    if gemma4_decode_16row_enabled() {
+        "matvec_q4_0_16row_mv"
+    } else {
+        "matvec_q4_0_64row_mv"
+    }
 }
 
 pub(crate) fn gemma4_q4_qkv_projection_kernel() -> &'static str {
@@ -1172,7 +1176,31 @@ fn gemma4_q4_batch_mulmm(
 }
 
 pub(crate) fn gemma4_ffn_down_projection_kernel() -> &'static str {
-    "matvec_q4_0_64row_mv"
+    if gemma4_decode_16row_enabled() {
+        "matvec_q4_0_16row_mv"
+    } else {
+        "matvec_q4_0_64row_mv"
+    }
+}
+
+/// Opt-in gate for the llama.cpp-current 16-row-per-threadgroup q4_0 matvec
+/// granularity (128 threads, 4 SIMD groups x 4 rows) on the decode Q4
+/// matvec sites: ffn-down, attention-output, PLE, and the shared-KV query
+/// projection.  Off by default so the composed 64-row stack stays the
+/// production path; the 16-row kernels are bitwise-identical to the 64-row
+/// family per row and only change the threadgroup grid.
+fn gemma4_decode_16row_enabled() -> bool {
+    std::env::var_os("ATLAS_GEMMA4_DECODE_16ROW").is_some()
+}
+
+/// 16-row counterpart binding for the RMS-input decode matvecs: kernel name
+/// and rows-per-threadgroup for `matvec_rms_labeled`.
+fn gemma4_q4_rms_projection_binding() -> (&'static str, usize) {
+    if gemma4_decode_16row_enabled() {
+        ("matvec_q4_0_16row_mv_rms", 16)
+    } else {
+        ("matvec_q4_0_64row_mv_rms", 64)
+    }
 }
 
 fn gemma4_rms_norm_decode_kernel(hidden_size: usize) -> &'static str {
@@ -1884,12 +1912,17 @@ impl<'a> Gemma4E2bExecutor<'a> {
         };
         let buffers = &[input, weight, output, input_width, output_width_buffer];
         if format == GgufTensorType::Q4_0 {
+            let rows_per_group = if gemma4_decode_16row_enabled() {
+                16
+            } else {
+                64
+            };
             command.dispatch_threadgroups_1d_labeled(
                 kernel,
                 profiling_label,
                 buffers,
-                output_width.div_ceil(64),
-                256,
+                output_width.div_ceil(rows_per_group),
+                if rows_per_group == 64 { 256 } else { 128 },
             )?;
         } else if format == GgufTensorType::Q6K {
             command.dispatch_threadgroups_1d_labeled(
@@ -1923,7 +1956,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
         rms_weight: &GpuBuffer,
     ) -> Result<()> {
         let (kernel, rows_per_group): (&'static str, usize) = match format {
-            GgufTensorType::Q4_0 => ("matvec_q4_0_64row_mv_rms", 64),
+            GgufTensorType::Q4_0 => gemma4_q4_rms_projection_binding(),
             GgufTensorType::Q6K => ("matvec_q6_k_64row_mv_rms", 64),
             _ => anyhow::bail!(
                 "RMS-input matvec requires the mv_ext kernel family for format {format:?}"
@@ -1962,8 +1995,16 @@ impl<'a> Gemma4E2bExecutor<'a> {
             gemma4_ffn_down_projection_kernel(),
             Some("ffn_down_projection"),
             &[input, weight, output, input_width, output_width],
-            output_width_value.div_ceil(64),
-            256,
+            output_width_value.div_ceil(if gemma4_decode_16row_enabled() {
+                16
+            } else {
+                64
+            }),
+            if gemma4_decode_16row_enabled() {
+                128
+            } else {
+                256
+            },
         )?;
         Ok(())
     }

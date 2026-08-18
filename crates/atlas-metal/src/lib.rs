@@ -1008,6 +1008,8 @@ mod macos {
                 "gelu_multiply_f32",
                 "matvec_q4_0_64row_mv",
                 "matvec_q4_0_64row_mv_rms",
+                "matvec_q4_0_16row_mv",
+                "matvec_q4_0_16row_mv_rms",
                 "matmul_q4_0_qkv_32row_mv_rms",
                 "matmul_q4_0_gate_up_32row_mv_rms",
                 "matvec_q6_k_64row_mv",
