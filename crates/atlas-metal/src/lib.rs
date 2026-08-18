@@ -531,6 +531,77 @@ mod macos {
             Ok(())
         }
 
+        /// 2D-grid dispatch with threadgroup (shared) memory, required by the
+        /// vendored llama.cpp `kernel_mul_mm` family.  The grid is
+        /// `(width, height, 1)` threadgroups of `threads_per_threadgroup`
+        /// threads, and `threadgroup_memory_bytes` of shared memory is bound at
+        /// `threadgroup(0)`.
+        pub fn dispatch_threadgroups_2d_tgm(
+            &mut self,
+            kernel: &'static str,
+            profiling_label: Option<&'static str>,
+            buffers: &[(&GpuBuffer, usize)],
+            grid_width: usize,
+            grid_height: usize,
+            threads_per_threadgroup: usize,
+            threadgroup_memory_bytes: usize,
+        ) -> Result<(), MetalError> {
+            let encode_started = Instant::now();
+            if self.encoder.is_none() {
+                self.encoder = Some(
+                    self.command_buffer
+                        .computeCommandEncoder()
+                        .ok_or(MetalError::CommandCreation)?,
+                );
+            }
+            let encoder = self.encoder.as_ref().expect("compute encoder exists");
+            let pipeline = self
+                .runtime
+                .pipelines
+                .get(kernel)
+                .ok_or_else(|| MetalError::MissingKernel(kernel.into()))?;
+            encoder.setComputePipelineState(&**pipeline);
+            for (index, (buffer, offset)) in buffers.iter().enumerate() {
+                if *offset > buffer.bytes {
+                    return Err(MetalError::InvalidInput(
+                        "resident buffer offset is out of range".into(),
+                    ));
+                }
+                unsafe {
+                    encoder.setBuffer_offset_atIndex(Some(buffer.native()), *offset, index);
+                }
+            }
+            if threadgroup_memory_bytes > 0 {
+                unsafe {
+                    encoder.setThreadgroupMemoryLength_atIndex(threadgroup_memory_bytes, 0);
+                }
+            }
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: grid_width.max(1),
+                    height: grid_height.max(1),
+                    depth: 1,
+                },
+                MTLSize {
+                    width: threads_per_threadgroup.max(1),
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.complete_profiled_dispatch(
+                kernel,
+                profiling_label,
+                0,
+                grid_width.saturating_mul(grid_height),
+                threads_per_threadgroup,
+                Self::estimate_bound_bytes(
+                    buffers.iter().map(|(buffer, offset)| (*buffer, *offset)),
+                ),
+                encode_started.elapsed(),
+            )?;
+            Ok(())
+        }
+
         fn complete_profiled_dispatch(
             &mut self,
             kernel: &'static str,
@@ -866,12 +937,18 @@ mod macos {
                 "rms_norm_decode_f32",
                 "rms_norm_decode_f32_vec4",
                 "gemma4_rms_residual_f32",
+                "gemma4_ple_rms_add_scale_f32",
                 "matvec_f32",
                 "matvec_q4_0",
                 "matvec_q4_0_blocked",
                 "matmul_q4_0_batch_16row",
                 "matmul_q4_0_batch_32row",
                 "matmul_q4_0_batch_mm64",
+                "gemma4_q4_0_to_f16_batch",
+                "gemma4_cast_f32_to_f16_batch",
+                "matmul_q4_0_batch_f16",
+                "llama_mul_mm_q4_0_f32",
+                "llama_mul_mm_f16_f32",
                 "matmul_f16_batch",
                 "matvec_q8_0",
                 "embedding_lookup_q4_0",
@@ -920,6 +997,8 @@ mod macos {
                 "attention_decode_gemma4_simd_q4_0_flash16_swa_exact_v3",
                 "attention_decode_gemma4_simd_q4_0_flash16_v4",
                 "attention_decode_gemma4_simd_q4_0_flash16_swa_v4",
+                "attention_prefill_gemma4_simd_q4_0_flash16_v4",
+                "attention_prefill_gemma4_simd_q4_0_flash16_swa_v4",
                 "gelu_multiply_f32",
                 "matvec_q4_0_64row_mv",
                 "matvec_q4_0_64row_mv_rms",

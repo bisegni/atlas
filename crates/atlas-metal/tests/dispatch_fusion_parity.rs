@@ -256,3 +256,97 @@ fn rms_residual_matches_rms_norm_then_add() {
         );
     }
 }
+
+#[test]
+fn ple_rms_add_scale_matches_norm_add_then_scale() {
+    // The decode PLE-per-layer epilogue is normally three dispatches:
+    //   rms_norm_decode_f32_vec4(work, post_norm) -> normalized
+    //   vector_add_f32(state, normalized)         -> state
+    //   scalar_multiply_f32(state, layer_output_scale) -> state
+    // gemma4_ple_rms_add_scale_f32 fuses all three (one dispatch). It must
+    // match that exact reference path under the max-abs < 1e-3 phase contract.
+    let runtime = match MetalRuntime::new() {
+        Ok(runtime) => runtime,
+        Err(MetalError::NoDevice) => {
+            eprintln!("skipping: no Metal device is available to this process");
+            return;
+        }
+        Err(error) => panic!("Metal runtime should initialize: {error}"),
+    };
+    let mut state = 0x3a5c_9491u32;
+    let epsilon = 1e-6f32;
+    for hidden in [512u32, 1280u32, 2304u32] {
+        let len = hidden as usize;
+        let mut input = vec![0.0f32; len];
+        fill_f32(&mut input, &mut state);
+        let mut weight = vec![0.0f32; len];
+        fill_f32(&mut weight, &mut state);
+
+        // reverse(0.25, 2.0) so the scale is not trivially 1.0
+        let scale = (next_f32(&mut state) - 0.5) * 4.0 + 1.0;
+        let input_buf = runtime.upload_f32(&input).unwrap();
+        let weight_buf = runtime.upload_f32(&weight).unwrap();
+        let hidden_buf = runtime.upload_u32(&[hidden]).unwrap();
+        let eps_buf = runtime.upload_f32(&[epsilon]).unwrap();
+        let scale_buf = runtime.upload_f32(&[scale]).unwrap();
+
+        let zero = vec![0.0f32; len];
+
+        // Reference: norm -> add -> scale
+        let mut state_ref = vec![0.0f32; len];
+        fill_f32(&mut state_ref, &mut state);
+        let state_ref_buf = runtime.upload_f32(&state_ref).unwrap();
+        let normalized = runtime.upload_f32(&zero).unwrap();
+        dispatch(
+            &runtime,
+            "rms_norm_decode_f32_vec4",
+            &[
+                (&input_buf, 0),
+                (&weight_buf, 0),
+                (&normalized, 0),
+                (&hidden_buf, 0),
+                (&eps_buf, 0),
+            ],
+            1,
+            32,
+        );
+        dispatch_1d(
+            &runtime,
+            "vector_add_f32",
+            &[&state_ref_buf, &normalized, &state_ref_buf, &hidden_buf],
+            hidden as usize,
+        );
+        dispatch_1d(
+            &runtime,
+            "scalar_multiply_f32",
+            &[&state_ref_buf, &state_ref_buf, &scale_buf, &hidden_buf],
+            hidden as usize,
+        );
+        let reference = runtime.read_f32(&state_ref_buf, len).unwrap();
+
+        // Candidate: fused single dispatch (must start from the same state)
+        let state_cand_buf = runtime.upload_f32(&state_ref).unwrap();
+        let normalized = runtime.upload_f32(&zero).unwrap();
+        dispatch(
+            &runtime,
+            "gemma4_ple_rms_add_scale_f32",
+            &[
+                (&input_buf, 0),
+                (&weight_buf, 0),
+                (&state_cand_buf, 0),
+                (&normalized, 0),
+                (&hidden_buf, 0),
+                (&eps_buf, 0),
+                (&scale_buf, 0),
+            ],
+            1,
+            32,
+        );
+        let candidate = runtime.read_f32(&state_cand_buf, len).unwrap();
+        compare(
+            &format!("ple_rms_add_scale hidden={hidden} scale={scale}"),
+            &reference,
+            &candidate,
+        );
+    }
+}

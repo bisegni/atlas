@@ -335,3 +335,137 @@ fn batch_mm64_measures_accuracy() {
         );
     }
 }
+/// llama.cpp-style fp16 mul_mm path (opt-in `ATLAS_GEMMA4_MUL_MM`): the two
+/// prep passes (q4_0 -> fp16 layer dequant, fp32 activation -> fp16 cast) then
+/// the no-threadgroup-staging matrix-unit GEMM.  Asserted at llama.cpp's own
+/// accuracy level (relative, not the tight max-abs < 1e-3 fp32 contract) since
+/// fp16 inputs are inherent to this path.  Includes the "final K-chunk zeroed"
+/// guard that fails a kernel which only keeps the last chunk.
+#[test]
+fn batch_mul_mm_f16_measures_accuracy() {
+    let runtime = match MetalRuntime::new() {
+        Ok(runtime) => runtime,
+        Err(MetalError::NoDevice) => {
+            eprintln!("skipping: no Metal device is available to this process");
+            return;
+        }
+        Err(error) => panic!("Metal runtime should initialize: {error}"),
+    };
+    let mut state = 0x5eed_cafeu32;
+    for (batch, input_width, output_width) in [
+        (64u32, 2304u32, 4096u32),
+        (64u32, 2048u32, 2304u32),
+        (128u32, 2304u32, 2304u32),
+    ] {
+        let blocks = (input_width / 32) as usize;
+        let input = {
+            let mut v = vec![0.0f32; (batch * input_width) as usize];
+            fill_f32(&mut v, &mut state);
+            v
+        };
+        let weights = build_q4_weights(output_width as usize, blocks, &mut state);
+        let q4 = runtime.upload_bytes(&weights).unwrap();
+        let in_w_buf = runtime.upload_u32(&[input_width]).unwrap();
+        let out_w_buf = runtime.upload_u32(&[output_width]).unwrap();
+        let batch_buf = runtime.upload_u32(&[batch]).unwrap();
+        let f16_w = runtime
+            .allocate((output_width as usize) * (input_width as usize) * 2)
+            .unwrap();
+        let f16_a = runtime
+            .allocate((batch as usize) * (input_width as usize) * 2)
+            .unwrap();
+        let output_len = (batch * output_width) as usize;
+        let run = |kernel: &'static str,
+                   tile_tokens: usize,
+                   rows_per_group: usize,
+                   threads: usize,
+                   input_slice: &[f32]| {
+            let out_buf = runtime.upload_f32(&vec![0.0f32; output_len]).unwrap();
+            let input32 = runtime.upload_f32(input_slice).unwrap();
+            let mut command = runtime.begin_resident_command().unwrap();
+            command
+                .dispatch_threadgroups_1d(
+                    kernel,
+                    &[&input32, &q4, &out_buf, &in_w_buf, &out_w_buf, &batch_buf],
+                    (batch as usize).div_ceil(tile_tokens)
+                        * (output_width as usize).div_ceil(rows_per_group),
+                    threads,
+                )
+                .unwrap();
+            command.finish().unwrap();
+            runtime.read_f32(&out_buf, output_len).unwrap()
+        };
+
+        let run_mul_mm = |input_values: &[f32]| {
+            let input32 = runtime.upload_f32(input_values).unwrap();
+            let out_buf = runtime.upload_f32(&vec![0.0f32; output_len]).unwrap();
+            let mut command = runtime.begin_resident_command().unwrap();
+            command
+                .dispatch_threadgroups_1d(
+                    "gemma4_q4_0_to_f16_batch",
+                    &[&q4, &f16_w, &in_w_buf, &out_w_buf],
+                    (output_width as usize).div_ceil(256),
+                    256,
+                )
+                .unwrap();
+            command
+                .dispatch_threadgroups_1d(
+                    "gemma4_cast_f32_to_f16_batch",
+                    &[&input32, &f16_a, &in_w_buf, &batch_buf],
+                    ((batch * input_width) as usize).div_ceil(256),
+                    256,
+                )
+                .unwrap();
+            command
+                .dispatch_threadgroups_1d(
+                    "matmul_q4_0_batch_f16",
+                    &[&f16_a, &f16_w, &out_buf, &in_w_buf, &out_w_buf, &batch_buf],
+                    (batch as usize).div_ceil(32) * (output_width as usize).div_ceil(32),
+                    128,
+                )
+                .unwrap();
+            command.finish().unwrap();
+            runtime.read_f32(&out_buf, output_len).unwrap()
+        };
+
+        let reference = run("matmul_q4_0_batch_16row", 1, 16, 128, &input);
+        let candidate = run_mul_mm(&input);
+        let errors = |label: &str, reference: &[f32], candidate: &[f32]| {
+            let mut max_abs = 0.0f32;
+            let mut max_ref = 0.0f32;
+            for (c, r) in candidate.iter().zip(reference) {
+                max_abs = max_abs.max((c - r).abs());
+                max_ref = max_ref.max(r.abs());
+            }
+            let relative = if max_ref > 0.0 {
+                max_abs / max_ref
+            } else {
+                0.0
+            };
+            eprintln!(
+                "{label} batch={batch} input={input_width} output={output_width}: max_abs={max_abs:.3e} max_ref={max_ref:.3e} relative={relative:.3e}"
+            );
+            assert!(
+                relative < 5e-2,
+                "{label} diverges beyond the llama-grade fp16 mul_mm contract: relative={relative:.3e} (max_abs={max_abs:.3e}, max_ref={max_ref:.3e})"
+            );
+        };
+        errors("batch_mul_mm_f16", &reference, &candidate);
+        // Accumulation regression guard: zero the final 64-dim K-chunk.  A
+        // kernel that keeps only the last chunk produces an all-zero output
+        // here; a correct reducer keeps the rest.
+        let mut input_no_last = input.clone();
+        for token in 0..batch as usize {
+            for k in (input_width as usize - 64)..input_width as usize {
+                input_no_last[token * input_width as usize + k] = 0.0;
+            }
+        }
+        let reference_no_last = run("matmul_q4_0_batch_16row", 1, 16, 128, &input_no_last);
+        let candidate_no_last = run_mul_mm(&input_no_last);
+        errors(
+            "batch_mul_mm_f16_last_chunk_zeroed",
+            &reference_no_last,
+            &candidate_no_last,
+        );
+    }
+}

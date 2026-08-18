@@ -213,6 +213,51 @@ kernel void gemma4_rms_residual_f32(
     }
 }
 
+// Decode PLE-per-layer epilogue fusion (phase-13.9, dispatch reduction).
+// The current per-layer PLE tail is three elementwise dispatches over the
+// hidden row:
+//   rms_norm_decode_f32_vec4(work, post_norm)          // -> normalized
+//   vector_add_f32(state, normalized)                  // -> state
+//   scalar_multiply_f32(state, layer_output_scale)     // -> state
+// This kernel fuses them into one dispatch, saving 2 launches per layer
+// (~70 of the ~547 decode dispatches/token).  It retains the exact
+// rms_norm_decode_f32_vec4 reduction and the volatile `normalized`
+// rounding boundary (same as gemma4_rms_residual_f32), then computes
+//   state = (state + normalized) * layer_output_scale
+// elementwise, which is bitwise-identical to the three-kernel baseline.
+kernel void gemma4_ple_rms_add_scale_f32(
+    device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]],
+    // state doubles as the residual source and the scaled output.
+    device volatile float *state [[buffer(2)]],
+    device volatile float *normalized [[buffer(3)]],
+    constant uint &hidden [[buffer(4)]], constant float &epsilon [[buffer(5)]],
+    device const float *scale [[buffer(6)]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    uint vector_tiles = hidden / 128;
+    float squared_sum = 0.0f;
+    for (uint tile = 0; tile < vector_tiles; ++tile) {
+        uint offset = tile * 128 + lane * 4;
+        float4 x = *(device const float4 *)(input + offset);
+        squared_sum += x.x * x.x + x.y * x.y + x.z * x.z + x.w * x.w;
+    }
+    float inverse_rms = rsqrt(simd_sum(squared_sum) / float(hidden) + epsilon);
+    for (uint tile = 0; tile < vector_tiles; ++tile) {
+        uint offset = tile * 128 + lane * 4;
+        float4 x = *(device const float4 *)(input + offset);
+        float4 w = *(device const float4 *)(weight + offset);
+        *(device float4 *)(normalized + offset) = x * inverse_rms * w;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    float s = *scale;
+    for (uint tile = 0; tile < vector_tiles; ++tile) {
+        uint offset = tile * 128 + lane * 4;
+        float4 n = *(device const float4 *)(normalized + offset);
+        float4 r = *(device const float4 *)(state + offset);
+        *(device float4 *)(state + offset) = (r + n) * s;
+    }
+}
+
+
 kernel void matvec_f32(
     device const float *input [[buffer(0)]], device const float *weights [[buffer(1)]],
     device float *output [[buffer(2)]], constant uint &input_width [[buffer(3)]],
@@ -477,6 +522,103 @@ kernel void matmul_q4_0_batch_mm64(
         simdgroup_store(
             d[tt],
             output + (base_token + tt * 8) * output_width + base_row + simdgroup * 8,
+            output_width,
+            ulong2(0, 0),
+            false);
+    }
+}
+
+// llama.cpp-style fp16 matrix-unit mul_mm (Path B opt-in, `ATLAS_GEMMA4_MUL_MM`).
+// The two prep passes turn the two GPU-hostile inputs into fp16 fragments that
+// this GEMM can feed straight to the matrix units with NO threadgroup weight
+// staging and NO per-K-chunk dequant barrier:
+//   - gemma4_q4_0_to_f16_batch  dequantizes the resident row-major GGUF q4_0
+//     tensor into a contiguous fp16 layer buffer `[out][in]`;
+//   - gemma4_cast_f32_to_f16_batch casts the fp32 activation slice to fp16.
+// matmul_q4_0_batch_f16 then uses llama.cpp's persistent-accumulator structure:
+// each threadgroup covers GEMMA4_MUL_MM_TOKENS=32 tokens x 32 output rows and
+// keeps GEMMA4_MUL_MM_TOKENS/8 independent fp32 simdgroup accumulators across
+// the whole K reduction, loading each 8-row weight sub-block into the matrix
+// units once and reusing it across the 32 tokens.  A 512-token prompt therefore
+// reads the weight matrix 512/32 = 16 times (vs 64 for an 8-token tile) while
+// charging no per-chunk dequant/barrier -- the contraction (a-load
+// transpose=false, b-load transpose=true, transpose=false store) is the
+// probe-verified one from `matmul_q4_0_batch_mm64` (docs/plan-close-prefill-gap.md).
+// This is tolerance-level (fp16 inputs => ~1e-4 relative error vs fp32),
+// llama.cpp's own accuracy level, so the executor keeps it opt-in (`ATLAS_GEMMA4_MUL_MM`)
+// and leaves the fp32 scalar tile as the max-abs < 1e-3 default.
+#define GEMMA4_MUL_MM_ROWS 32   // output rows per threadgroup (4 simdgroups x 8)
+#define GEMMA4_MUL_MM_TOKENS 32 // tokens per threadgroup (4 x 8-token subtiles)
+kernel void gemma4_q4_0_to_f16_batch(
+    device const uchar *q4 [[buffer(0)]],
+    device half *f16 [[buffer(1)]],
+    constant uint &input_width [[buffer(2)]],
+    constant uint &output_width [[buffer(3)]],
+    uint id [[thread_position_in_grid]]) {
+    // One thread per output row; each thread dequantizes all of that row's
+    // q4_0 blocks into fp16.  Layout matches `dequantize_block` in atlas-core.
+    if (id >= output_width) return;
+    uint blocks = input_width / 32;
+    device half *dst = f16 + id * input_width;
+    for (uint b = 0; b < blocks; ++b) {
+        device const uchar *base = q4 + (id * blocks + b) * 18;
+        half scale = *(device const half *)base;
+        for (uint i = 0; i < 16; ++i) {
+            uchar packed = base[2 + i];
+            dst[b * 32 + i]      = half(float(int(packed & 15) - 8) * float(scale));
+            dst[b * 32 + i + 16] = half(float(int(packed >> 4) - 8) * float(scale));
+        }
+    }
+}
+
+kernel void gemma4_cast_f32_to_f16_batch(
+    device const float *input [[buffer(0)]],
+    device half *output [[buffer(1)]],
+    constant uint &input_width [[buffer(2)]],
+    constant uint &batch [[buffer(3)]],
+    uint id [[thread_position_in_grid]]) {
+    uint count = batch * input_width;
+    if (id >= count) return;
+    output[id] = half(input[id]);
+}
+
+kernel void matmul_q4_0_batch_f16(
+    device const half *act_f16 [[buffer(0)]],
+    device const half *weights_f16 [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &input_width [[buffer(3)]],
+    constant uint &output_width [[buffer(4)]],
+    constant uint &batch [[buffer(5)]],
+    uint group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    const uint grid_row_tiles = (output_width + GEMMA4_MUL_MM_ROWS - 1) / GEMMA4_MUL_MM_ROWS;
+    const uint token_tile = group / grid_row_tiles;
+    const uint row_tile = group % grid_row_tiles;
+    const uint base_token = token_tile * GEMMA4_MUL_MM_TOKENS;
+    const uint base_row = row_tile * GEMMA4_MUL_MM_ROWS;
+    const uint simdgroup = tid / 32;
+    const uint sg_row = base_row + simdgroup * 8;
+    // Executor gate guarantees batch % GEMMA4_MUL_MM_TOKENS == 0,
+    // output_width % GEMMA4_MUL_MM_ROWS == 0 and input_width % 8 == 0, so every
+    // load/store stays in bounds.  d[] must stay fully unrolled so every
+    // fragment index is a compile-time constant (dynamic indexing into a
+    // simdgroup-matrix array does not lower to valid fragment storage).
+    simdgroup_float8x8 d[GEMMA4_MUL_MM_TOKENS / 8];
+    _Pragma("clang loop unroll(full)") for (uint tt = 0; tt < GEMMA4_MUL_MM_TOKENS / 8; ++tt) {
+        d[tt] = simdgroup_float8x8(0.0f);
+    }
+    for (uint k0 = 0; k0 + 8 <= input_width; k0 += 8) {
+        simdgroup_half8x8 b;
+        simdgroup_load(b, weights_f16 + sg_row * input_width + k0, input_width, ulong2(0, 0), true);
+        _Pragma("clang loop unroll(full)") for (uint tt = 0; tt < GEMMA4_MUL_MM_TOKENS / 8; ++tt) {
+            simdgroup_half8x8 a;
+            simdgroup_load(a, act_f16 + (base_token + tt * 8) * input_width + k0, input_width, ulong2(0, 0), false);
+            simdgroup_multiply_accumulate(d[tt], a, b, d[tt]);
+        }
+    }
+    _Pragma("clang loop unroll(full)") for (uint tt = 0; tt < GEMMA4_MUL_MM_TOKENS / 8; ++tt) {
+        simdgroup_store(
+            d[tt],
+            output + (base_token + tt * 8) * output_width + sg_row,
             output_width,
             ulong2(0, 0),
             false);
@@ -1997,6 +2139,118 @@ kernel void NAME( \
 }
 
 DEFINE_FLASH_ATTENTION_V4(attention_decode_gemma4_simd_q4_0_flash16_v4, 512, 16, 12)
+
+// Batched prefill variant of Flash16 v4 (phase-13.11): identical merged-slice
+// design, but the grid is batch*heads (one threadgroup per (token, head)) and
+// each threadgroup reads its token's packed key_control entry
+// (key_start<<16 | key_count) from the contiguous per-token table (stride
+// `layers`).  This replaces the serial per-key, per-key-barrier prefill scan
+// (attention_decode_fused_gemma4_simd_q4_0_batch) with the barrier-free
+// merged-slice flash scan for every prompt token in one dispatch.  Like the
+// decode v4 kernel it is tolerance-level (the slice split + merge changes the
+// FP32 reduction order), not bitwise.
+#define DEFINE_FLASH_ATTENTION_V4_BATCH(NAME, HEAD_DIM, BLOCKS, SLICES) \
+kernel void NAME( \
+    device const float *query [[buffer(0)]], device const uchar *cache [[buffer(1)]], \
+    device float *output [[buffer(2)]], constant uint &heads [[buffer(3)]], \
+    constant uint &kv_heads [[buffer(4)]], constant uint &head_dim [[buffer(5)]], \
+    constant uint &capacity [[buffer(6)]], device const uint *key_control [[buffer(7)]], \
+    constant uint &layers [[buffer(8)]], \
+    uint group [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]], \
+    uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]) { \
+    uint token = group / heads; \
+    uint head = group % heads; \
+    if (head >= heads) return; \
+    if (head_dim != HEAD_DIM) return; \
+    if (simd_group >= SLICES) return; \
+    uint control = key_control[token * layers]; \
+    uint key_start = control >> 16; \
+    uint key_count = control & 0xffffu; \
+    uint kv_head = head / (heads / kv_heads); \
+    uint blocks_per_position = kv_heads * BLOCKS; \
+    uint value_base = capacity * blocks_per_position; \
+    uint qbase = token * heads * HEAD_DIM + head * HEAD_DIM; \
+    if (key_count == 0) { \
+        for (uint b = 0; b < BLOCKS; ++b) { \
+            uint dim = 32 * b + lane; \
+            if (dim < HEAD_DIM) output[qbase + dim] = 0.0f; \
+        } \
+        return; \
+    } \
+    uint start = key_start + simd_group * key_count / SLICES; \
+    uint end = key_start + (simd_group + 1) * key_count / SLICES; \
+    float maximum = -INFINITY; \
+    float denominator = 0.0f; \
+    FLASH_ACC_DECLS \
+    float q_cache[BLOCKS]; \
+    for (uint qb = 0; qb < BLOCKS; ++qb) { \
+        uint qdim = 32 * qb + lane; \
+        q_cache[qb] = query[qbase + qdim]; \
+    } \
+    for (uint key = start; key < end; ++key) { \
+        uint key_element = key * kv_heads * HEAD_DIM + kv_head * HEAD_DIM; \
+        uint key_block_base = key_element / 32; \
+        float partial = 0.0f; \
+        _Pragma("unroll") \
+        for (uint b = 0; b < BLOCKS; ++b) { \
+            device const uchar *base = cache + (key_block_base + b) * 18; \
+            float scale = simd_broadcast(float(*(device const half *)base), 0); \
+            uchar packed = base[2 + (lane & 15)]; \
+            uchar nibble = lane < 16 ? packed & 15 : packed >> 4; \
+            partial += q_cache[b] * scale * float(int(nibble) - 8); \
+        } \
+        float score = simd_sum(partial); \
+        float rescale = 1.0f; \
+        float weight; \
+        if (score > maximum) { \
+            rescale = exp(maximum - score); \
+            weight = 1.0f; \
+            maximum = score; \
+            denominator = denominator * rescale + weight; \
+        } else { \
+            weight = exp(score - maximum); \
+            denominator += weight; \
+        } \
+        uint value_block_base = value_base + key_block_base; \
+        _Pragma("unroll") \
+        for (uint b = 0; b < BLOCKS; ++b) { \
+            device const uchar *base = cache + (value_block_base + b) * 18; \
+            float scale = simd_broadcast(float(*(device const half *)base), 0); \
+            uchar packed = base[2 + (lane & 15)]; \
+            uchar nibble = lane < 16 ? packed & 15 : packed >> 4; \
+            float value = scale * float(int(nibble) - 8); \
+            if (b == 0) acc0 = acc0 * rescale + weight * value; \
+            FLASH_ACC_UPDATES \
+        } \
+    } \
+    threadgroup float merg_max[SLICES]; \
+    threadgroup float merg_sum[SLICES]; \
+    threadgroup float merg_out[SLICES * HEAD_DIM]; \
+    if (lane == 0) { \
+        merg_max[simd_group] = maximum; \
+        merg_sum[simd_group] = denominator; \
+    } \
+    FLASH_ACC_STORES(HEAD_DIM, BLOCKS) \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+    threadgroup float global_max, global_sum; \
+    if (tid == 0) { \
+        global_max = -INFINITY; \
+        for (uint g = 0; g < SLICES; ++g) global_max = max(global_max, merg_max[g]); \
+        global_sum = 0.0f; \
+        for (uint g = 0; g < SLICES; ++g) global_sum += merg_sum[g] * exp(merg_max[g] - global_max); \
+    } \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+    for (uint b = 0; b < BLOCKS; ++b) { \
+        uint dim = 32 * b + lane; \
+        float value = 0.0f; \
+        for (uint g = 0; g < SLICES; ++g) value += merg_out[g * HEAD_DIM + dim] * exp(merg_max[g] - global_max); \
+        output[qbase + dim] = value / global_sum; \
+    } \
+}
+
+DEFINE_FLASH_ATTENTION_V4_BATCH(attention_prefill_gemma4_simd_q4_0_flash16_v4, 512, 16, 12)
+DEFINE_FLASH_ATTENTION_V4_BATCH(attention_prefill_gemma4_simd_q4_0_flash16_swa_v4, 256, 8, 24)
+
 DEFINE_FLASH_ATTENTION_V4(attention_decode_gemma4_simd_q4_0_flash16_swa_v4, 256, 8, 24)
 
 
@@ -2539,3 +2793,364 @@ kernel void logits_process_f32(
     constant uint &count [[buffer(4)]], uint id [[thread_position_in_grid]]) {
     if (id < count) { output[id] = (logits[id] + bias[id]) / temperature; }
 }
+
+// ============================================================================
+// Vendored from llama.cpp — MIT License.
+//
+// Faithful port of llama.cpp's classic (simdgroup_load-based) `kernel_mul_mm`
+// (ggml/src/ggml-metal/ggml-metal.metal), specialized for q4_0 weights x f32
+// activations, a single batch, and contiguous row-major tensors. Only the
+// host/device ABI is adapted (scalar constants instead of ggml's kargs
+// struct); the compute core is llama.cpp's: a small 64x32 output tile per
+// threadgroup, dequantization of a 64x32 weight tile + a 32x32 activation
+// tile into threadgroup memory each K-step, then simdgroup_matrix
+// multiply-accumulate over K. This is the "fill the matrix" design that
+// realizes the matrix-unit throughput (as opposed to dequantizing the whole
+// weight into a device buffer first).
+//
+// MIT License
+// Copyright (c) 2023-2025 ggml-org / llama.cpp authors
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// ============================================================================
+
+typedef struct {
+    half  d;        // delta (scale)
+    uchar qs[16];   // nibbles / quants
+} llama_block_q4_0;
+
+static inline void llama_dequantize_q4_0(
+        device const llama_block_q4_0 * xb,
+        short il,
+        thread half4x4 & reg) {
+    device const ushort * qs = ((device const ushort *)xb + 1);
+    const float d1 = il ? ((float)xb->d / 16.f) : (float)xb->d;
+    const float d2 = d1 / 256.f;
+    const float md = -8.f * (float)xb->d;
+    const ushort mask0 = il ? 0x00F0 : 0x000F;
+    const ushort mask1 = mask0 << 8;
+
+    float4x4 reg_f;
+    for (int i = 0; i < 8; i++) {
+        reg_f[i/2][2*(i%2) + 0] = d1 * (float)(qs[i] & mask0) + md;
+        reg_f[i/2][2*(i%2) + 1] = d2 * (float)(qs[i] & mask1) + md;
+    }
+    reg = (half4x4)reg_f;
+}
+
+// C(M,N) = A(M,K) @ B(K,N) where A = src0 is the q4_0 weight [M=out x K],
+// B = src1 is the f32 activation laid out [N=tokens x K] (so B(k,n) reads
+// src1[n*K + k]), and dst is written [N x M] (dst[n*M + m]). Grid:
+// tgpig.x = ceil(N/32), tgpig.y = ceil(M/64), depth 1. 128 threads/threadgroup.
+kernel void llama_mul_mm_q4_0_f32(
+        device const uchar * src0,
+        device const float * src1,
+        device       float * dst,
+        constant uint & ne00,   // K
+        constant uint & ne0,    // M (output rows)
+        constant uint & ne1,    // N (tokens)
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+
+    threadgroup half * sa = (threadgroup half *)(shmem);
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;   // 2
+    constexpr int NL1 = NK/8;    // 4
+    constexpr short nl = 2;      // q4_0
+
+    const uint nb01 = (ne00/32)*18;   // weight row stride (bytes)
+    const uint nb10 = 4;              // activation element stride (bytes)
+    const uint nb11 = ne00*4;         // activation row stride (bytes)
+
+    const int r0 = tgpig.y*NR0;
+    const int r1 = tgpig.x*NR1;
+
+    const short nr0 = ((int)ne0 - r0 < NR0) ? ((int)ne0 - r0) : NR0;
+    const short nr1 = ((int)ne1 - r1 < NR1) ? ((int)ne1 - r1) : NR1;
+
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
+
+    const short il0 = (tiitg % NL0);
+    short il = il0;
+
+    const short offset1 = il0/nl;   // 0 for q4_0
+
+    device const llama_block_q4_0 * x =
+        (device const llama_block_q4_0 *)(src0 + nb01*(r0 + lr0)) + offset1;
+
+    const short iy = 8*(tiitg % NL1);
+
+    device const float * y = (device const float *)(
+        (device const uchar *)src1 + nb11*(r1 + lr1) + nb10*iy);
+
+    simdgroup_half8x8  ma[4];
+    simdgroup_half8x8  mb[2];
+    simdgroup_float8x8 mc[8];
+
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    for (int loop_k = 0; loop_k < (int)ne00; loop_k += NK) {
+        // A: dequantize the q4 weight tile into threadgroup memory
+        half4x4 temp_a;
+        llama_dequantize_q4_0(x, il, temp_a);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma unroll
+        for (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = (tiitg/NL0)/8;
+            const short lx = (tiitg/NL0)%8;
+            const short ly = i%8;
+            const short ib = 8*sx + sy;
+            *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+        }
+
+        // B: load the f32 activation tile into threadgroup memory (K % NK == 0)
+        {
+            const short sx = (tiitg%NL1);
+            const short sy = (tiitg/NL1)/8;
+            const short ly = (tiitg/NL1)%8;
+            const short ib = 4*sx + sy;
+            *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) =
+                (half2x4)(*((device float2x4 *)y));
+        }
+
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        x  = (il < 2) ? x + (2 + nl - 1)/nl : x;
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // load fragments from threadgroup memory and accumulate outer products
+        threadgroup const half * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const half * lsmb = (sb + 2*64*(sgitg/2));
+
+        #pragma unroll
+        for (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
+            for (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
+            for (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    if (r0 + NR0 <= (int)ne0 && r1 + NR1 <= (int)ne1) {
+        device float * C = (device float *)dst +
+            (r0 + 32*(sgitg &  1)) +
+            (r1 + 16*(sgitg >> 1)) * ne0;
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], C + 8*(i%4) + 8*ne0*(i/4), ne0, 0, false);
+        }
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float * temp_str =
+            ((threadgroup float *)shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            for (int j = tiitg; j < nr1; j += NR1) {
+                device float  * D  = (device float *)dst + r0 + (r1 + j)*ne0;
+                device float4 * D4 = (device float4 *)D;
+                threadgroup float  * C  = temp_str + (j*NR0);
+                threadgroup float4 * C4 = (threadgroup float4 *)C;
+                int i = 0;
+                for (; i < nr0/4; i++) {
+                    *(D4 + i) = *(C4 + i);
+                }
+                i *= 4;
+                for (; i < nr0; i++) {
+                    *(D + i) = *(C + i);
+                }
+            }
+        }
+    }
+}
+
+// C(M,N) = A(M,K) @ B(K,N) where A = src0 is the fp16 weight [M x K],
+// B = src1 is the f32 activation [N x K] (so B(k,n) reads src1[n*K + k]), and
+// dst is written [N x M] (dst[n*M + m]). Same tile/threadgroup geometry as
+// llama_mul_mm_q4_0_f32 (64x32 output tile, 4 simdgroups, NK=32), but the A
+// operand is fp16 with NO dequantization: a direct half4x4 load (llama.cpp's
+// dequantize_f16, MIT-attributed as above). Grid: tgpig.x = ceil(N/32),
+// tgpig.y = ceil(M/64). 128 threads/threadgroup.
+kernel void llama_mul_mm_f16_f32(
+        device const half  * src0,
+        device const float * src1,
+        device       float * dst,
+        constant uint & ne00,   // K
+        constant uint & ne0,    // M (output rows)
+        constant uint & ne1,    // N (tokens)
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+
+    threadgroup half * sa = (threadgroup half *)(shmem);
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;   // 2
+    constexpr int NL1 = NK/8;    // 4
+
+    const uint nb01 = ne00*2;    // weight row stride (bytes, f16)
+    const uint nb10 = 4;         // activation element stride (bytes)
+    const uint nb11 = ne00*4;    // activation row stride (bytes)
+
+    const int r0 = tgpig.y*NR0;
+    const int r1 = tgpig.x*NR1;
+
+    const short nr0 = ((int)ne0 - r0 < NR0) ? ((int)ne0 - r0) : NR0;
+    const short nr1 = ((int)ne1 - r1 < NR1) ? ((int)ne1 - r1) : NR1;
+
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
+
+    const short il0 = (tiitg % NL0);
+
+    device const half4x4 * x =
+        (device const half4x4 *)((device const uchar *)src0 + nb01*(r0 + lr0)) + il0;
+
+    const short iy = 8*(tiitg % NL1);
+
+    device const float * y = (device const float *)(
+        (device const uchar *)src1 + nb11*(r1 + lr1) + nb10*iy);
+
+    simdgroup_half8x8  ma[4];
+    simdgroup_half8x8  mb[2];
+    simdgroup_float8x8 mc[8];
+
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    for (int loop_k = 0; loop_k < (int)ne00; loop_k += NK) {
+        half4x4 temp_a = *x;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma unroll
+        for (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = (tiitg/NL0)/8;
+            const short lx = (tiitg/NL0)%8;
+            const short ly = i%8;
+            const short ib = 8*sx + sy;
+            *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+        }
+
+        {
+            const short sx = (tiitg%NL1);
+            const short sy = (tiitg/NL1)/8;
+            const short ly = (tiitg/NL1)%8;
+            const short ib = 4*sx + sy;
+            *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) =
+                (half2x4)(*((device float2x4 *)y));
+        }
+
+        x += 2;
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const half * lsmb = (sb + 2*64*(sgitg/2));
+
+        #pragma unroll
+        for (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
+            for (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
+            for (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    if (r0 + NR0 <= (int)ne0 && r1 + NR1 <= (int)ne1) {
+        device float * C = (device float *)dst +
+            (r0 + 32*(sgitg &  1)) +
+            (r1 + 16*(sgitg >> 1)) * ne0;
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], C + 8*(i%4) + 8*ne0*(i/4), ne0, 0, false);
+        }
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float * temp_str =
+            ((threadgroup float *)shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            for (int j = tiitg; j < nr1; j += NR1) {
+                device float  * D  = (device float *)dst + r0 + (r1 + j)*ne0;
+                device float4 * D4 = (device float4 *)D;
+                threadgroup float  * C  = temp_str + (j*NR0);
+                threadgroup float4 * C4 = (threadgroup float4 *)C;
+                int i = 0;
+                for (; i < nr0/4; i++) {
+                    *(D4 + i) = *(C4 + i);
+                }
+                i *= 4;
+                for (; i < nr0; i++) {
+                    *(D + i) = *(C + i);
+                }
+            }
+        }
+    }
+}
+

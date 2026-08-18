@@ -1066,6 +1066,36 @@ fn gemma4_q4_batch_uses_mm64() -> bool {
     std::env::var_os("ATLAS_GEMMA4_MM64").is_some()
 }
 
+/// Opt-in gate for the llama.cpp-style fp16 matrix-unit prefill GEMM
+/// (`matmul_q4_0_batch_f16`). Off by default so the fp32 scalar tile stays the
+/// production path under the max-abs < 1e-3 contract; the fp16 path is
+/// tolerance-level (~1e-2 relative, llama.cpp's own accuracy) so it is enabled
+/// only for benchmark-style workloads via `ATLAS_GEMMA4_MUL_MM`.
+fn gemma4_q4_batch_uses_mul_mm() -> bool {
+    std::env::var_os("ATLAS_GEMMA4_MUL_MM").is_some()
+}
+
+/// Opt-in gate for the vendored llama.cpp `llama_mul_mm_q4_0_f32` prefill
+/// GEMM — a faithful port of llama.cpp's classic simdgroup-matrix
+/// `kernel_mul_mm` (small-tile threadgroup staging + simdgroup_matrix
+/// multiply-accumulate). Off by default so the fp32 scalar tile stays the
+/// production path; set `ATLAS_GEMMA4_LLAMA_MUL_MM` to route the prefill
+/// projections through it for benchmark comparison. Tolerance-level (fp16
+/// fragments), the same accuracy class as the MUL_MM path.
+fn gemma4_llama_mul_mm_enabled() -> bool {
+    std::env::var_os("ATLAS_GEMMA4_LLAMA_MUL_MM").is_some()
+}
+
+/// Opt-in gate for the Flash16-v4 batched prefill attention
+/// (`attention_prefill_gemma4_simd_q4_0_flash16_[swa_]v4`). Off by default so
+/// the bitwise batched prefill scan stays the production path; the flash
+/// variant is tolerance-level (slice split + merge reorder the FP32 reduction),
+/// the same accuracy class as the decode Flash16 path. Set
+/// `ATLAS_GEMMA4_FLASH_PREFILL` to enable it (q4_0 KV only).
+fn gemma4_flash_prefill_enabled() -> bool {
+    std::env::var_os("ATLAS_GEMMA4_FLASH_PREFILL").is_some()
+}
+
 /// Q4 batched GEMM binding.  The 32-token x 64-row fp16 matrix-unit kernel
 /// (`matmul_q4_0_batch_mm64`, Phase B) applies only when enabled via
 /// `ATLAS_GEMMA4_MM64` and the geometry divides evenly (batch % 32 == 0,
@@ -1086,6 +1116,51 @@ fn gemma4_q4_batch_geometry(
             GEMMA4_Q4_BATCH_THREADS,
         )
     }
+}
+
+const GEMMA4_MUL_MM_TOKENS: usize = 32;
+const GEMMA4_MUL_MM_ROWS: usize = 32;
+const GEMMA4_MUL_MM_THREADS: usize = 128;
+
+/// Pure q4_0 byte-length -> K/input-width recovery used by the mul_mm gate.
+/// A row-major q4_0 tensor of `output_width` rows packs `output_width *
+/// (in / 32) * 18` bytes and `in % 32 == 0`.  Returns `in` when the byte
+/// length is consistent with the given output width, else None.
+fn q4_weight_bytes_to_input_width(bytes: usize, output_width: usize) -> Option<usize> {
+    if output_width == 0 || bytes % 18 != 0 {
+        return None;
+    }
+    let rows_x_blocks = bytes / 18;
+    if rows_x_blocks % output_width != 0 {
+        return None;
+    }
+    let blocks = rows_x_blocks / output_width;
+    blocks.checked_mul(32)
+}
+
+/// Decode the mul_mm geometry from the resident q4_0 weight buffer.  Returns
+/// the K/input width when the llama.cpp-style fp16 mul_mm path can run on this
+/// matmul (gate on and batch/rows/geometry divisible), else None so the caller
+/// keeps the scalar fp32 path.  `input_width` is recovered from the q4_0 byte
+/// length (`out * (in / 32) * 18`), avoiding a host-side scalar readback.
+fn gemma4_q4_batch_mulmm(
+    mul_mm_enabled: bool,
+    weight: &GpuBuffer,
+    output_width_value: usize,
+    batch_value: usize,
+) -> Result<Option<usize>> {
+    if !mul_mm_enabled
+        || batch_value % GEMMA4_MUL_MM_TOKENS != 0
+        || output_width_value % GEMMA4_MUL_MM_ROWS != 0
+    {
+        return Ok(None);
+    }
+    let input_width_value = match q4_weight_bytes_to_input_width(weight.bytes(), output_width_value)
+    {
+        Some(input_width) if input_width % 8 == 0 => input_width,
+        _ => return Ok(None),
+    };
+    Ok(Some(input_width_value))
 }
 
 pub(crate) fn gemma4_ffn_down_projection_kernel() -> &'static str {
@@ -1228,6 +1303,9 @@ pub struct Gemma4E2bExecutor<'a> {
     rope_swa_sin: GpuBuffer,
     layer_state_trace: Option<GpuBuffer>,
     diagnostic_one: Option<GpuBuffer>,
+    gemma4_mul_mm_enabled: bool,
+    f16_act: Option<GpuBuffer>,
+    f16_weights: Option<GpuBuffer>,
     rope_freq_factors: Vec<f32>,
     prefill: Gemma4PrefillBuffers,
     pending_weight_upload_bytes: u64,
@@ -1527,6 +1605,36 @@ impl<'a> Gemma4E2bExecutor<'a> {
         } else {
             (None, None)
         };
+        let gemma4_mul_mm_enabled = gemma4_q4_batch_uses_mul_mm();
+        // llama.cpp-style fp16 mul_mm scratch (Path B opt-in).  `f16_weights`
+        // holds one dequantized q4_0 layer tensor; sized to the largest batched
+        // projection (gate_up = 2*max_ffn rows x hidden cols dominate).  `f16_act`
+        // holds the fp16-cast activation slice for one prompt chunk.  Only
+        // allocated when the gate is on; the scalar fp32 path needs neither.
+        let f16_scratch = if gemma4_mul_mm_enabled {
+            let max_batched_projection_out = max_ffn
+                .checked_mul(2)
+                .context("Gemma fp16 weight scratch out-width overflows")?
+                .max(q_width);
+            let f16_weights_bytes = max_batched_projection_out
+                .checked_mul(h)
+                .and_then(|n| n.checked_mul(2))
+                .and_then(|n| (n > 0).then_some(n))
+                .context("Gemma fp16 weight scratch size overflows")?;
+            let max_input = max_ffn.max(h);
+            let f16_act_bytes = GEMMA4_PREFILL_BATCH_CAPACITY
+                .checked_mul(max_input)
+                .and_then(|n| n.checked_mul(2))
+                .and_then(|n| (n > 0).then_some(n))
+                .context("Gemma fp16 activation scratch size overflows")?;
+            (
+                Some(runtime.allocate(f16_weights_bytes)?),
+                Some(runtime.allocate(f16_act_bytes)?),
+            )
+        } else {
+            (None, None)
+        };
+        let (f16_weights, f16_act) = f16_scratch;
         Ok(Self {
             model,
             max_context,
@@ -1610,6 +1718,9 @@ impl<'a> Gemma4E2bExecutor<'a> {
             rope_swa_sin: allocate(head / 2)?,
             layer_state_trace,
             diagnostic_one,
+            gemma4_mul_mm_enabled,
+            f16_act,
+            f16_weights,
             rope_freq_factors,
             prefill,
             pending_weight_upload_bytes: weight_upload_bytes,
@@ -1842,21 +1953,164 @@ impl<'a> Gemma4E2bExecutor<'a> {
         Ok(())
     }
 
-    fn rms_norm_decode_labeled(
+    /// llama.cpp-style fp16 mul_mm prefill GEMM (Path B opt-in).  Preps the two
+    /// GPU-hostile inputs into fp16 fragments (dequantize the resident q4_0
+    /// tensor into a layer fp16 buffer, cast the fp32 activation slice to
+    /// fp16), then runs the no-threadgroup-staging matrix-unit GEMM.  All three
+    /// dispatches land in the same command buffer; Metal's default hazard
+    /// tracking orders them.  Tolerance-level (~1e-2 relative), opt-in only.
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_q4_0_batch_mul_mm(
         &self,
         command: &mut atlas_metal::ResidentCommand<'_>,
-        profiling_label: Option<&'static str>,
         input: &GpuBuffer,
         weight: &GpuBuffer,
         output: &GpuBuffer,
+        input_width_buf: &GpuBuffer,
+        output_width_buf: &GpuBuffer,
+        batch_buf: &GpuBuffer,
+        input_width_value: usize,
+        output_width_value: usize,
+        batch_value: usize,
+        label: &'static str,
     ) -> Result<()> {
-        let kernel = gemma4_rms_norm_decode_kernel(self.model.config.hidden_size);
+        let f16_weights = self
+            .f16_weights
+            .as_ref()
+            .context("fp16 weight scratch not allocated for mul_mm")?;
+        let f16_act = self
+            .f16_act
+            .as_ref()
+            .context("fp16 activation scratch not allocated for mul_mm")?;
+        let f16_weight_bytes = input_width_value
+            .checked_mul(output_width_value)
+            .and_then(|n| n.checked_mul(2))
+            .context("fp16 weight scratch size overflows")?;
+        ensure!(
+            f16_weight_bytes <= f16_weights.bytes(),
+            "fp16 weight scratch ({}) too small for {input_width_value}x{output_width_value}",
+            f16_weights.bytes()
+        );
+        let f16_act_bytes = input_width_value
+            .checked_mul(batch_value)
+            .and_then(|n| n.checked_mul(2))
+            .context("fp16 activation scratch size overflows")?;
+        ensure!(
+            f16_act_bytes <= f16_act.bytes(),
+            "fp16 activation scratch ({}) too small for batch {batch_value} x {input_width_value}",
+            f16_act.bytes()
+        );
         command.dispatch_threadgroups_1d_labeled(
-            kernel,
-            profiling_label,
-            &[input, weight, output, &self.hidden, &self.epsilon],
-            1,
-            32,
+            "gemma4_q4_0_to_f16_batch",
+            Some(label),
+            &[weight, f16_weights, input_width_buf, output_width_buf],
+            output_width_value.div_ceil(256),
+            256,
+        )?;
+        command.dispatch_threadgroups_1d_labeled(
+            "gemma4_cast_f32_to_f16_batch",
+            Some(label),
+            &[input, f16_act, input_width_buf, batch_buf],
+            batch_value
+                .checked_mul(input_width_value)
+                .context("Gemma mul_mm cast grid overflows")?
+                .div_ceil(256),
+            256,
+        )?;
+        let grid = batch_value
+            .div_ceil(GEMMA4_MUL_MM_TOKENS)
+            .checked_mul(output_width_value.div_ceil(GEMMA4_MUL_MM_ROWS))
+            .context("Gemma mul_mm GEMM grid overflows")?;
+        command.dispatch_threadgroups_1d_labeled(
+            "matmul_q4_0_batch_f16",
+            Some(label),
+            &[
+                f16_act,
+                f16_weights,
+                output,
+                input_width_buf,
+                output_width_buf,
+                batch_buf,
+            ],
+            grid,
+            GEMMA4_MUL_MM_THREADS,
+        )?;
+        Ok(())
+    }
+
+    /// Dispatch the vendored llama.cpp `llama_mul_mm_q4_0_f32` for one prefill
+    /// projection. Layout matches the kernel: src0=weight [M x K] q4_0,
+    /// src1=input activation [N x K] f32, dst=output [N x M] f32, where
+    /// K=input_width, M=output_width, N=batch. Grid is (ceil(N/32), ceil(M/64))
+    /// threadgroups of 128 threads with 8KB of threadgroup memory.
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_q4_0_llama_mul_mm(
+        &self,
+        command: &mut atlas_metal::ResidentCommand<'_>,
+        input: &GpuBuffer,
+        weight: &GpuBuffer,
+        output: &GpuBuffer,
+        input_width: &GpuBuffer,
+        output_width: &GpuBuffer,
+        batch: &GpuBuffer,
+        output_width_value: usize,
+        batch_value: usize,
+        label: &'static str,
+    ) -> Result<()> {
+        command.dispatch_threadgroups_2d_tgm(
+            "llama_mul_mm_q4_0_f32",
+            Some(label),
+            &[
+                (weight, 0),
+                (input, 0),
+                (output, 0),
+                (input_width, 0),
+                (output_width, 0),
+                (batch, 0),
+            ],
+            batch_value.div_ceil(32),
+            output_width_value.div_ceil(64),
+            128,
+            8192,
+        )?;
+        Ok(())
+    }
+
+    /// Dispatch the vendored llama.cpp `llama_mul_mm_f16_f32` for one prefill
+    /// projection whose weight is fp16 (Gemma 4's `per_layer_model_proj`).
+    /// Same geometry as the q4_0 variant: src0=f16 weight [M x K],
+    /// src1=input activation [N x K] f32, dst=output [N x M] f32, grid
+    /// (ceil(N/32), ceil(M/64)) threadgroups of 128 threads, 8KB threadgroup
+    /// memory.
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_f16_llama_mul_mm(
+        &self,
+        command: &mut atlas_metal::ResidentCommand<'_>,
+        input: &GpuBuffer,
+        weight: &GpuBuffer,
+        output: &GpuBuffer,
+        input_width: &GpuBuffer,
+        output_width: &GpuBuffer,
+        batch: &GpuBuffer,
+        output_width_value: usize,
+        batch_value: usize,
+        label: &'static str,
+    ) -> Result<()> {
+        command.dispatch_threadgroups_2d_tgm(
+            "llama_mul_mm_f16_f32",
+            Some(label),
+            &[
+                (weight, 0),
+                (input, 0),
+                (output, 0),
+                (input_width, 0),
+                (output_width, 0),
+                (batch, 0),
+            ],
+            batch_value.div_ceil(32),
+            output_width_value.div_ceil(64),
+            128,
+            8192,
         )?;
         Ok(())
     }
@@ -1886,6 +2140,42 @@ impl<'a> Gemma4E2bExecutor<'a> {
         let buffers = &[input, weight, output, input_width, output_width, batch];
         match format {
             GgufTensorType::Q4_0 => {
+                if gemma4_llama_mul_mm_enabled() {
+                    self.matmul_q4_0_llama_mul_mm(
+                        command,
+                        input,
+                        weight,
+                        output,
+                        input_width,
+                        output_width,
+                        batch,
+                        output_width_value,
+                        batch_value,
+                        "layer_major_batched_projection_llama_mul_mm",
+                    )?;
+                    return Ok(());
+                }
+                if let Some(input_width_value) = gemma4_q4_batch_mulmm(
+                    self.gemma4_mul_mm_enabled,
+                    weight,
+                    output_width_value,
+                    batch_value,
+                )? {
+                    self.matmul_q4_0_batch_mul_mm(
+                        command,
+                        input,
+                        weight,
+                        output,
+                        input_width,
+                        output_width,
+                        batch,
+                        input_width_value,
+                        output_width_value,
+                        batch_value,
+                        "layer_major_batched_projection_mul_mm_f16",
+                    )?;
+                    return Ok(());
+                }
                 let (kernel, tile_tokens, rows_per_group, threads) =
                     gemma4_q4_batch_geometry(batch_value, output_width_value);
                 command.dispatch_threadgroups_1d_labeled(
@@ -1906,12 +2196,29 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 batch_value * output_width_value.div_ceil(8),
                 128,
             )?,
-            GgufTensorType::F16 => command.dispatch_1d_labeled(
-                kernel,
-                Some("layer_major_batched_projection"),
-                buffers,
-                batch_value * output_width_value,
-            )?,
+            GgufTensorType::F16 => {
+                if gemma4_llama_mul_mm_enabled() {
+                    self.matmul_f16_llama_mul_mm(
+                        command,
+                        input,
+                        weight,
+                        output,
+                        input_width,
+                        output_width,
+                        batch,
+                        output_width_value,
+                        batch_value,
+                        "layer_major_batched_projection_llama_mul_mm_f16",
+                    )?;
+                } else {
+                    command.dispatch_1d_labeled(
+                        kernel,
+                        Some("layer_major_batched_projection"),
+                        buffers,
+                        batch_value * output_width_value,
+                    )?;
+                }
+            }
             _ => unreachable!("formats above are exhaustive"),
         }
         Ok(())
@@ -1929,6 +2236,42 @@ impl<'a> Gemma4E2bExecutor<'a> {
         output_width_value: usize,
         batch_value: usize,
     ) -> Result<()> {
+        if gemma4_llama_mul_mm_enabled() {
+            self.matmul_q4_0_llama_mul_mm(
+                command,
+                input,
+                weight,
+                output,
+                input_width,
+                output_width,
+                batch,
+                output_width_value,
+                batch_value,
+                "layer_major_batched_ffn_down_projection_llama_mul_mm",
+            )?;
+            return Ok(());
+        }
+        if let Some(input_width_value) = gemma4_q4_batch_mulmm(
+            self.gemma4_mul_mm_enabled,
+            weight,
+            output_width_value,
+            batch_value,
+        )? {
+            self.matmul_q4_0_batch_mul_mm(
+                command,
+                input,
+                weight,
+                output,
+                input_width,
+                output_width,
+                batch,
+                input_width_value,
+                output_width_value,
+                batch_value,
+                "layer_major_batched_ffn_down_projection_mul_mm_f16",
+            )?;
+            return Ok(());
+        }
         let (kernel, tile_tokens, rows_per_group, threads) =
             gemma4_q4_batch_geometry(batch_value, output_width_value);
         command.dispatch_threadgroups_1d_labeled(
@@ -3285,26 +3628,45 @@ impl<'a> Gemma4E2bExecutor<'a> {
             )?;
         }
         let cache = self.kv[source].as_ref().expect("Gemma KV source has cache");
-        let (attention_kernel, attention_threads) =
-            gemma4_attention_batch_binding(self.kv_cache_type);
         let controls_offset = layer * std::mem::size_of::<u32>();
-        command.dispatch_threadgroups_1d_at_labeled(
-            attention_kernel,
-            Some("layer_major_batched_attention"),
-            &[
-                (&self.prefill.q_rot, 0),
-                (cache, 0),
-                (&self.prefill.attention, 0),
-                (&self.heads, 0),
-                (&self.kv_heads, 0),
-                (head_width, 0),
-                (&self.capacity, 0),
-                (key_counts, controls_offset),
-                (&self.layers, 0),
-            ],
-            batch_value * c.attention_heads,
-            attention_threads,
-        )?;
+        let attention_buffers = &[
+            (&self.prefill.q_rot, 0),
+            (cache, 0),
+            (&self.prefill.attention, 0),
+            (&self.heads, 0),
+            (&self.kv_heads, 0),
+            (head_width, 0),
+            (&self.capacity, 0),
+            (key_counts, controls_offset),
+            (&self.layers, 0),
+        ];
+        if gemma4_flash_prefill_enabled() && self.kv_cache_type == Gemma4KvCacheType::Q4_0 {
+            // Flash16-v4 merged-slice batched prefill attention (opt-in,
+            // tolerance-level). Full layers use 12 slices (384 threads); swa
+            // layers use 24 slices (768 threads).
+            let (kernel, threads) = if sliding {
+                ("attention_prefill_gemma4_simd_q4_0_flash16_swa_v4", 768)
+            } else {
+                ("attention_prefill_gemma4_simd_q4_0_flash16_v4", 384)
+            };
+            command.dispatch_threadgroups_1d_at_labeled(
+                kernel,
+                Some("layer_major_batched_attention_flash"),
+                attention_buffers,
+                batch_value * c.attention_heads,
+                threads,
+            )?;
+        } else {
+            let (attention_kernel, attention_threads) =
+                gemma4_attention_batch_binding(self.kv_cache_type);
+            command.dispatch_threadgroups_1d_at_labeled(
+                attention_kernel,
+                Some("layer_major_batched_attention"),
+                attention_buffers,
+                batch_value * c.attention_heads,
+                attention_threads,
+            )?;
+        }
         let wo = self.weight(&format!("{p}.attn_output.weight"), GgufTensorType::Q4_0)?;
         self.matmul_batch(
             command,
@@ -3917,26 +4279,27 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 h,
                 GgufTensorType::Q4_0,
             )?;
-            self.rms_norm_decode_labeled(
-                &mut command,
-                Some("ple_norm"),
-                &self.work,
-                &post_norm,
-                &self.work,
-            )?;
-            command.dispatch_1d(
-                "vector_add_f32",
-                &[&self.state, &self.work, &self.state, &self.hidden],
-                h,
-            )?;
             let scale = self.weight(
                 &format!("{p}.layer_output_scale.weight"),
                 GgufTensorType::F32,
             )?;
-            command.dispatch_1d(
-                "scalar_multiply_f32",
-                &[&self.state, &self.state, &scale, &self.hidden],
-                h,
+            // Fused PLE epilogue: rms_norm(work) -> state += normalized ->
+            // state *= layer_output_scale, all in one dispatch (bitwise-identical
+            // to the three-kernel baseline, saving 2 launches per layer).
+            command.dispatch_threadgroups_1d_labeled(
+                "gemma4_ple_rms_add_scale_f32",
+                Some("ple_norm"),
+                &[
+                    &self.work,
+                    &post_norm,
+                    &self.state,
+                    &self.work,
+                    &self.hidden,
+                    &self.epsilon,
+                    &scale,
+                ],
+                1,
+                32,
             )?;
             if let (Some(layer_state_trace), Some(diagnostic_one)) =
                 (&self.layer_state_trace, &self.diagnostic_one)
@@ -4002,7 +4365,7 @@ mod tests {
         gemma4_decode_profile_targets, gemma4_kernel_family, gemma4_prefill_path,
         gemma4_profile_family, gemma4_q6_k_to_q4_0, gemma4_rms_norm_decode_kernel,
         gemma4_rope_angle, gemma4_selected_group_formats, gemma4_should_finish,
-        gemma4_weight_format_with_plan,
+        gemma4_weight_format_with_plan, q4_weight_bytes_to_input_width,
     };
     use atlas_core::{GgufTensorType, dequantize_block};
 
@@ -4120,6 +4483,22 @@ mod tests {
             "rms_norm_decode_f32_vec4"
         );
         assert_eq!(gemma4_rms_norm_decode_kernel(2305), "rms_norm_decode_f32");
+    }
+
+    #[test]
+    fn q4_weight_bytes_recover_input_width_for_mul_mm() {
+        // gate_up: out = 2*11520 = 23040 rows, in = 2304, blocks = 72.
+        // bytes = 23040 * 72 * 18.
+        let out = 23040usize;
+        let blocks = 72usize; // in = 2304
+        let bytes = out * blocks * 18;
+        assert_eq!(q4_weight_bytes_to_input_width(bytes, out), Some(2304));
+        // A mismatched width or non-18-byte alignment yields None.
+        assert_eq!(q4_weight_bytes_to_input_width(bytes, out + 1), None);
+        assert_eq!(q4_weight_bytes_to_input_width(bytes, 0), None);
+        assert_eq!(q4_weight_bytes_to_input_width(bytes + 1, out), None);
+        // A width that does not divide rows_x_blocks cleanly is rejected.
+        assert_eq!(q4_weight_bytes_to_input_width(bytes, 7), None);
     }
 
     #[test]
