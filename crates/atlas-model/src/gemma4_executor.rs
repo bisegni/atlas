@@ -3740,14 +3740,9 @@ impl<'a> Gemma4E2bExecutor<'a> {
             GgufTensorType::Q4_0,
         )?;
         command.dispatch_1d(
-            "gelu_f32",
-            &[&self.prefill.gate, &self.prefill.activated, &ffn_batch],
-            batch_value * ffn,
-        )?;
-        command.dispatch_1d(
-            "vector_multiply_f32",
+            "gelu_multiply_f32",
             &[
-                &self.prefill.activated,
+                &self.prefill.gate,
                 &self.prefill.up,
                 &self.prefill.product,
                 &ffn_batch,
