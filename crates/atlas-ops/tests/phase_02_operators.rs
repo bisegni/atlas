@@ -45,9 +45,11 @@ fn fp32_neural_operators_match_cpu_oracles_for_prefill_and_decode() {
     // fp16 mul_mm trio (gemma4_q4_0_to_f16_batch, gemma4_cast_f32_to_f16_batch,
     // matmul_q4_0_batch_f16), the phase-13.9 decode PLE-tail fusion
     // (gemma4_ple_rms_add_scale_f32), the vendored llama.cpp prefill GEMM
-    // (llama_mul_mm_q4_0_f32), and the Flash16-v4 batched prefill attention
-    // (attention_prefill_gemma4_simd_q4_0_flash16_[swa_]v4) = 91.
-    assert_eq!(ops.runtime().pipeline_count(), 91);
+    // (llama_mul_mm_q4_0_f32), the Flash16-v4 batched prefill attention
+    // (attention_prefill_gemma4_simd_q4_0_flash16_[swa_]v4), and the
+    // phase-13.14 matrix-unit prefill attention pair
+    // (attention_prefill_gemma4_simd_q4_0_flash16_[swa_]v6) = 96.
+    assert_eq!(ops.runtime().pipeline_count(), 96);
 
     let table = [0.0, 0.1, 0.2, 0.3, 1.0, 1.1, 1.2, 1.3, 2.0, 2.1, 2.2, 2.3];
     let (embedded, _) = ops.embedding(&table, 3, 4, &[2, 0]).unwrap();

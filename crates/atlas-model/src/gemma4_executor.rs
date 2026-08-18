@@ -3641,9 +3641,10 @@ impl<'a> Gemma4E2bExecutor<'a> {
             (&self.layers, 0),
         ];
         if gemma4_flash_prefill_enabled() && self.kv_cache_type == Gemma4KvCacheType::Q4_0 {
-            // Flash16-v5 batched prefill attention (opt-in, tolerance-level):
-            // one threadgroup per token with one SIMD group per head, sharing
-            // the K/V q4_0 dequant across heads (Gemma 4 E2B uses kv_heads == 1).
+            // Flash16-v5 shared-head prefill attention (opt-in, tolerance-level).
+            // The phase-13.14 flash16-v6 matrix-unit variant is registered for
+            // parity tests but measured equal to v5 on M2 Max (no speedup), so
+            // v5 remains the dispatched prefill attention kernel.
             let kernel = if sliding {
                 "attention_prefill_gemma4_simd_q4_0_flash16_swa_v5"
             } else {

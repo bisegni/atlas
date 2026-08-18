@@ -7,10 +7,12 @@ Silicon with the required numerical or performance evidence recorded.
 ## Current phase
 
 - [phase-13.14-remaining-prefill-attention-and-decode.md](phase-13.14-remaining-prefill-attention-and-decode.md) —
-  The two remaining gaps: (1) matrix-unit prefill attention (flash16-v5 is
-  latency-bound on the serial per-key chain; llama's `flash_attn_ext` batches
-  Q·Kᵀ/P·V onto the matrix units — ~40 ms, prefill 1.2× → ~1.07×) and (2) the
-  separate 1.9× decode gap. Plan/backlog, no acceptance gate yet.
+  Lever 1 implemented as flash16-v6 (matrix-unit prefill attention,
+  `simdgroup_matrix` S=Q·Kᵀ/O+=P·V) and measured **equal to v5, not faster**:
+  prefill ~376 vs ~374.5 ms (v5), attention ~87 vs ~80 ms, hash `f23c2962…`
+  preserved; v6 kept as a registered tolerance-parity kernel, v5 remains the
+  dispatched kernel of record. The attention kernel is q4_0-dequant/bandwidth-
+  bound, not dot-product-latency-bound. Lever 2 (decode 1.9×) still open.
 - [phase-13.13-flash16-v5-shared-head-prefill-attention.md](phase-13.13-flash16-v5-shared-head-prefill-attention.md) —
   Flash16-v5 prefill attention: one threadgroup per token with one SIMD group
   per head, sharing the K/V q4_0 dequant across heads (kv_heads == 1). Prefill
