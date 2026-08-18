@@ -60,6 +60,12 @@ bandwidth, and halving that traffic (single-pass online softmax, each key/K/V
 visited once) is what moves the needle (~+7%).  v7 is now the default prefill
 attention kernel.
 
+Unverified the exact hash above.  A subsequent run on the **real
+`gemma-4-e2b-it-q4_0` gguf fixture** (Resident, q4_0 KV, pp512/tg128,
+warmup1+5) confirmed the same result: prefill 335.0–342.2 ms (median ~337),
+~1517–1528 tok/s; decode ~1990 ms (~64 tok/s); stream hash `f23c2962…`
+preserved.
+
 ## Command book
 
 ```zsh
@@ -81,6 +87,9 @@ Expected pass signal: parity max_rel < 1e-2; matched benchmark prefill
   opt-in v7 5-run matched benchmark (341–353 ms).
 - `artifacts/phase-13.14/matched-benchmark-pp512-tg128-v7-default.jsonl` —
   v7-as-default 5-run matched benchmark (344–349 ms, hash `f23c2962…`).
+- `artifacts/phase-13.14/matched-benchmark-pp512-tg128-v7-gguf-e2b-it.jsonl` —
+  v7-as-default 5-run matched benchmark on the real gguf E2B-it fixture
+  (335–342 ms, ~1517–1528 tok/s, hash `f23c2962…`).
 - `artifacts/phase-13.14/flash16-v6-profile-pp512.jsonl` — exact-per-dispatch
   v6 profile (negative-result evidence).
 
