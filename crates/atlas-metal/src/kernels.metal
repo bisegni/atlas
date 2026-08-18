@@ -2585,6 +2585,244 @@ kernel void NAME( \
 DEFINE_FLASH_ATTENTION_V6_BATCH(attention_prefill_gemma4_simd_q4_0_flash16_v6, 512)
 DEFINE_FLASH_ATTENTION_V6_BATCH(attention_prefill_gemma4_simd_q4_0_flash16_swa_v6, 256)
 
+// Flash16-v7: single-pass matrix-unit prefill attention with online softmax
+// rescaling.  Same tiling, buffers and math as v6 (one threadgroup per 8-token
+// tile, one SIMD group per head, heads == 8, kv_heads == 1), but each key
+// block is dequantized only once for K and once for V and S = Q·K^T is
+// computed once, not twice: the per-row block max merges into the running max
+// with denominator rescaling, the O accumulator fragments are rescaled by
+// exp(m_old - m_new) only when the max actually moves, and the final
+// normalization divides the accumulator once by the denominator rows.
+//
+// Metal exposes no scalar element access for simdgroup matrices
+// (thread_elements() writable indices do not connect to the matrix register
+// file on this toolchain - verified empirically with load/store probes), so
+// the per-row rescale is expressed as a public-API matrix multiply: the row
+// scale factors form a diagonal fragment L built in threadgroup memory, and
+// each O fragment becomes o[dt] = L·o[dt] (a full 8x8 fp32 simdgroup MAC).
+// The rescale fires only when at least one row's max actually moved, which
+// happens only in the early key blocks of a causal window; steady-state blocks
+// add P·V with zero per-row scaling cost.  The final division by the
+// denominator rows uses the same diagonal-multiply form.  Rows with a zero
+// denominator stay zero.
+#define DEFINE_FLASH_ATTENTION_V7_BATCH(NAME, HEAD_DIM) \
+kernel void NAME( \
+    device const half *query [[buffer(0)]], device const uchar *cache [[buffer(1)]], \
+    device float *output [[buffer(2)]], constant uint &heads [[buffer(3)]], \
+    constant uint &kv_heads [[buffer(4)]], constant uint &head_dim [[buffer(5)]], \
+    constant uint &capacity [[buffer(6)]], device const uint *key_control [[buffer(7)]], \
+    constant uint &layers [[buffer(8)]], constant uint &batch [[buffer(9)]], \
+    uint token_tile [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]], \
+    uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]) { \
+    const uint TOKENS = 8; \
+    const uint KEY_BLOCK = 16; \
+    const uint BLOCKS = HEAD_DIM / 32; \
+    if (head_dim != HEAD_DIM) return; \
+    if (simd_group >= heads) return; \
+    threadgroup half tg_kv[KEY_BLOCK * HEAD_DIM]; \
+    threadgroup float tg_s[8 * TOKENS * KEY_BLOCK]; \
+    threadgroup half tg_p[8 * TOKENS * KEY_BLOCK]; \
+    threadgroup uint tg_control[TOKENS]; \
+    threadgroup float tg_m[8 * TOKENS]; \
+    threadgroup float tg_d[8 * TOKENS]; \
+    threadgroup float tg_scale[8 * TOKENS]; \
+    threadgroup float tg_diag[8 * 8 * 8]; \
+    uint base_token = token_tile * TOKENS; \
+    uint head = simd_group; \
+    uint kv_head = head / (heads / kv_heads); \
+    uint blocks_per_position = kv_heads * BLOCKS; \
+    uint value_base = capacity * blocks_per_position; \
+    uint qbase = head * HEAD_DIM; \
+    uint q_stride = heads * HEAD_DIM; \
+    uint sbase = head * (TOKENS * KEY_BLOCK); \
+    uint stat = head * TOKENS; \
+    if (simd_group == 0 && lane < TOKENS) { \
+        uint token = base_token + lane; \
+        tg_control[lane] = (token < batch) ? key_control[token * layers] : 0u; \
+    } \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+    uint min_start = 0xffffffffu; \
+    uint max_end = 0u; \
+    for (uint r = 0; r < TOKENS; ++r) { \
+        uint token = base_token + r; \
+        if (token >= batch) continue; \
+        uint control = tg_control[r]; \
+        uint ks = control >> 16; \
+        uint kc = control & 0xffffu; \
+        if (kc == 0) continue; \
+        min_start = min(min_start, ks); \
+        max_end = max(max_end, ks + kc); \
+    } \
+    uint my_key_start = 0u; \
+    uint my_key_count = 0u; \
+    if (lane < TOKENS) { \
+        uint control = tg_control[lane]; \
+        my_key_start = control >> 16; \
+        my_key_count = control & 0xffffu; \
+    } \
+    bool my_valid = (lane < TOKENS) && (base_token + lane < batch) && (my_key_count > 0u); \
+    if (max_end <= min_start) { \
+        for (uint idx = tid; idx < TOKENS * HEAD_DIM; idx += 256) { \
+            uint r = idx / HEAD_DIM; \
+            uint dim = idx % HEAD_DIM; \
+            if (base_token + r < batch) output[(base_token + r) * q_stride + qbase + dim] = 0.0f; \
+        } \
+        return; \
+    } \
+    simdgroup_float8x8 o[HEAD_DIM / 8]; \
+    _Pragma("clang loop unroll(full)") for (uint dt = 0; dt < HEAD_DIM / 8; ++dt) o[dt] = simdgroup_float8x8(0.0f); \
+    if (lane < TOKENS) { \
+        tg_m[stat + lane] = -INFINITY; \
+        tg_d[stat + lane] = 0.0f; \
+    } \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+    for (uint kb = min_start; kb < max_end; kb += KEY_BLOCK) { \
+        for (uint idx = tid; idx < KEY_BLOCK * HEAD_DIM; idx += 256) { \
+            uint key = idx / HEAD_DIM; \
+            uint dim = idx % HEAD_DIM; \
+            uint gkey = kb + key; \
+            if (gkey < max_end) { \
+                uint block = dim / 32; \
+                uint within = dim % 32; \
+                device const uchar *base = cache + (gkey * blocks_per_position + kv_head * BLOCKS + block) * 18; \
+                float scale = float(*(device const half *)base); \
+                uchar packed = base[2 + (within & 15)]; \
+                uchar nibble = within < 16 ? packed & 15 : packed >> 4; \
+                tg_kv[key * HEAD_DIM + dim] = half(scale * float(int(nibble) - 8)); \
+            } else { \
+                tg_kv[key * HEAD_DIM + dim] = half(0.0f); \
+            } \
+        } \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+        simdgroup_float8x8 s0 = simdgroup_float8x8(0.0f); \
+        simdgroup_float8x8 s1 = simdgroup_float8x8(0.0f); \
+        _Pragma("clang loop unroll(full)") for (uint koff = 0; koff < HEAD_DIM; koff += 8) { \
+            simdgroup_half8x8 qa, kb0, kb1; \
+            simdgroup_load(qa, query + base_token * q_stride + qbase + koff, q_stride, ulong2(0, 0), false); \
+            simdgroup_load(kb0, tg_kv + koff, HEAD_DIM, ulong2(0, 0), true); \
+            simdgroup_load(kb1, tg_kv + 8 * HEAD_DIM + koff, HEAD_DIM, ulong2(0, 0), true); \
+            simdgroup_multiply_accumulate(s0, qa, kb0, s0); \
+            simdgroup_multiply_accumulate(s1, qa, kb1, s1); \
+        } \
+        simdgroup_store(s0, tg_s + sbase + 0, KEY_BLOCK, ulong2(0, 0), false); \
+        simdgroup_store(s1, tg_s + sbase + 8, KEY_BLOCK, ulong2(0, 0), false); \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+        if (lane < TOKENS) { \
+            float m_local = -INFINITY; \
+            _Pragma("unroll") \
+            for (uint c = 0; c < KEY_BLOCK; ++c) { \
+                uint gkey = kb + c; \
+                if (gkey >= my_key_start && gkey < my_key_start + my_key_count) { \
+                    float s = tg_s[sbase + lane * KEY_BLOCK + c]; \
+                    m_local = max(m_local, s); \
+                } \
+            } \
+            float m_old = tg_m[stat + lane]; \
+            float m_new = max(m_old, m_local); \
+            float block_scale = 1.0f; \
+            float l_local = 0.0f; \
+            if (m_local != -INFINITY) { \
+                block_scale = exp(m_old - m_new); \
+                _Pragma("unroll") \
+                for (uint c = 0; c < KEY_BLOCK; ++c) { \
+                    uint gkey = kb + c; \
+                    if (gkey >= my_key_start && gkey < my_key_start + my_key_count) { \
+                        l_local += exp(tg_s[sbase + lane * KEY_BLOCK + c] - m_new); \
+                    } \
+                } \
+                tg_d[stat + lane] = tg_d[stat + lane] * block_scale + l_local; \
+                tg_m[stat + lane] = m_new; \
+            } \
+            tg_scale[stat + lane] = block_scale; \
+        } \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+        bool changed = false; \
+        for (uint h = 0; h < heads; ++h) { \
+            _Pragma("unroll") \
+            for (uint r = 0; r < TOKENS; ++r) changed |= (tg_scale[h * TOKENS + r] != 1.0f); \
+        } \
+        if (changed) { \
+            if (lane < TOKENS) { \
+                float scale = tg_scale[stat + lane]; \
+                _Pragma("unroll") \
+                for (uint c = 0; c < TOKENS; ++c) { \
+                    tg_diag[head * 64 + lane * 8 + c] = (c == lane) ? scale : 0.0f; \
+                } \
+            } \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+            simdgroup_float8x8 diag = simdgroup_float8x8(0.0f); \
+            simdgroup_float8x8 zero = simdgroup_float8x8(0.0f); \
+            simdgroup_load(diag, tg_diag + head * 64, TOKENS, ulong2(0, 0), false); \
+            _Pragma("clang loop unroll(full)") for (uint dt = 0; dt < HEAD_DIM / 8; ++dt) { \
+                simdgroup_float8x8 scaled; \
+                simdgroup_multiply_accumulate(scaled, diag, o[dt], zero); \
+                o[dt] = scaled; \
+            } \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+        } \
+        if (lane < TOKENS) { \
+            float m = tg_m[stat + lane]; \
+            bool valid = my_valid && (tg_d[stat + lane] > 0.0f); \
+            _Pragma("unroll") \
+            for (uint c = 0; c < KEY_BLOCK; ++c) { \
+                uint gkey = kb + c; \
+                float p = 0.0f; \
+                if (valid && gkey >= my_key_start && gkey < my_key_start + my_key_count) { \
+                    p = exp(tg_s[sbase + lane * KEY_BLOCK + c] - m); \
+                } \
+                tg_p[sbase + lane * KEY_BLOCK + c] = half(p); \
+            } \
+        } \
+        for (uint idx = tid; idx < KEY_BLOCK * HEAD_DIM; idx += 256) { \
+            uint key = idx / HEAD_DIM; \
+            uint dim = idx % HEAD_DIM; \
+            uint gkey = kb + key; \
+            if (gkey < max_end) { \
+                uint block = dim / 32; \
+                uint within = dim % 32; \
+                device const uchar *base = cache + (value_base + gkey * blocks_per_position + kv_head * BLOCKS + block) * 18; \
+                float scale = float(*(device const half *)base); \
+                uchar packed = base[2 + (within & 15)]; \
+                uchar nibble = within < 16 ? packed & 15 : packed >> 4; \
+                tg_kv[key * HEAD_DIM + dim] = half(scale * float(int(nibble) - 8)); \
+            } else { \
+                tg_kv[key * HEAD_DIM + dim] = half(0.0f); \
+            } \
+        } \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+        simdgroup_half8x8 pa0, pa1; \
+        simdgroup_load(pa0, tg_p + sbase + 0, KEY_BLOCK, ulong2(0, 0), false); \
+        simdgroup_load(pa1, tg_p + sbase + 8, KEY_BLOCK, ulong2(0, 0), false); \
+        _Pragma("clang loop unroll(full)") for (uint dt = 0; dt < HEAD_DIM / 8; ++dt) { \
+            simdgroup_half8x8 vb0, vb1; \
+            simdgroup_load(vb0, tg_kv + dt * 8, HEAD_DIM, ulong2(0, 0), false); \
+            simdgroup_load(vb1, tg_kv + 8 * HEAD_DIM + dt * 8, HEAD_DIM, ulong2(0, 0), false); \
+            simdgroup_multiply_accumulate(o[dt], pa0, vb0, o[dt]); \
+            simdgroup_multiply_accumulate(o[dt], pa1, vb1, o[dt]); \
+        } \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+    } \
+    if (lane < TOKENS) { \
+        for (uint c = 0; c < TOKENS; ++c) { \
+            float d = tg_d[stat + lane]; \
+            tg_diag[head * 64 + lane * 8 + c] = (c == lane) ? ((d > 0.0f) ? 1.0f / d : 0.0f) : 0.0f; \
+        } \
+    } \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+    simdgroup_float8x8 diag = simdgroup_float8x8(0.0f); \
+    simdgroup_float8x8 zero = simdgroup_float8x8(0.0f); \
+    simdgroup_load(diag, tg_diag + head * 64, TOKENS, ulong2(0, 0), false); \
+    _Pragma("clang loop unroll(full)") for (uint dt = 0; dt < HEAD_DIM / 8; ++dt) { \
+        simdgroup_float8x8 scaled; \
+        simdgroup_multiply_accumulate(scaled, diag, o[dt], zero); \
+        o[dt] = scaled; \
+        simdgroup_store(o[dt], output + base_token * q_stride + qbase + dt * 8, q_stride, ulong2(0, 0), false); \
+    } \
+}
+
+DEFINE_FLASH_ATTENTION_V7_BATCH(attention_prefill_gemma4_simd_q4_0_flash16_v7, 512)
+DEFINE_FLASH_ATTENTION_V7_BATCH(attention_prefill_gemma4_simd_q4_0_flash16_swa_v7, 256)
+
 DEFINE_FLASH_ATTENTION_V4(attention_decode_gemma4_simd_q4_0_flash16_swa_v4, 256, 8, 24)
 
 

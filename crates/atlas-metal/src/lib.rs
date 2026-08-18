@@ -1003,6 +1003,8 @@ mod macos {
                 "attention_prefill_gemma4_simd_q4_0_flash16_swa_v5",
                 "attention_prefill_gemma4_simd_q4_0_flash16_v6",
                 "attention_prefill_gemma4_simd_q4_0_flash16_swa_v6",
+                "attention_prefill_gemma4_simd_q4_0_flash16_v7",
+                "attention_prefill_gemma4_simd_q4_0_flash16_swa_v7",
                 "gelu_multiply_f32",
                 "matvec_q4_0_64row_mv",
                 "matvec_q4_0_64row_mv_rms",

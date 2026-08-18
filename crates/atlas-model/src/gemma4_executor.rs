@@ -1096,6 +1096,14 @@ fn gemma4_flash_prefill_enabled() -> bool {
     std::env::var_os("ATLAS_GEMMA4_FLASH_PREFILL").is_some()
 }
 
+/// Default single-pass flash16-v7 prefill attention (online softmax
+/// rescaling, half the v5/v6 K/V dequant traffic).  Requires the base
+/// `ATLAS_GEMMA4_FLASH_PREFILL` gate as well.  Set
+/// `ATLAS_GEMMA4_FLASH_PREFILL_V5` to fall back to the shared-head v5 kernel.
+fn gemma4_flash_prefill_v7_enabled() -> bool {
+    gemma4_flash_prefill_enabled() && !std::env::var_os("ATLAS_GEMMA4_FLASH_PREFILL_V5").is_some()
+}
+
 /// Q4 batched GEMM binding.  The 32-token x 64-row fp16 matrix-unit kernel
 /// (`matmul_q4_0_batch_mm64`, Phase B) applies only when enabled via
 /// `ATLAS_GEMMA4_MM64` and the geometry divides evenly (batch % 32 == 0,
@@ -1223,6 +1231,7 @@ struct Gemma4PrefillBuffers {
     norm: GpuBuffer,
     q: GpuBuffer,
     q_rot: GpuBuffer,
+    q_rot_f16: GpuBuffer,
     k: GpuBuffer,
     k_rot: GpuBuffer,
     v: GpuBuffer,
@@ -1580,6 +1589,12 @@ impl<'a> Gemma4E2bExecutor<'a> {
             norm: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * h)?,
             q: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * q_width)?,
             q_rot: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * q_width)?,
+            q_rot_f16: runtime.allocate(
+                GEMMA4_PREFILL_BATCH_CAPACITY
+                    .checked_mul(q_width)
+                    .and_then(|n| n.checked_mul(2))
+                    .context("Gemma fp16 query scratch size overflows")?,
+            )?,
             k: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * head)?,
             k_rot: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * head)?,
             v: allocate(GEMMA4_PREFILL_BATCH_CAPACITY * head)?,
@@ -3641,22 +3656,63 @@ impl<'a> Gemma4E2bExecutor<'a> {
             (&self.layers, 0),
         ];
         if gemma4_flash_prefill_enabled() && self.kv_cache_type == Gemma4KvCacheType::Q4_0 {
-            // Flash16-v5 shared-head prefill attention (opt-in, tolerance-level).
-            // The phase-13.14 flash16-v6 matrix-unit variant is registered for
-            // parity tests but measured equal to v5 on M2 Max (no speedup), so
-            // v5 remains the dispatched prefill attention kernel.
-            let kernel = if sliding {
-                "attention_prefill_gemma4_simd_q4_0_flash16_swa_v5"
+            // Flash16-v7 single-pass matrix-unit prefill attention (online
+            // softmax rescaling, half the K/V dequant traffic) is the default.
+            // v5 remains registered/available via ATLAS_GEMMA4_FLASH_PREFILL_V5.
+            if gemma4_flash_prefill_v7_enabled() {
+                command.dispatch_threadgroups_1d_labeled(
+                    "gemma4_cast_f32_to_f16_batch",
+                    Some("layer_major_batched_attention_q_cast_f16"),
+                    &[
+                        &self.prefill.q_rot,
+                        &self.prefill.q_rot_f16,
+                        q_width_buffer,
+                        batch,
+                    ],
+                    batch_value
+                        .checked_mul(q_width)
+                        .context("Gemma flash attention q cast grid overflows")?
+                        .div_ceil(256),
+                    256,
+                )?;
+                let kernel = if sliding {
+                    "attention_prefill_gemma4_simd_q4_0_flash16_swa_v7"
+                } else {
+                    "attention_prefill_gemma4_simd_q4_0_flash16_v7"
+                };
+                let flash16_v7_buffers = &[
+                    (&self.prefill.q_rot_f16, 0),
+                    (cache, 0),
+                    (&self.prefill.attention, 0),
+                    (&self.heads, 0),
+                    (&self.kv_heads, 0),
+                    (head_width, 0),
+                    (&self.capacity, 0),
+                    (key_counts, controls_offset),
+                    (&self.layers, 0),
+                    (batch, 0),
+                ];
+                command.dispatch_threadgroups_1d_at_labeled(
+                    kernel,
+                    Some("layer_major_batched_attention_flash"),
+                    flash16_v7_buffers,
+                    batch_value.div_ceil(8),
+                    256,
+                )?;
             } else {
-                "attention_prefill_gemma4_simd_q4_0_flash16_v5"
-            };
-            command.dispatch_threadgroups_1d_at_labeled(
-                kernel,
-                Some("layer_major_batched_attention_flash"),
-                attention_buffers,
-                batch_value,
-                256,
-            )?;
+                let kernel = if sliding {
+                    "attention_prefill_gemma4_simd_q4_0_flash16_swa_v5"
+                } else {
+                    "attention_prefill_gemma4_simd_q4_0_flash16_v5"
+                };
+                command.dispatch_threadgroups_1d_at_labeled(
+                    kernel,
+                    Some("layer_major_batched_attention_flash"),
+                    attention_buffers,
+                    batch_value,
+                    256,
+                )?;
+            }
         } else {
             let (attention_kernel, attention_threads) =
                 gemma4_attention_batch_binding(self.kv_cache_type);
