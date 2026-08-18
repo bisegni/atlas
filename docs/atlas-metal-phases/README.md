@@ -6,6 +6,24 @@ Silicon with the required numerical or performance evidence recorded.
 
 ## Current phase
 
+- [phase-13.16-decode-matvec-16row.md](phase-13.16-decode-matvec-16row.md) —
+  Decode matvec geometry lever: 16-row-per-threadgroup variants of the mv_ext
+  q4_0 kernels (`matvec_q4_0_16row_mv[_rms]`, opt-in
+  `ATLAS_GEMMA4_DECODE_16ROW`) are bitwise-identical to the 64-row family
+  (parity gates in `matvec_16row_parity.rs`) and measured decode **−6.1% e2e**
+  (mean 1863.0 vs 1984.3 ms, 68.7 vs 64.5 tok/s), per-token GPU
+  **20.52 → 19.51 ms (−4.9%)**, stream hash `f23c2962…` unchanged. Biggest
+  family wins: ffn-down −29.2%, wo −18.1%, PLE −11.0%; the fused qkv and
+  gate/up kernels still await a band-width variant.
+- [phase-13.15-decode-matvec-mul-mm-negative.md](phase-13.15-decode-matvec-mul-mm-negative.md) —
+  Lever 2 (decode 1.9×) first hypothesis falsified: routing the single-token
+  (N=1) decode Q4 matvecs (qkv, gate/up, ffn-down, wo) through the vendored
+  llama `llama_mul_mm_q4_0_f32` matrix-unit kernel made decode **2.8× slower**
+  (median ~5578 vs ~1989 ms, ~23 vs ~64.5 tok/s) despite a bitwise-preserved
+  stream hash `f23c2962…`; the opt-in code was reverted and the mv_ext matvec
+  family stays the decode default — `mul_mm`'s advantage requires real batch
+  (N ≥ 16–32). Lever 2 remains open; remaining levers are attention (~21.5% of
+  per-token GPU), PLE/lm_head, and batch decode.
 - [phase-13.14-remaining-prefill-attention-and-decode.md](phase-13.14-remaining-prefill-attention-and-decode.md) —
   Lever 1 closed with flash16-v7 single-pass matrix-unit prefill attention
   (online softmax rescaling, each key/K-V visited once, half the dequant
