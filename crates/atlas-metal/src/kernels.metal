@@ -2251,6 +2251,111 @@ kernel void NAME( \
 DEFINE_FLASH_ATTENTION_V4_BATCH(attention_prefill_gemma4_simd_q4_0_flash16_v4, 512, 16, 12)
 DEFINE_FLASH_ATTENTION_V4_BATCH(attention_prefill_gemma4_simd_q4_0_flash16_swa_v4, 256, 8, 24)
 
+// Third-generation batched prefill attention. The v4 kernels dispatch one
+// threadgroup per (token, head) and, because Gemma 4 E2B uses a single shared
+// KV head (kv_heads == 1), every one of the `heads` threadgroups for a token
+// re-dequantizes the SAME key/value cache. This variant dispatches one
+// threadgroup per token with `heads` SIMD groups (one per head); the K/V q4_0
+// dequantization for each key is done ONCE cooperatively into threadgroup
+// memory and shared across all heads, removing the per-head dequant redundancy.
+// Requires kv_heads == 1 (all heads share one KV head) and heads == 8.
+#define FLASH_ACC_STORE_V5(NB, B) \
+    if (B < NB) { uint dim = B * 32 + lane; output[qbase + dim] = acc##B / denominator; }
+#define FLASH_ACC_STORES_V5(NB) \
+    FLASH_ACC_STORE_V5(NB, 0) FLASH_ACC_STORE_V5(NB, 1) FLASH_ACC_STORE_V5(NB, 2) FLASH_ACC_STORE_V5(NB, 3) \
+    FLASH_ACC_STORE_V5(NB, 4) FLASH_ACC_STORE_V5(NB, 5) FLASH_ACC_STORE_V5(NB, 6) FLASH_ACC_STORE_V5(NB, 7) \
+    FLASH_ACC_STORE_V5(NB, 8) FLASH_ACC_STORE_V5(NB, 9) FLASH_ACC_STORE_V5(NB, 10) FLASH_ACC_STORE_V5(NB, 11) \
+    FLASH_ACC_STORE_V5(NB, 12) FLASH_ACC_STORE_V5(NB, 13) FLASH_ACC_STORE_V5(NB, 14) FLASH_ACC_STORE_V5(NB, 15)
+
+#define DEFINE_FLASH_ATTENTION_V5_BATCH(NAME, HEAD_DIM, BLOCKS) \
+kernel void NAME( \
+    device const float *query [[buffer(0)]], device const uchar *cache [[buffer(1)]], \
+    device float *output [[buffer(2)]], constant uint &heads [[buffer(3)]], \
+    constant uint &kv_heads [[buffer(4)]], constant uint &head_dim [[buffer(5)]], \
+    constant uint &capacity [[buffer(6)]], device const uint *key_control [[buffer(7)]], \
+    constant uint &layers [[buffer(8)]], \
+    uint token [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]], \
+    uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]) { \
+    if (head_dim != HEAD_DIM) return; \
+    uint head = simd_group; \
+    if (head >= heads) return; \
+    uint control = key_control[token * layers]; \
+    uint key_start = control >> 16; \
+    uint key_count = control & 0xffffu; \
+    uint kv_head = head / (heads / kv_heads); \
+    uint blocks_per_position = kv_heads * BLOCKS; \
+    uint value_base = capacity * blocks_per_position; \
+    uint qbase = token * heads * HEAD_DIM + head * HEAD_DIM; \
+    threadgroup float k_shared[HEAD_DIM]; \
+    threadgroup float v_shared[HEAD_DIM]; \
+    float maximum = -INFINITY; \
+    float denominator = 0.0f; \
+    FLASH_ACC_DECLS \
+    float q_cache[BLOCKS]; \
+    for (uint qb = 0; qb < BLOCKS; ++qb) { \
+        uint qdim = 32 * qb + lane; \
+        q_cache[qb] = query[qbase + qdim]; \
+    } \
+    if (key_count == 0) { \
+        for (uint b = 0; b < BLOCKS; ++b) { \
+            uint dim = 32 * b + lane; \
+            output[qbase + dim] = 0.0f; \
+        } \
+        return; \
+    } \
+    for (uint key = key_start; key < key_start + key_count; ++key) { \
+        uint key_block_base = key * blocks_per_position + kv_head * BLOCKS; \
+        uint value_block_base = value_base + key_block_base; \
+        for (uint i = tid; i < HEAD_DIM; i += 256) { \
+            uint block = i / 32; \
+            uint within = i % 32; \
+            device const uchar *base = cache + (key_block_base + block) * 18; \
+            float scale = float(*(device const half *)base); \
+            uchar packed = base[2 + (within & 15)]; \
+            uchar nibble = within < 16 ? packed & 15 : packed >> 4; \
+            k_shared[i] = scale * float(int(nibble) - 8); \
+        } \
+        for (uint i = tid; i < HEAD_DIM; i += 256) { \
+            uint block = i / 32; \
+            uint within = i % 32; \
+            device const uchar *base = cache + (value_block_base + block) * 18; \
+            float scale = float(*(device const half *)base); \
+            uchar packed = base[2 + (within & 15)]; \
+            uchar nibble = within < 16 ? packed & 15 : packed >> 4; \
+            v_shared[i] = scale * float(int(nibble) - 8); \
+        } \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+        float partial = 0.0f; \
+        for (uint b = 0; b < BLOCKS; ++b) { \
+            uint dim = 32 * b + lane; \
+            partial += q_cache[b] * k_shared[dim]; \
+        } \
+        float score = simd_sum(partial); \
+        float rescale = 1.0f; \
+        float weight; \
+        if (score > maximum) { \
+            rescale = exp(maximum - score); \
+            weight = 1.0f; \
+            maximum = score; \
+            denominator = denominator * rescale + weight; \
+        } else { \
+            weight = exp(score - maximum); \
+            denominator += weight; \
+        } \
+        for (uint b = 0; b < BLOCKS; ++b) { \
+            uint dim = 32 * b + lane; \
+            float value = v_shared[dim]; \
+            if (b == 0) acc0 = acc0 * rescale + weight * value; \
+            FLASH_ACC_UPDATES \
+        } \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+    } \
+    FLASH_ACC_STORES_V5(BLOCKS) \
+}
+
+DEFINE_FLASH_ATTENTION_V5_BATCH(attention_prefill_gemma4_simd_q4_0_flash16_v5, 512, 16)
+DEFINE_FLASH_ATTENTION_V5_BATCH(attention_prefill_gemma4_simd_q4_0_flash16_swa_v5, 256, 8)
+
 DEFINE_FLASH_ATTENTION_V4(attention_decode_gemma4_simd_q4_0_flash16_swa_v4, 256, 8, 24)
 
 

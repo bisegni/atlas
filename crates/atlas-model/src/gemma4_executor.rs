@@ -3641,20 +3641,20 @@ impl<'a> Gemma4E2bExecutor<'a> {
             (&self.layers, 0),
         ];
         if gemma4_flash_prefill_enabled() && self.kv_cache_type == Gemma4KvCacheType::Q4_0 {
-            // Flash16-v4 merged-slice batched prefill attention (opt-in,
-            // tolerance-level). Full layers use 12 slices (384 threads); swa
-            // layers use 24 slices (768 threads).
-            let (kernel, threads) = if sliding {
-                ("attention_prefill_gemma4_simd_q4_0_flash16_swa_v4", 768)
+            // Flash16-v5 batched prefill attention (opt-in, tolerance-level):
+            // one threadgroup per token with one SIMD group per head, sharing
+            // the K/V q4_0 dequant across heads (Gemma 4 E2B uses kv_heads == 1).
+            let kernel = if sliding {
+                "attention_prefill_gemma4_simd_q4_0_flash16_swa_v5"
             } else {
-                ("attention_prefill_gemma4_simd_q4_0_flash16_v4", 384)
+                "attention_prefill_gemma4_simd_q4_0_flash16_v5"
             };
             command.dispatch_threadgroups_1d_at_labeled(
                 kernel,
                 Some("layer_major_batched_attention_flash"),
                 attention_buffers,
-                batch_value * c.attention_heads,
-                threads,
+                batch_value,
+                256,
             )?;
         } else {
             let (attention_kernel, attention_threads) =
