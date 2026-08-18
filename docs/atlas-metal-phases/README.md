@@ -6,6 +6,39 @@ Silicon with the required numerical or performance evidence recorded.
 
 ## Current phase
 
+- [phase-13.12-fast-f16-prefill-mul-mm.md](phase-13.12-fast-f16-prefill-mul-mm.md) —
+  Vendored llama.cpp's `kernel_mul_mm_f16_f32` (direct `half4x4` load, no
+  dequant) for Gemma 4's fp16 `per_layer_model_proj`. The single naive
+  `matmul_f16_batch` GEMM dropped 269.42 → 1.96 ms, cutting prefill ~728 → ~452
+  ms (~700 → ~1132 tok/s, +62%); gap to llama.cpp 2.4× → ~1.4×; hash preserved.
+- [phase-13.11-flash-prefill-attention.md](phase-13.11-flash-prefill-attention.md) —
+  Flash16-v4 merged-slice batched prefill attention
+  (`attention_prefill_gemma4_simd_q4_0_flash16_[swa_]v4`, opt-in
+  `ATLAS_GEMMA4_FLASH_PREFILL`). Replaces the serial per-key-barrier prefill
+  scan. Correct (hash `f23c2962…` preserved) but only +4% prefill because Gemma
+  is mostly sliding-window; confirms prefill is now GEMM-dominated.
+- [phase-13.10-vendored-llama-mul-mm-prefill.md](phase-13.10-vendored-llama-mul-mm-prefill.md) —
+  Vendored llama.cpp's classic simdgroup-matrix `kernel_mul_mm` (MIT) as
+  `llama_mul_mm_q4_0_f32` (opt-in `ATLAS_GEMMA4_LLAMA_MUL_MM`) + a
+  2D-grid/threadgroup-memory dispatch. Prefill ~316 → ~674 tok/s (+113%),
+  closing the llama.cpp gap from ~5x to ~2.4x; decode unchanged; hash preserved.
+- [phase-13.9-decode-ple-tail-fusion.md](phase-13.9-decode-ple-tail-fusion.md) —
+  Decode PLE-tail dispatch fusion: `gemma4_ple_rms_add_scale_f32` collapses the
+  per-layer `rms_norm → vector_add → scalar_multiply` tail into one dispatch.
+  Bitwise-correct (greedy hash `f23c2962…` preserved) and cuts decode dispatch
+  count 547.7 → 478.2/token (−12.7%), but decode tok/s is unchanged (64.3–64.9)
+  because decode is GPU-latency-bound, not dispatch-bound — re-confirming the
+  phase-13.4 D3 verdict post-v4. Not a decode-throughput lever.
+- [phase-13.8-llama-grade-prefill-mul-mm.md](phase-13.8-llama-grade-prefill-mul-mm.md) —
+  llama.cpp-style fp16 matrix-unit prefill GEMM (opt-in `ATLAS_GEMMA4_MUL_MM`):
+  `matmul_q4_0_batch_f16` feeds the matrix units from device fp16 fragments with
+  NO threadgroup weight staging (dequantized once per layer via
+  `gemma4_q4_0_to_f16_batch`, fp32 act cast via `gemma4_cast_f32_to_f16_batch`).
+  Tolerance-level (~3–4e-4 relative, gated off by default; the fp32 scalar tile
+  stays the `max-abs < 1e-3` default). Kernel parity passes on M2 Max.
+  End-to-end measured on the local Gemma 4 E2B fixture: **prefill ~256 → ~286
+  tok/s (+12%) at pp512** — a real but modest gain, not the llama-grade
+  (~1600 tok/s) jump; see phase-13.9 "Implication for the llama.cpp gap".
 - [phase-13.7-flash16-v4-decode-attention.md](phase-13.7-flash16-v4-decode-attention.md) —
   Path B merged-slice decode flash attention: `Flash16` now binds the
   non-bitwise v4 kernels (no per-key barriers; slice-merge in threadgroup
