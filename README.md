@@ -205,10 +205,27 @@ pass `--show-thoughts` only when it is intentionally needed. The raw
 `generate --max-new-tokens N --greedy` command is for completion and parity
 diagnostics and does not apply the chat template.
 
-Each completed turn prints Resident performance metrics and appends one JSON
-record to `artifacts/chat-performance.jsonl`. The first turn includes the model
-weight upload. After `/reset`, later turns in the same process should report
-`"weight_upload_bytes": 0`.
+Each completed turn appends one JSON record to `artifacts/chat-performance.jsonl`.
+The first turn includes the model weight upload. After `/reset`, later turns in
+the same process should report `"weight_upload_bytes": 0`.
+
+By default chat keeps the terminal clean and prints no metrics. Pass `--verbose`
+to print the most useful metrics after each turn in a readable form, or
+`--verbose json` for the complete JSON record:
+
+```zsh
+cargo run --release -p atlas-cli -- chat \
+  --model gemma4-e2b-q4_0 \
+  --prompt 'Explain the history and importance of Paris.' \
+  --verbose text
+```
+
+The text summary reports model, weight format and executor, KV cache and
+attention kernel, prompt/decode tokens with prefill and decode tok/s, host
+wall time, finish reason, memory (resident, KV, upload, readback), the
+embedding and output-projection kernels, the quantization-preflight state and
+plan, and the JSONL log path. `--verbose json` prints the exact record that is
+appended to the log.
 
 The canonical matched workload (pp512/tg128, Resident, Gemma 4 E2B Q4_0)
 reaches approximately 1505 tok/s prefill and ~68.8 tok/s decode

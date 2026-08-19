@@ -199,9 +199,27 @@ fn provider_command(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ChatMetricsVerbosity {
+    #[default]
+    Silent,
+    Text,
+    Json,
+}
+
+impl ChatMetricsVerbosity {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "text" => Ok(Self::Text),
+            "json" => Ok(Self::Json),
+            other => bail!("unknown --verbose mode `{other}`; expected `text` or `json`"),
+        }
+    }
+}
+
 fn chat(args: &[String]) -> Result<()> {
     CHAT_INTERRUPTED.store(false, Ordering::Release);
-    let (model_id, prompt, max_tokens, show_thoughts, kv_cache_type, q4_attention_mode) =
+    let (model_id, prompt, max_tokens, show_thoughts, kv_cache_type, q4_attention_mode, verbosity) =
         parse_chat_args(args)?;
     let selection = resolve_model(&model_id)?;
     let model = load_verified_model(&selection)?;
@@ -221,6 +239,7 @@ fn chat(args: &[String]) -> Result<()> {
             max_tokens,
             show_thoughts,
             &selection,
+            verbosity,
         )?;
         return Ok(());
     }
@@ -255,6 +274,7 @@ fn chat(args: &[String]) -> Result<()> {
             max_tokens,
             show_thoughts,
             &selection,
+            verbosity,
         )?;
         messages.push(Gemma4ChatMessage::new(Gemma4ChatRole::Model, visible));
     }
@@ -268,6 +288,7 @@ fn run_chat_turn(
     requested: Option<usize>,
     show_thoughts: bool,
     selection: &ModelRecord,
+    verbosity: ChatMetricsVerbosity,
 ) -> Result<String> {
     let prompt = render_gemma4_chat(messages)?;
     let prompt_tokens = model.tokenize(&prompt)?.len();
@@ -313,6 +334,7 @@ fn run_chat_turn(
         &visible,
         max_tokens,
         requested.is_none(),
+        verbosity,
     )?;
     Ok(visible)
 }
@@ -454,6 +476,7 @@ fn emit_metrics(
     visible: &str,
     max_tokens: usize,
     context_limit: bool,
+    verbosity: ChatMetricsVerbosity,
 ) -> Result<()> {
     let finish_reason = match generation.finish_reason {
         Gemma4FinishReason::Eos => "eos",
@@ -468,9 +491,10 @@ fn emit_metrics(
         generation.metrics.decode_command_buffers as usize,
         generation.metrics.decode,
     );
+    let model_id = record.id.clone();
     let record = json!({
         "event": "generation_metrics",
-        "model_id": record.id,
+        "model_id": model_id,
         "executor": "resident",
         "format": "gguf-gemma4-q4_0",
         "weight_format": generation.metrics.weight_format.as_str(),
@@ -517,10 +541,104 @@ fn emit_metrics(
             "host_ms": generation.metrics.host_wall_time.as_secs_f64() * 1000.0
         }
     });
-    eprintln!("{record}");
     append_jsonl(&record)?;
-    eprintln!("chat performance log: {CHAT_PERFORMANCE_LOG}");
+    match verbosity {
+        ChatMetricsVerbosity::Silent => {}
+        ChatMetricsVerbosity::Json => {
+            eprintln!("{record}");
+        }
+        ChatMetricsVerbosity::Text => {
+            emit_text_metrics(
+                &model_id,
+                generation,
+                finish_reason,
+                max_tokens,
+                context_limit,
+                prefill,
+                decode,
+            );
+        }
+    }
     Ok(())
+}
+
+fn emit_text_metrics(
+    model_id: &str,
+    generation: &Gemma4Generation,
+    finish_reason: &str,
+    max_tokens: usize,
+    context_limit: bool,
+    prefill_tok_s: f64,
+    decode_tok_s: f64,
+) {
+    eprintln!("== generation metrics ==");
+    eprintln!(
+        "model:      {} · {} · {}",
+        model_id,
+        generation.metrics.weight_format.as_str(),
+        "resident"
+    );
+    eprintln!(
+        "cache:      {} KV · attention {} · {}",
+        generation.metrics.kv_cache_type.as_str(),
+        generation.metrics.q4_attention_mode.as_str(),
+        generation.metrics.attention_kernel
+    );
+    eprintln!(
+        "prefill:    {} tokens · {:.1} ms · {:.1} tok/s",
+        generation.generation.prompt_token_ids.len(),
+        generation.metrics.prefill.as_secs_f64() * 1000.0,
+        prefill_tok_s,
+    );
+    eprintln!(
+        "decode:     {} tokens · {:.1} ms · {:.1} tok/s",
+        generation.generation.generated_token_ids.len(),
+        generation.metrics.decode.as_secs_f64() * 1000.0,
+        decode_tok_s,
+    );
+    eprintln!(
+        "host total: {:.1} ms",
+        generation.metrics.host_wall_time.as_secs_f64() * 1000.0,
+    );
+    eprintln!(
+        "finish:     {finish_reason} · limit={} · max_new_tokens={max_tokens}",
+        if context_limit { "context" } else { "explicit" },
+    );
+    eprintln!(
+        "memory:     resident {} · kv {} · upload {} · readback {}",
+        format_bytes(generation.metrics.resident_bytes),
+        format_bytes(generation.metrics.kv_cache_bytes),
+        format_bytes(generation.metrics.weight_upload_bytes),
+        format_bytes(generation.metrics.readback_bytes),
+    );
+    eprintln!(
+        "kernels:    embed {} · lm_head {}",
+        generation.metrics.embedding_kernel, generation.metrics.output_projection_kernel,
+    );
+    eprintln!(
+        "quant:      {} · {} rejections",
+        generation.metrics.quantization_preflight_state,
+        generation.metrics.quantization_rejections.len(),
+    );
+    if let Some(path) = generation.metrics.quantization_plan_path.as_deref() {
+        eprintln!("plan:       {path}");
+    }
+    eprintln!("logged:     {CHAT_PERFORMANCE_LOG}");
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.2} {}", UNITS[unit])
+    }
 }
 fn rate(tokens: usize, elapsed: Duration) -> f64 {
     if elapsed.is_zero() {
@@ -1985,6 +2103,7 @@ fn parse_chat_args(
     bool,
     Gemma4KvCacheType,
     Gemma4Q4AttentionMode,
+    ChatMetricsVerbosity,
 )> {
     let mut model = None;
     let mut prompt = None;
@@ -1992,6 +2111,7 @@ fn parse_chat_args(
     let mut thoughts = false;
     let mut kv_cache_type = Gemma4KvCacheType::Q4_0;
     let mut q4_attention_mode = Gemma4Q4AttentionMode::default();
+    let mut verbosity = ChatMetricsVerbosity::Silent;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -2022,6 +2142,15 @@ fn parse_chat_args(
                     args.get(i).context("--q4-attention-mode needs a value")?,
                 )?;
             }
+            "--verbose" => match args.get(i + 1).map(String::as_str) {
+                Some("text") | Some("json") => {
+                    i += 1;
+                    verbosity = ChatMetricsVerbosity::parse(
+                        args.get(i).context("--verbose needs a value")?,
+                    )?;
+                }
+                _ => verbosity = ChatMetricsVerbosity::Text,
+            },
             "--executor" => {
                 i += 1;
                 ensure!(
@@ -2040,6 +2169,7 @@ fn parse_chat_args(
         thoughts,
         kv_cache_type,
         q4_attention_mode,
+        verbosity,
     ))
 }
 
@@ -2339,9 +2469,10 @@ fn metal_info() -> Result<()> {
 #[cfg(test)]
 mod kv_cache_cli_tests {
     use super::{
-        Gemma4KvCacheType, Gemma4Q4AttentionMode, GpuCountersMode, ThoughtFilter,
-        attention_dimensions, parse_benchmark_args, parse_chat_args, parse_matched_benchmark_args,
-        parse_profile_args, profiler_operation_family, token_ids_sha256, visible_chat_completion,
+        ChatMetricsVerbosity, Gemma4KvCacheType, Gemma4Q4AttentionMode, GpuCountersMode,
+        ThoughtFilter, attention_dimensions, parse_benchmark_args, parse_chat_args,
+        parse_matched_benchmark_args, parse_profile_args, profiler_operation_family,
+        token_ids_sha256, visible_chat_completion,
     };
     use atlas_profiler::{AttentionKind, AttentionScanPass, OperationFamily};
 
@@ -2431,10 +2562,60 @@ mod kv_cache_cli_tests {
             "--kv-cache-type".to_owned(),
             "q8_0".to_owned(),
         ];
-        let (_, _, _, _, cache_type, attention_mode) =
+        let (_, _, _, _, cache_type, attention_mode, _) =
             parse_chat_args(&args).expect("parse chat options");
         assert_eq!(cache_type, Gemma4KvCacheType::Q8_0);
         assert_eq!(attention_mode, Gemma4Q4AttentionMode::Flash16);
+    }
+
+    #[test]
+    fn chat_accepts_verbose_modes() {
+        let model = vec!["--model".to_owned(), "gemma4-e2b-q4_0".to_owned()];
+        assert_eq!(
+            parse_chat_args(&model).expect("parse chat options").6,
+            ChatMetricsVerbosity::Silent
+        );
+
+        let bare = vec![
+            "--model".to_owned(),
+            "gemma4-e2b-q4_0".to_owned(),
+            "--verbose".to_owned(),
+        ];
+        assert_eq!(
+            parse_chat_args(&bare).expect("parse chat options").6,
+            ChatMetricsVerbosity::Text
+        );
+
+        let text = vec![
+            "--model".to_owned(),
+            "gemma4-e2b-q4_0".to_owned(),
+            "--verbose".to_owned(),
+            "text".to_owned(),
+        ];
+        assert_eq!(
+            parse_chat_args(&text).expect("parse chat options").6,
+            ChatMetricsVerbosity::Text
+        );
+
+        let json = vec![
+            "--model".to_owned(),
+            "gemma4-e2b-q4_0".to_owned(),
+            "--verbose".to_owned(),
+            "json".to_owned(),
+        ];
+        assert_eq!(
+            parse_chat_args(&json).expect("parse chat options").6,
+            ChatMetricsVerbosity::Json
+        );
+
+        let invalid = vec![
+            "--model".to_owned(),
+            "gemma4-e2b-q4_0".to_owned(),
+            "--verbose".to_owned(),
+            "xml".to_owned(),
+        ];
+        let parsed = parse_chat_args(&invalid);
+        assert!(parsed.is_err(), "xml is not a valid verbose mode");
     }
 
     #[test]
