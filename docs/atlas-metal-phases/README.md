@@ -6,6 +6,13 @@ Silicon with the required numerical or performance evidence recorded.
 
 ## Current phase
 
+- [phase-13.17-q6-lm-head-16row-negative.md](phase-13.17-q6-lm-head-16row-negative.md) —
+  Band-shrink negative: the 16-row variant of the q6_k lm_head matvec
+  (M=262144, already device-saturating) is **~14% slower** (1.428 vs 1.249
+  ms/tok GPU) and was reverted. Design rule: the 16-row band pays only on
+  latency-bound decode matvecs, not throughput-bound huge-M kernels. Remaining
+  levers: PLE per-layer dispatch fusion (~1 ms/tok at ~18 µs x 105 dispatches),
+  attention split-KV, batch decode.
 - [phase-13.16-decode-matvec-16row.md](phase-13.16-decode-matvec-16row.md) —
   Decode matvec geometry lever, now the **production default**: 16-row-
   per-threadgroup variants of the mv_ext q4_0 kernels (`matvec_q4_0_16row_mv[_rms]`)
