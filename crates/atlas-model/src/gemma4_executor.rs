@@ -1101,33 +1101,36 @@ fn gemma4_q4_batch_uses_mul_mm() -> bool {
     std::env::var_os("ATLAS_GEMMA4_MUL_MM").is_some()
 }
 
-/// Opt-in gate for the vendored llama.cpp `llama_mul_mm_q4_0_f32` prefill
-/// GEMM — a faithful port of llama.cpp's classic simdgroup-matrix
-/// `kernel_mul_mm` (small-tile threadgroup staging + simdgroup_matrix
-/// multiply-accumulate). Off by default so the fp32 scalar tile stays the
-/// production path; set `ATLAS_GEMMA4_LLAMA_MUL_MM` to route the prefill
-/// projections through it for benchmark comparison. Tolerance-level (fp16
-/// fragments), the same accuracy class as the MUL_MM path.
+/// Prefill GEMM default gate: the vendored llama.cpp `llama_mul_mm_q4_0_f32`
+/// prefill GEMM (a faithful port of llama.cpp's classic simdgroup-matrix
+/// `kernel_mul_mm`, small-tile threadgroup staging + simdgroup_matrix
+/// multiply-accumulate) is the **production default** since phase-13.19 and
+/// routes the prefill projections through it; set `ATLAS_GEMMA4_LLAMA_MUL_MM=0`
+/// to fall back to the fp32 scalar tile (the phase-13.19 default-flip A/B,
+/// matching phase-13.10's opt-in behavior).  Tolerance-level (fp16 fragments),
+/// on-fixture greedy stream hash identical to the scalar tile.
 fn gemma4_llama_mul_mm_enabled() -> bool {
-    std::env::var_os("ATLAS_GEMMA4_LLAMA_MUL_MM").is_some()
+    std::env::var_os("ATLAS_GEMMA4_LLAMA_MUL_MM").map_or(true, |value| value != "0")
 }
 
-/// Opt-in gate for the Flash16-v4 batched prefill attention
-/// (`attention_prefill_gemma4_simd_q4_0_flash16_[swa_]v4`). Off by default so
-/// the bitwise batched prefill scan stays the production path; the flash
-/// variant is tolerance-level (slice split + merge reorder the FP32 reduction),
-/// the same accuracy class as the decode Flash16 path. Set
-/// `ATLAS_GEMMA4_FLASH_PREFILL` to enable it (q4_0 KV only).
+/// Prefill attention gate: the Flash16 batched prefill attention
+/// (`attention_prefill_gemma4_simd_q4_0_flash16_[swa_]vN`) is the
+/// **production default** since phase-13.19 and replaces the bitwise batched
+/// prefill scan; set `ATLAS_GEMMA4_FLASH_PREFILL=0` to fall back to the scan
+/// (the phase-13.19 default-flip A/B, matching phase-13.11's opt-in
+/// behavior).  The flash variant is tolerance-level (slice split + merge
+/// reorder the FP32 reduction), the same accuracy class as the decode
+/// Flash16 path, with the on-fixture greedy stream hash unchanged.
 fn gemma4_flash_prefill_enabled() -> bool {
-    std::env::var_os("ATLAS_GEMMA4_FLASH_PREFILL").is_some()
+    std::env::var_os("ATLAS_GEMMA4_FLASH_PREFILL").map_or(true, |value| value != "0")
 }
 
 /// Default single-pass flash16-v7 prefill attention (online softmax
-/// rescaling, half the v5/v6 K/V dequant traffic).  Requires the base
-/// `ATLAS_GEMMA4_FLASH_PREFILL` gate as well.  Set
-/// `ATLAS_GEMMA4_FLASH_PREFILL_V5` to fall back to the shared-head v5 kernel.
+/// rescaling, half the v5/v6 K/V dequant traffic).  Used whenever the flash
+/// prefill gate is on (the phase-13.19 default).  Set
+/// `ATLAS_GEMMA4_FLASH_PREFILL_V5=1` to fall back to the shared-head v5 kernel.
 fn gemma4_flash_prefill_v7_enabled() -> bool {
-    gemma4_flash_prefill_enabled() && !std::env::var_os("ATLAS_GEMMA4_FLASH_PREFILL_V5").is_some()
+    gemma4_flash_prefill_enabled() && std::env::var_os("ATLAS_GEMMA4_FLASH_PREFILL_V5").is_none()
 }
 
 /// Q4 batched GEMM binding.  The 32-token x 64-row fp16 matrix-unit kernel

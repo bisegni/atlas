@@ -6,6 +6,14 @@ Silicon with the required numerical or performance evidence recorded.
 
 ## Current phase
 
+- [phase-13.19-fast-prefill-default.md](phase-13.19-fast-prefill-default.md) —
+  Fast prefill by default: the mul_mm prefill GEMMs
+  (`ATLAS_GEMMA4_LLAMA_MUL_MM`) and the Flash16 batched prefill attention
+  (`ATLAS_GEMMA4_FLASH_PREFILL`) are now production defaults (opt-out with
+  `=0`); the legacy prefill path needs no env to be dormant. Default bench
+  prefill **~339–341 ms / ~1505–1510 tok/s** (was ~317 tok/s pre-flip at the
+  same command), decode flat at ~1859 ms (~68.8 tok/s), greedy hash
+  `f23c2962…` unchanged in both directions of the flip.
 - [phase-13.18-ple-input-gate-fusion.md](phase-13.18-ple-input-gate-fusion.md) —
   Decode PLE input-gate dispatch fusion: `gemma4_ple_gate_gelu_f32` collapses
   the per-layer `matvec_q4_0_16row_mv (inp_gate)` +
@@ -62,12 +70,14 @@ Silicon with the required numerical or performance evidence recorded.
 - [phase-13.11-flash-prefill-attention.md](phase-13.11-flash-prefill-attention.md) —
   Flash16-v4 merged-slice batched prefill attention
   (`attention_prefill_gemma4_simd_q4_0_flash16_[swa_]v4`, opt-in
-  `ATLAS_GEMMA4_FLASH_PREFILL`). Replaces the serial per-key-barrier prefill
+  `ATLAS_GEMMA4_FLASH_PREFILL`; part of the production prefill default since
+  phase-13.19). Replaces the serial per-key-barrier prefill
   scan. Correct (hash `f23c2962…` preserved) but only +4% prefill because Gemma
   is mostly sliding-window; confirms prefill is now GEMM-dominated.
 - [phase-13.10-vendored-llama-mul-mm-prefill.md](phase-13.10-vendored-llama-mul-mm-prefill.md) —
   Vendored llama.cpp's classic simdgroup-matrix `kernel_mul_mm` (MIT) as
-  `llama_mul_mm_q4_0_f32` (opt-in `ATLAS_GEMMA4_LLAMA_MUL_MM`) + a
+  `llama_mul_mm_q4_0_f32` (opt-in `ATLAS_GEMMA4_LLAMA_MUL_MM`; part of the
+  production prefill default since phase-13.19) + a
   2D-grid/threadgroup-memory dispatch. Prefill ~316 → ~674 tok/s (+113%),
   closing the llama.cpp gap from ~5x to ~2.4x; decode unchanged; hash preserved.
 - [phase-13.9-decode-ple-tail-fusion.md](phase-13.9-decode-ple-tail-fusion.md) —

@@ -24,7 +24,8 @@ fp16 with no dequantization — a direct `half4x4` load) as
 - `crates/atlas-model/src/gemma4_executor.rs` — `matmul_f16_llama_mul_mm`;
   the F16 arm of `matmul_batch` routes `per_layer_model_proj` through it when
   `ATLAS_GEMMA4_LLAMA_MUL_MM` is set (falls back to `matmul_f16_batch`
-  otherwise).
+  otherwise).  Since phase-13.19 the gate defaults to on (opt-out via
+  `ATLAS_GEMMA4_LLAMA_MUL_MM=0`); at the time of this phase it was opt-in.
 - `crates/atlas-metal/tests/llama_mul_mm_f16_parity.rs` — CPU-oracle parity.
 
 ## Parity
