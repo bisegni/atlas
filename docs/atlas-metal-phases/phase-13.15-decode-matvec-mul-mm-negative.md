@@ -68,6 +68,10 @@ for single-token decode; `mul_mm`'s advantage only materializes at real batch
 negative also confirms decode remains latency-bound as phase-13.4/13.9
 described; the observed ~20–32%-of-bandwidth matvecs are not a fixable
 occupancy artifact of the matvec shape but the floor for single-token GEMMs.
+(The "not a fixable occupancy artifact" claim covers the *matrix-unit* shape
+specifically; the *band geometry* of the mv_ext family was still fixable — see
+phase-13.16, which shrank the threadgroup band to 16 rows for ~8% decode with
+bitwise parity.)
 
 Secondary finding: the standalone-vec4-RMS + mul_mm stack preserved the exact
 greedy stream hash `f23c2962…`, so the RMS-fusion reordering concern was not

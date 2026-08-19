@@ -7,14 +7,15 @@ Silicon with the required numerical or performance evidence recorded.
 ## Current phase
 
 - [phase-13.16-decode-matvec-16row.md](phase-13.16-decode-matvec-16row.md) —
-  Decode matvec geometry lever: 16-row-per-threadgroup variants of the mv_ext
-  q4_0 kernels (`matvec_q4_0_16row_mv[_rms]`, opt-in
-  `ATLAS_GEMMA4_DECODE_16ROW`) are bitwise-identical to the 64-row family
-  (parity gates in `matvec_16row_parity.rs`) and measured decode **−6.1% e2e**
-  (mean 1863.0 vs 1984.3 ms, 68.7 vs 64.5 tok/s), per-token GPU
-  **20.52 → 19.51 ms (−4.9%)**, stream hash `f23c2962…` unchanged. Biggest
-  family wins: ffn-down −29.2%, wo −18.1%, PLE −11.0%; the fused qkv and
-  gate/up kernels still await a band-width variant.
+  Decode matvec geometry lever, now the **production default**: 16-row-
+  per-threadgroup variants of the mv_ext q4_0 kernels (`matvec_q4_0_16row_mv[_rms]`)
+  and of the fused qkv/gate/up kernels (`matmul_q4_0_[qkv|gate_up]_16row_mv_rms`)
+  are bitwise-identical to the 64/32-row family (6 parity gates in
+  `matvec_16row_parity.rs`) and measured decode **−7.8% e2e** (mean 1850.1 vs
+  2006.8 ms, 69.2 vs 63.8 tok/s), per-token GPU **20.89 → 19.25 ms (−7.9%)**,
+  stream hash `f23c2962…` unchanged. Family wins: ffn-down −31.9%, wo −22.1%,
+  qkv −19.5%, PLE −14.2%, gate/up −8.2%. `ATLAS_GEMMA4_DECODE_16ROW=0` opts
+  back into the 64/32-row stack for A/B.
 - [phase-13.15-decode-matvec-mul-mm-negative.md](phase-13.15-decode-matvec-mul-mm-negative.md) —
   Lever 2 (decode 1.9×) first hypothesis falsified: routing the single-token
   (N=1) decode Q4 matvecs (qkv, gate/up, ffn-down, wo) through the vendored
