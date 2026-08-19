@@ -33,16 +33,13 @@ append-only performance metrics. See the
 
 ## Plan structure
 
-- [Main architecture plan](docs/Atlas_Metal_Inference_Engine_Plan.md) —
-  goals, architecture, technical choices, and the overall roadmap.
-- [Shared implementation contract](docs/Atlas_Metal_Inference_Engine_Phase_Subplans.md)
-  — model fixture policy, Hugging Face download commands, artifact rules, and
-  cross-phase exit requirements.
+- [Engineering reference](docs/atlas-engineering.md) — design principles,
+  architecture and correctness contract, model fixture policy, GGUF workflow,
+  quantization preflight, benchmark/profiler instrumentation, and the
+  llama.cpp gap summary.
 - [Phase index / current state](docs/atlas-metal-phases/README.md) — status
   source of truth (per-phase records were consolidated into this index and
   `next-improvements.md` on 2026-08-18; older records remain in git history).
-- [GGUF conversion guide](docs/atlas-gguf-conversion.md) — native Q4_0/Q8_0
-  conversion, progress telemetry, import, and verification.
 
 Every phase has a concrete outcome, implementation scope, model test fixture,
 and acceptance gate. A phase is not complete until its runnable test passes on
@@ -246,4 +243,4 @@ model loading, scheduling, and the memory runtime have stable CLI contracts.
 
 For the complete sequence and exact gates, begin with the
 [phase index](docs/atlas-metal-phases/README.md) and the
-[shared implementation contract](docs/Atlas_Metal_Inference_Engine_Phase_Subplans.md).
+[engineering reference](docs/atlas-engineering.md).

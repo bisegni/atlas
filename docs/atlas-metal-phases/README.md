@@ -78,4 +78,4 @@ fixture is not present on the current machine).
   fused-PLE, split-PLE A/B).
 - `artifacts/phase-13.14/` — prefill attention A/B benches.
 - `artifacts/atlas-vs-llama/` — llama.cpp gap measurements
-  (see [atlas-vs-llama-gap-analysis.md](../atlas-vs-llama-gap-analysis.md)).
+  (see section 7 of [atlas-engineering.md](../atlas-engineering.md)).

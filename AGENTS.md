@@ -21,8 +21,8 @@ history).
 - `crates/atlas-cli`: user-facing CLI commands and runtime reporting.
 - `crates/*/tests`: focused regression and phase acceptance coverage.
 
-Read `docs/Atlas_Metal_Inference_Engine_Phase_Subplans.md` when work involves
-fixtures, acceptance evidence, phase gates, or artifacts. Preserve existing
+Read `docs/atlas-engineering.md` (sections 2–3) when work involves fixtures,
+acceptance evidence, phase gates, or artifacts. Preserve existing
 user changes: inspect `git status` and `git diff` before editing, and do not
 revert or reformat unrelated files.
 

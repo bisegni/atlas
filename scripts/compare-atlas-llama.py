@@ -6,7 +6,7 @@ stdout/stderr, normalizes supported JSON output, and refuses to claim a valid
 comparison when required workload fields do not match.
 
 Atlas is expected to expose the matched benchmark JSON contract described in:
-    docs/llama_cpp_matched_benchmark_instrumentation.md
+    docs/atlas-engineering.md (section 6, Performance instrumentation)
 
 Until that CLI is implemented, pass --atlas-command with a shell-style command
 template. Supported placeholders are documented in --help.
