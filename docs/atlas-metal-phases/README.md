@@ -6,13 +6,21 @@ Silicon with the required numerical or performance evidence recorded.
 
 ## Current phase
 
+- [phase-13.18-ple-input-gate-fusion.md](phase-13.18-ple-input-gate-fusion.md) —
+  Decode PLE input-gate dispatch fusion: `gemma4_ple_gate_gelu_f32` collapses
+  the per-layer `matvec_q4_0_16row_mv (inp_gate)` +
+  `ple_gelu_multiply_offset_f32` pair into one dispatch (kernel-level
+  bitwise-identical, greedy hash `f23c2962…` preserved). Exact per-dispatch
+  profile: PLE family 1.978 → 1.727 ms/token (−11.1%), −35 dispatches/token,
+  per-token GPU −3.3%; e2e bench flat within noise (1859 vs 1853 ms, 68.8 vs
+  69.1 tok/s) — the same measured-wash verdict as phase-13.9, kept as the
+  default. `ATLAS_GEMMA4_PLE_SPLIT=1` restores the split kernels for A/B.
 - [phase-13.17-q6-lm-head-16row-negative.md](phase-13.17-q6-lm-head-16row-negative.md) —
   Band-shrink negative: the 16-row variant of the q6_k lm_head matvec
   (M=262144, already device-saturating) is **~14% slower** (1.428 vs 1.249
   ms/tok GPU) and was reverted. Design rule: the 16-row band pays only on
   latency-bound decode matvecs, not throughput-bound huge-M kernels. Remaining
-  levers: PLE per-layer dispatch fusion (~1 ms/tok at ~18 µs x 105 dispatches),
-  attention split-KV, batch decode.
+  levers: attention split-KV, batch decode.
 - [phase-13.16-decode-matvec-16row.md](phase-13.16-decode-matvec-16row.md) —
   Decode matvec geometry lever, now the **production default**: 16-row-
   per-threadgroup variants of the mv_ext q4_0 kernels (`matvec_q4_0_16row_mv[_rms]`)

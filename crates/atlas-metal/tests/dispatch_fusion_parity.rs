@@ -350,3 +350,148 @@ fn ple_rms_add_scale_matches_norm_add_then_scale() {
         );
     }
 }
+
+fn assert_bitwise(label: &str, reference: &[f32], candidate: &[f32]) {
+    assert_eq!(reference.len(), candidate.len());
+    let mut diffs = 0usize;
+    for (r, c) in reference.iter().zip(candidate.iter()) {
+        if r.to_bits() != c.to_bits() {
+            diffs += 1;
+        }
+    }
+    assert_eq!(
+        diffs, 0,
+        "{label}: fused and split kernels diverge bitwise in {diffs} rows"
+    );
+}
+
+fn build_q4_weights(rows: usize, blocks: usize, state: &mut u32) -> Vec<u8> {
+    let mut weights = vec![0u8; rows * blocks * 18];
+    for (i, chunk) in weights.chunks_mut(18).enumerate() {
+        let scale = (0.005 + (i as f32 % 101.0) * 0.0003) as f32;
+        let half = (scale * 32768.0).round() as u16;
+        chunk[..2].copy_from_slice(&half.to_le_bytes());
+        let mut nibble = next_u32(state) as u8;
+        for byte in chunk[2..].iter_mut() {
+            nibble = nibble.wrapping_mul(7).wrapping_add(13) % 16;
+            *byte = nibble | (nibble << 4);
+        }
+    }
+    weights
+}
+
+fn run_ple_gate_gelu_split(
+    runtime: &MetalRuntime,
+    input: &[f32],
+    weights: &[u8],
+    ple: &[f32],
+    ple_offset: u32,
+    rows: usize,
+) -> Vec<f32> {
+    let input_buf = runtime.upload_f32(input).unwrap();
+    let weights_buf = runtime.upload_bytes(weights).unwrap();
+    let ple_buf = runtime.upload_f32(ple).unwrap();
+    let gate_buf = runtime.upload_f32(&vec![0.0f32; rows]).unwrap();
+    let out_buf = runtime.upload_f32(&vec![0.0f32; rows]).unwrap();
+    let input_width_buf = runtime.upload_u32(&[input.len() as u32]).unwrap();
+    let output_width_buf = runtime.upload_u32(&[rows as u32]).unwrap();
+    let offset_buf = runtime.upload_u32(&[ple_offset]).unwrap();
+    dispatch(
+        runtime,
+        "matvec_q4_0_16row_mv",
+        &[
+            (&input_buf, 0),
+            (&weights_buf, 0),
+            (&gate_buf, 0),
+            (&input_width_buf, 0),
+            (&output_width_buf, 0),
+        ],
+        (rows + 15) / 16,
+        128,
+    );
+    dispatch_1d(
+        runtime,
+        "ple_gelu_multiply_offset_f32",
+        &[
+            &gate_buf,
+            &ple_buf,
+            &out_buf,
+            &offset_buf,
+            &output_width_buf,
+        ],
+        rows,
+    );
+    runtime.read_f32(&out_buf, rows).unwrap()
+}
+
+fn run_ple_gate_gelu_fused(
+    runtime: &MetalRuntime,
+    input: &[f32],
+    weights: &[u8],
+    ple: &[f32],
+    ple_offset: u32,
+    rows: usize,
+) -> Vec<f32> {
+    let input_buf = runtime.upload_f32(input).unwrap();
+    let weights_buf = runtime.upload_bytes(weights).unwrap();
+    let ple_buf = runtime.upload_f32(ple).unwrap();
+    let out_buf = runtime.upload_f32(&vec![0.0f32; rows]).unwrap();
+    let input_width_buf = runtime.upload_u32(&[input.len() as u32]).unwrap();
+    let output_width_buf = runtime.upload_u32(&[rows as u32]).unwrap();
+    let offset_buf = runtime.upload_u32(&[ple_offset]).unwrap();
+    dispatch(
+        runtime,
+        "gemma4_ple_gate_gelu_f32",
+        &[
+            (&input_buf, 0),
+            (&weights_buf, 0),
+            (&ple_buf, 0),
+            (&offset_buf, 0),
+            (&out_buf, 0),
+            (&input_width_buf, 0),
+            (&output_width_buf, 0),
+        ],
+        (rows + 15) / 16,
+        128,
+    );
+    runtime.read_f32(&out_buf, rows).unwrap()
+}
+
+#[test]
+fn ple_gate_gelu_fused_is_bitwise_identical_to_split() {
+    // The phase-13.19 PLE input-gate fusion: gemma4_ple_gate_gelu_f32 replaces
+    // the per-layer pair of matvec_q4_0_16row_mv (state * inp_gate) followed
+    // by ple_gelu_multiply_offset_f32 (GELU * PLE slice) with one dispatch.
+    // The fused kernel keeps the 16-row per-lane block math and the elementwise
+    // GELU * PLE multiply verbatim, so every output element must match the
+    // two-kernel baseline bitwise (not merely within 1e-3).
+    let runtime = match MetalRuntime::new() {
+        Ok(runtime) => runtime,
+        Err(MetalError::NoDevice) => {
+            eprintln!("skipping: no Metal device is available to this process");
+            return;
+        }
+        Err(error) => panic!("Metal runtime should initialize: {error}"),
+    };
+    let mut state = 0x5f4b_7a3cu32;
+    for input_width in [512u32, 1024u32, 2304u32] {
+        let blocks = (input_width / 32) as usize;
+        let mut input = vec![0.0f32; input_width as usize];
+        fill_f32(&mut input, &mut state);
+        for rows in [31usize, 256usize, 260usize, 512usize, 1280usize] {
+            let weights = build_q4_weights(rows, blocks, &mut state);
+            let mut ple = vec![0.0f32; 4 * rows];
+            fill_f32(&mut ple, &mut state);
+            let ple_offset = (next_u32(&mut state) % 4) * rows as u32;
+            let split = run_ple_gate_gelu_split(&runtime, &input, &weights, &ple, ple_offset, rows);
+            let fused = run_ple_gate_gelu_fused(&runtime, &input, &weights, &ple, ple_offset, rows);
+            assert_bitwise(
+                &format!(
+                    "ple_gate_gelu_fused_vs_split in={input_width} rows={rows} off={ple_offset}"
+                ),
+                &split,
+                &fused,
+            );
+        }
+    }
+}

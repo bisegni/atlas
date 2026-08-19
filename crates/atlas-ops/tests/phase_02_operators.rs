@@ -50,8 +50,11 @@ fn fp32_neural_operators_match_cpu_oracles_for_prefill_and_decode() {
     // phase-13.14 matrix-unit prefill attention pair
     // (attention_prefill_gemma4_simd_q4_0_flash16_[swa_]v6), and the
     // phase-13.14 single-pass online-softmax pair
-    // (attention_prefill_gemma4_simd_q4_0_flash16_[swa_]v7) = 98.
-    assert_eq!(ops.runtime().pipeline_count(), 98);
+    // (attention_prefill_gemma4_simd_q4_0_flash16_[swa_]v7), the phase-13.15/13.16
+    // 16-row q4 decode matvec quartet (matvec_q4_0_16row_mv[_rms],
+    // matmul_q4_0_[qkv|gate_up]_16row_mv_rms), and the phase-13.18 PLE
+    // input-gate fusion (gemma4_ple_gate_gelu_f32) = 103.
+    assert_eq!(ops.runtime().pipeline_count(), 103);
 
     let table = [0.0, 0.1, 0.2, 0.3, 1.0, 1.1, 1.2, 1.3, 2.0, 2.1, 2.2, 2.3];
     let (embedded, _) = ops.embedding(&table, 3, 4, &[2, 0]).unwrap();

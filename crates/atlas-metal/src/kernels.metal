@@ -800,6 +800,86 @@ kernel void ple_gelu_multiply_offset_f32(
     }
 }
 
+// Decode-only fused PLE input gate: replaces the per-layer pair of
+// matvec_q4_0_16row_mv (state * inp_gate into the gate buffer) followed by
+// ple_gelu_multiply_offset_f32 (GELU * PLE slice into activated) with one
+// dispatch.  The matvec phase is the 16-row kernel's per-lane block math
+// verbatim and the lane-0 write applies the elementwise GELU * PLE multiply
+// verbatim, so every activated value is bitwise identical to the two-kernel
+// baseline and the downstream projection matvec (which depends only on
+// activated) is bitwise identical as well.
+kernel void gemma4_ple_gate_gelu_f32(
+    device const float *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device const float *ple [[buffer(2)]], constant uint &ple_offset [[buffer(3)]],
+    device float *output [[buffer(4)]], constant uint &input_width [[buffer(5)]],
+    constant uint &output_width [[buffer(6)]], uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    uint simdgroup = tid / 32;
+    uint lane = tid % 32;
+    uint row = group * 16 + simdgroup * 4;
+    bool active = row < output_width;
+    uint blocks = input_width / 32;
+    uint ix = lane / 2;
+    uint il = (lane % 2) * 8;
+    float sumf[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    device const uchar *ax[4];
+    for (uint r = 0; r < 4; ++r) {
+        uint safe_row = min(row + r, output_width - 1);
+        ax[r] = weights + safe_row * blocks * 18;
+    }
+    float yl[16];
+    device const float *yb = input + ix * 32 + il;
+    for (uint ib = ix; ib < blocks; ib += 16) {
+        float sumy0 = 0.0f;
+        float sumy1 = 0.0f;
+        #pragma unroll
+        for (uint i = 0; i < 8; i += 2) {
+            sumy0 += yb[i + 0] + yb[i + 1];
+            yl[i + 0] = yb[i + 0];
+            yl[i + 1] = yb[i + 1] * (1.0f / 256.0f);
+            sumy1 += yb[i + 16] + yb[i + 17];
+            yl[i + 8] = yb[i + 16] * (1.0f / 16.0f);
+            yl[i + 9] = yb[i + 17] * (1.0f / 4096.0f);
+        }
+        float sumy = sumy0 + sumy1;
+        if (active) {
+            #pragma unroll
+            for (uint r = 0; r < 4; ++r) {
+                device const uchar *base = ax[r] + ib * 18;
+                float scale = float(*(device const half *)base);
+                device const ushort *qs = (device const ushort *)(base + 2 + il);
+                float acc0 = 0.0f;
+                float acc1 = 0.0f;
+                float acc2 = 0.0f;
+                float acc3 = 0.0f;
+                #pragma unroll
+                for (uint i = 0; i < 8; i += 2) {
+                    ushort q = qs[i / 2];
+                    acc0 += yl[i + 0] * float(q & 0x000F);
+                    acc1 += yl[i + 1] * float(q & 0x0F00);
+                    acc2 += yl[i + 8] * float(q & 0x00F0);
+                    acc3 += yl[i + 9] * float(q & 0xF000);
+                }
+                sumf[r] += scale * (sumy * -8.0f + acc0 + acc1 + acc2 + acc3);
+            }
+        }
+        yb += 512;
+    }
+    for (uint r = 0; r < 4; ++r) sumf[r] = simd_sum(sumf[r]);
+    if (lane == 0) {
+        for (uint r = 0; r < 4; ++r) {
+            uint out_row = row + r;
+            if (out_row < output_width) {
+                float x = sumf[r];
+                float argument = 0.7978845608f * (x + 0.044715f * x * x * x);
+                float gelu = isinf(argument) ? (argument > 0.0f ? x : 0.0f)
+                                              : 0.5f * x * (1.0f + atlas_tanh_f32(argument));
+                output[out_row] = gelu * ple[ple_offset + out_row];
+            }
+        }
+    }
+}
+
 
 
 kernel void copy_u32(

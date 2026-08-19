@@ -91,10 +91,10 @@ cargo run --release -p atlas-cli -- benchmark matched --model gemma4-e2b-q4_0 \
 The lm_head remains on the 64-row q6 kernel at ~1.25 ms/token (6% of decode).
 With all matvec band levers now exhausted (positive for the q4 decode family,
 negative for huge-M q6), the remaining decode levers are the structural ones:
-(a) PLE per-layer dispatch fusion — 105 small dispatches/token (input-gate
-matvec → gelu-multiply → rms → projection per layer) at ~18 µs each, worth
-~1 ms/token if the two launcher-per-layer minima can be fused bitwise;
-(b) attention split-KV — the flash16 decode scan (3.0 swa + 1.35 full ms)
-grows linearly with context and its reduction order is currently exact-locked;
-(c) batch decode (N > 1), where the per-dispatch tax and the mul_mm machinery
-(phase-13.15) finally pay off.
+(a) ~~PLE per-layer dispatch fusion~~ — done in [phase-13.18](phase-13.18-ple-input-gate-fusion.md):
+the input-gate matvec + gelu-multiply pair is now one bitwise-identical
+dispatch (PLE family −11.1%, −35 launches/token), a measured wash for e2e
+like phase-13.9; (b) attention split-KV — the flash16 decode scan (3.0 swa
++ 1.35 full ms) grows linearly with context and its reduction order is
+currently exact-locked; (c) batch decode (N > 1), where the per-dispatch tax
+and the mul_mm machinery (phase-13.15) finally pay off.

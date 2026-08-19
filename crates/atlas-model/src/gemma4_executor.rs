@@ -1216,6 +1216,17 @@ fn gemma4_decode_16row_enabled() -> bool {
     std::env::var_os("ATLAS_GEMMA4_DECODE_16ROW").map_or(true, |value| value != "0")
 }
 
+/// Decode PLE input-gate fusion: gemma4_ple_gate_gelu_f32 replaces the
+/// per-layer pair of matvec_q4_0_16row_mv (state * inp_gate) followed by
+/// ple_gelu_multiply_offset_f32 (GELU * PLE slice) with one dispatch.  The
+/// fused kernel keeps both steps verbatim, so `activated` (and therefore the
+/// downstream projection matvec) is bitwise identical; it only removes the
+/// gate-buffer round trip and one launch per layer.  Set
+/// `ATLAS_GEMMA4_PLE_SPLIT=1` to restore the split kernels for an A/B.
+fn gemma4_ple_gate_gelu_enabled() -> bool {
+    std::env::var_os("ATLAS_GEMMA4_PLE_SPLIT").map_or(true, |value| value != "1")
+}
+
 /// 16-row counterpart binding for the RMS-input decode matvecs: kernel name
 /// and rows-per-threadgroup for `matvec_rms_labeled`.
 fn gemma4_q4_rms_projection_binding() -> (&'static str, usize) {
@@ -4361,31 +4372,54 @@ impl<'a> Gemma4E2bExecutor<'a> {
             let inp_gate = self.weight(&format!("{p}.inp_gate.weight"), GgufTensorType::Q4_0)?;
             let projection = self.weight(&format!("{p}.proj.weight"), GgufTensorType::Q4_0)?;
             let post_norm = self.weight(&format!("{p}.post_norm.weight"), GgufTensorType::F32)?;
-            self.matvec_labeled(
-                &mut command,
-                Some("ple_input_gate"),
-                &self.state,
-                &inp_gate,
-                &self.gate,
-                &self.hidden,
-                &self.ple_width,
-                c.per_layer_embedding_size,
-                GgufTensorType::Q4_0,
-            )?;
             // Current layer PLE is a contiguous [256] slice in the resident [layer][width] table.
             let ple_offset = &self.ple_offsets[layer];
-            command.dispatch_1d_labeled(
-                "ple_gelu_multiply_offset_f32",
-                Some("ple_projection"),
-                &[
+            if gemma4_ple_gate_gelu_enabled() {
+                // Fused PLE input gate: GELU(state * inp_gate) * ple[layer] ->
+                // activated in one dispatch (16-row matvec lane math and the
+                // elementwise GELU*PLE multiply verbatim, so the output is
+                // bitwise identical to the two-kernel baseline; saves one
+                // launch per layer).
+                command.dispatch_threadgroups_1d_labeled(
+                    "gemma4_ple_gate_gelu_f32",
+                    Some("ple_input_gate"),
+                    &[
+                        &self.state,
+                        &inp_gate,
+                        &self.ple,
+                        &ple_offset,
+                        &self.activated,
+                        &self.hidden,
+                        &self.ple_width,
+                    ],
+                    c.per_layer_embedding_size.div_ceil(16),
+                    128,
+                )?;
+            } else {
+                self.matvec_labeled(
+                    &mut command,
+                    Some("ple_input_gate"),
+                    &self.state,
+                    &inp_gate,
                     &self.gate,
-                    &self.ple,
-                    &self.activated,
-                    &ple_offset,
+                    &self.hidden,
                     &self.ple_width,
-                ],
-                c.per_layer_embedding_size,
-            )?;
+                    c.per_layer_embedding_size,
+                    GgufTensorType::Q4_0,
+                )?;
+                command.dispatch_1d_labeled(
+                    "ple_gelu_multiply_offset_f32",
+                    Some("ple_projection"),
+                    &[
+                        &self.gate,
+                        &self.ple,
+                        &self.activated,
+                        &ple_offset,
+                        &self.ple_width,
+                    ],
+                    c.per_layer_embedding_size,
+                )?;
+            }
             self.matvec_labeled(
                 &mut command,
                 Some("ple_projection"),

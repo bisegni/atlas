@@ -938,6 +938,7 @@ mod macos {
                 "rms_norm_decode_f32_vec4",
                 "gemma4_rms_residual_f32",
                 "gemma4_ple_rms_add_scale_f32",
+                "gemma4_ple_gate_gelu_f32",
                 "matvec_f32",
                 "matvec_q4_0",
                 "matvec_q4_0_blocked",
