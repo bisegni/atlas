@@ -7,8 +7,11 @@ appears to work.
 ## First read and source of truth
 
 Before changing a feature, inspect the relevant crate, its focused tests, and
-the applicable phase plan under `docs/atlas-metal-phases/`. The phase index in
-`docs/atlas-metal-phases/README.md` is the status source of truth.
+the current-state index and improvement roadmap under
+`docs/atlas-metal-phases/`: `README.md` is the status source of truth and
+`next-improvements.md` is the open-work list (per-phase records were
+consolidated into these two files on 2026-08-18; older records remain in git
+history).
 
 - `crates/atlas-metal`: Metal device, buffers, command encoding, kernels, and
   GPU telemetry.

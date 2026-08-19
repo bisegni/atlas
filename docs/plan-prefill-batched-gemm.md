@@ -9,7 +9,7 @@
 > shift Metal's instruction selection ~1 ulp; the bitwise-exact token-major
 > variant measured only +5%. The software-prefetch idea from the original plan
 > was ruled out — it also drifts ~1 ulp and is incompatible with the stream
-> sentinel. See `docs/atlas-metal-phases/phase-13.6-prefill-batched-gemm.md`.
+> sentinel. See the current-state index at `docs/atlas-metal-phases/README.md` (phase records consolidated 2026-08-18).
 
 ## Objective
 
@@ -75,7 +75,7 @@ Artifacts under `artifacts/phase-13.6/`.
 
 ## Docs
 
-- `docs/atlas-metal-phases/phase-13.6-prefill-batched-gemm.md` + README index
+- `docs/atlas-metal-phases/README.md` index (phase records consolidated 2026-08-18).
   link.
 - Update the prefill status in `docs/atlas-vs-llama-gap-analysis.md`.
 

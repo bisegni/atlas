@@ -27,10 +27,9 @@ projection paths. Model fixtures remain ignored by Git.
 
 Gemma 4 E2B Q4_0 runs through the GPU-resident executor with interactive chat,
 one-command-buffer prompt submission, packed Q4_0/Q6_K projection kernels, and
-append-only performance metrics. The current implementation materially improves
-the original throughput, while longer-workload prefill and decode optimization
-remains open. See the
-[current evidence and next implementation strategies](docs/atlas-metal-phases/phase-12a-perf-gemma4-resident-performance.md#next-implementation-strategies).
+append-only performance metrics. See the
+[current state and performance](docs/atlas-metal-phases/README.md) and the
+[open improvements list](docs/atlas-metal-phases/next-improvements.md).
 
 ## Plan structure
 
@@ -39,8 +38,9 @@ remains open. See the
 - [Shared implementation contract](docs/Atlas_Metal_Inference_Engine_Phase_Subplans.md)
   — model fixture policy, Hugging Face download commands, artifact rules, and
   cross-phase exit requirements.
-- [Phase-plan index](docs/atlas-metal-phases/README.md) — one executable plan
-  file for each phase from Metal bootstrap through the memory router.
+- [Phase index / current state](docs/atlas-metal-phases/README.md) — status
+  source of truth (per-phase records were consolidated into this index and
+  `next-improvements.md` on 2026-08-18; older records remain in git history).
 - [GGUF conversion guide](docs/atlas-gguf-conversion.md) — native Q4_0/Q8_0
   conversion, progress telemetry, import, and verification.
 
@@ -213,11 +213,11 @@ record to `artifacts/chat-performance.jsonl`. The first turn includes the model
 weight upload. After `/reset`, later turns in the same process should report
 `"weight_upload_bytes": 0`.
 
-The current warm canonical `hi` workload reaches approximately 39 tok/s
-prefill and 40 tok/s decode on the measured Apple M2 Max, with one prefill
-command buffer and 3,489,602,512 Resident bytes. Longer-workload performance
+The canonical matched workload (pp512/tg128, Resident, Gemma 4 E2B Q4_0)
+reaches approximately 1505 tok/s prefill and ~68.8 tok/s decode
+(~14.5 ms/tok) on the measured Apple M2 Max.  Longer-workload performance
 remains open; see the prioritized
-[Gemma 4 next implementation strategies](docs/atlas-metal-phases/phase-12a-perf-gemma4-resident-performance.md#next-implementation-strategies).
+[improvements list](docs/atlas-metal-phases/next-improvements.md).
 
 The supported product interface is currently the local CLI. HTTP serving is
 intentionally deferred until the final API phase, after sampling, quantized
@@ -244,5 +244,6 @@ model loading, scheduling, and the memory runtime have stable CLI contracts.
 6. Add the loopback OpenAI-compatible server only after the local runtime and
    CLI contracts are complete.
 
-For the complete sequence and exact gates, begin with
-[Phase 0](docs/atlas-metal-phases/phase-00-metal-runtime-bootstrap.md).
+For the complete sequence and exact gates, begin with the
+[phase index](docs/atlas-metal-phases/README.md) and the
+[shared implementation contract](docs/Atlas_Metal_Inference_Engine_Phase_Subplans.md).

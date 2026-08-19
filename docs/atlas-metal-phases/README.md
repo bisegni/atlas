@@ -1,153 +1,81 @@
-# Atlas Metal phase index
+# Atlas Metal — current state
 
-Status source of truth for the Atlas Metal inference phases. A phase is
-complete only when its declared runnable acceptance gate passed on Apple
-Silicon with the required numerical or performance evidence recorded.
+Status source of truth for the Atlas Metal inference engine.  Historical
+per-phase records were consolidated here on 2026-08-18 (they remain in git
+history; evidence artifacts stay under `artifacts/`); the open work list
+lives in [next-improvements.md](next-improvements.md).
 
-## Current phase
+## Engine
 
-- [phase-13.19-fast-prefill-default.md](phase-13.19-fast-prefill-default.md) —
-  Fast prefill by default: the mul_mm prefill GEMMs
-  (`ATLAS_GEMMA4_LLAMA_MUL_MM`) and the Flash16 batched prefill attention
-  (`ATLAS_GEMMA4_FLASH_PREFILL`) are now production defaults (opt-out with
-  `=0`); the legacy prefill path needs no env to be dormant. Default bench
-  prefill **~339–341 ms / ~1505–1510 tok/s** (was ~317 tok/s pre-flip at the
-  same command), decode flat at ~1859 ms (~68.8 tok/s), greedy hash
-  `f23c2962…` unchanged in both directions of the flip.
-- [phase-13.18-ple-input-gate-fusion.md](phase-13.18-ple-input-gate-fusion.md) —
-  Decode PLE input-gate dispatch fusion: `gemma4_ple_gate_gelu_f32` collapses
-  the per-layer `matvec_q4_0_16row_mv (inp_gate)` +
-  `ple_gelu_multiply_offset_f32` pair into one dispatch (kernel-level
-  bitwise-identical, greedy hash `f23c2962…` preserved). Exact per-dispatch
-  profile: PLE family 1.978 → 1.727 ms/token (−11.1%), −35 dispatches/token,
-  per-token GPU −3.3%; e2e bench flat within noise (1859 vs 1853 ms, 68.8 vs
-  69.1 tok/s) — the same measured-wash verdict as phase-13.9, kept as the
-  default. `ATLAS_GEMMA4_PLE_SPLIT=1` restores the split kernels for A/B.
-- [phase-13.17-q6-lm-head-16row-negative.md](phase-13.17-q6-lm-head-16row-negative.md) —
-  Band-shrink negative: the 16-row variant of the q6_k lm_head matvec
-  (M=262144, already device-saturating) is **~14% slower** (1.428 vs 1.249
-  ms/tok GPU) and was reverted. Design rule: the 16-row band pays only on
-  latency-bound decode matvecs, not throughput-bound huge-M kernels. Remaining
-  levers: attention split-KV, batch decode.
-- [phase-13.16-decode-matvec-16row.md](phase-13.16-decode-matvec-16row.md) —
-  Decode matvec geometry lever, now the **production default**: 16-row-
-  per-threadgroup variants of the mv_ext q4_0 kernels (`matvec_q4_0_16row_mv[_rms]`)
-  and of the fused qkv/gate/up kernels (`matmul_q4_0_[qkv|gate_up]_16row_mv_rms`)
-  are bitwise-identical to the 64/32-row family (6 parity gates in
-  `matvec_16row_parity.rs`) and measured decode **−7.8% e2e** (mean 1850.1 vs
-  2006.8 ms, 69.2 vs 63.8 tok/s), per-token GPU **20.89 → 19.25 ms (−7.9%)**,
-  stream hash `f23c2962…` unchanged. Family wins: ffn-down −31.9%, wo −22.1%,
-  qkv −19.5%, PLE −14.2%, gate/up −8.2%. `ATLAS_GEMMA4_DECODE_16ROW=0` opts
-  back into the 64/32-row stack for A/B.
-- [phase-13.15-decode-matvec-mul-mm-negative.md](phase-13.15-decode-matvec-mul-mm-negative.md) —
-  Lever 2 (decode 1.9×) first hypothesis falsified: routing the single-token
-  (N=1) decode Q4 matvecs (qkv, gate/up, ffn-down, wo) through the vendored
-  llama `llama_mul_mm_q4_0_f32` matrix-unit kernel made decode **2.8× slower**
-  (median ~5578 vs ~1989 ms, ~23 vs ~64.5 tok/s) despite a bitwise-preserved
-  stream hash `f23c2962…`; the opt-in code was reverted and the mv_ext matvec
-  family stays the decode default — `mul_mm`'s advantage requires real batch
-  (N ≥ 16–32). Lever 2 remains open; remaining levers are attention (~21.5% of
-  per-token GPU), PLE/lm_head, and batch decode.
-- [phase-13.14-remaining-prefill-attention-and-decode.md](phase-13.14-remaining-prefill-attention-and-decode.md) —
-  Lever 1 closed with flash16-v7 single-pass matrix-unit prefill attention
-  (online softmax rescaling, each key/K-V visited once, half the dequant
-  traffic): prefill ~374 → ~346 ms (~+7%), hash `f23c2962…` preserved, **v7 is
-  now the default**: dispatched prefill attention kernel (v5 opt-in via
-  `ATLAS_GEMMA4_FLASH_PREFILL_V5=1`). The intermediate flash16-v6 two-pass
-  matrix-unit variant measured equal to v5 and was recorded as a negative
-  result. The attention kernel is q4_0-dequant/bandwidth-bound. Lever 2 (decode
-  1.9×) still open.
-- [phase-13.13-flash16-v5-shared-head-prefill-attention.md](phase-13.13-flash16-v5-shared-head-prefill-attention.md) —
-  Flash16-v5 prefill attention: one threadgroup per token with one SIMD group
-  per head, sharing the K/V q4_0 dequant across heads (kv_heads == 1). Prefill
-  attention ~163 → ~80 ms; prefill ~1132 → ~1356 tok/s; gap to llama.cpp ~1.4×
-  → ~1.25×; hash preserved.
-- [phase-13.12-fast-f16-prefill-mul-mm.md](phase-13.12-fast-f16-prefill-mul-mm.md) —
-  Vendored llama.cpp's `kernel_mul_mm_f16_f32` (direct `half4x4` load, no
-  dequant) for Gemma 4's fp16 `per_layer_model_proj`. The single naive
-  `matmul_f16_batch` GEMM dropped 269.42 → 1.96 ms, cutting prefill ~728 → ~452
-  ms (~700 → ~1132 tok/s, +62%); gap to llama.cpp 2.4× → ~1.4×; hash preserved.
-- [phase-13.11-flash-prefill-attention.md](phase-13.11-flash-prefill-attention.md) —
-  Flash16-v4 merged-slice batched prefill attention
-  (`attention_prefill_gemma4_simd_q4_0_flash16_[swa_]v4`, opt-in
-  `ATLAS_GEMMA4_FLASH_PREFILL`; part of the production prefill default since
-  phase-13.19). Replaces the serial per-key-barrier prefill
-  scan. Correct (hash `f23c2962…` preserved) but only +4% prefill because Gemma
-  is mostly sliding-window; confirms prefill is now GEMM-dominated.
-- [phase-13.10-vendored-llama-mul-mm-prefill.md](phase-13.10-vendored-llama-mul-mm-prefill.md) —
-  Vendored llama.cpp's classic simdgroup-matrix `kernel_mul_mm` (MIT) as
-  `llama_mul_mm_q4_0_f32` (opt-in `ATLAS_GEMMA4_LLAMA_MUL_MM`; part of the
-  production prefill default since phase-13.19) + a
-  2D-grid/threadgroup-memory dispatch. Prefill ~316 → ~674 tok/s (+113%),
-  closing the llama.cpp gap from ~5x to ~2.4x; decode unchanged; hash preserved.
-- [phase-13.9-decode-ple-tail-fusion.md](phase-13.9-decode-ple-tail-fusion.md) —
-  Decode PLE-tail dispatch fusion: `gemma4_ple_rms_add_scale_f32` collapses the
-  per-layer `rms_norm → vector_add → scalar_multiply` tail into one dispatch.
-  Bitwise-correct (greedy hash `f23c2962…` preserved) and cuts decode dispatch
-  count 547.7 → 478.2/token (−12.7%), but decode tok/s is unchanged (64.3–64.9)
-  because decode is GPU-latency-bound, not dispatch-bound — re-confirming the
-  phase-13.4 D3 verdict post-v4. Not a decode-throughput lever.
-- [phase-13.8-llama-grade-prefill-mul-mm.md](phase-13.8-llama-grade-prefill-mul-mm.md) —
-  llama.cpp-style fp16 matrix-unit prefill GEMM (opt-in `ATLAS_GEMMA4_MUL_MM`):
-  `matmul_q4_0_batch_f16` feeds the matrix units from device fp16 fragments with
-  NO threadgroup weight staging (dequantized once per layer via
-  `gemma4_q4_0_to_f16_batch`, fp32 act cast via `gemma4_cast_f32_to_f16_batch`).
-  Tolerance-level (~3–4e-4 relative, gated off by default; the fp32 scalar tile
-  stays the `max-abs < 1e-3` default). Kernel parity passes on M2 Max.
-  End-to-end measured on the local Gemma 4 E2B fixture: **prefill ~256 → ~286
-  tok/s (+12%) at pp512** — a real but modest gain, not the llama-grade
-  (~1600 tok/s) jump; see phase-13.9 "Implication for the llama.cpp gap".
-- [phase-13.7-flash16-v4-decode-attention.md](phase-13.7-flash16-v4-decode-attention.md) —
-  Path B merged-slice decode flash attention: `Flash16` now binds the
-  non-bitwise v4 kernels (no per-key barriers; slice-merge in threadgroup
-  memory), covered by the max-abs < 1e-3 tolerance contract. Decode more than
-  doubled (30.5 → 64.9 tok/s at matched pp512/tg128; ~0.8× llama.cpp's
-  empty-context decode), attention ~19 → ~2.5 ms/token, stream hash still
-  `f23c2962…` on the matched workloads (drifts at token 50 on the chat prompt —
-  the approved Path B tradeoff).
-- [phase-13.6-prefill-batched-gemm.md](phase-13.6-prefill-batched-gemm.md) —
-  Weight-stationary q4 batched GEMM for prefill: `matmul_q4_0_batch_32row`
-  tiles 4 tokens × 32 rows per threadgroup so each weight block is read once
-  and reused in registers, cutting prefill weight traffic ~4×. Prefill +60–70%
-  (~190 → ~308–322 tok/s flat at pp100/512/1024), closing the llama.cpp prefill
-  gap from ~8× to ~4–5× with a byte-identical greedy stream hash. Parity is
-  tolerance-level (max-abs ~4.7e-10, user-approved; the bitwise token-major
-  variant measured only +5%).
-- [phase-13.3-flash16-staged-kv-scan.md](phase-13.3-flash16-staged-kv-scan.md) —
-  Decode improvement D2 (gap analysis): staged, chunked, exact-ordered decode
-  attention KV scan with wide (512 full / 256 swa) threadgroups. Acceptance
-  gate met: v3 bitwise-identical to LegacyFused/`_nb` (per-token fp32 logit
-  digests + exact-token stream parity), decode GPU −31.6% at matched pp512/tg128
-  with a byte-identical greedy stream hash, decode 53.6→31.0→27.4 tok/s at
-  pp100→512→1024 (artifact under `artifacts/phase-13.3/`).
-- [phase-13.2-flash16-default-attention.md](phase-13.2-flash16-default-attention.md) —
-  Decode improvement D1 (gap analysis): q4 attention defaults to the
-  no-value-barrier flash16 variant. Acceptance gate met: per-token fp32
-  logit-digest and exact-token parity with LegacyFused preserved, decode GPU
-  −8.6% at matched pp512/tg128, greedy stream hash byte-identical (artifact
-  under `artifacts/phase-13.2/`).
-- [phase-13.1-batched-prefill-kernels.md](phase-13.1-batched-prefill-kernels.md) —
-  Token-batched prefill kernels (gap-analysis R1). Acceptance gate met: per-token
-  qk/rope, V-RMS, KV-append, attention, and PLE loops collapsed into single
-  dispatches; batch cap raised to 512; prefill pp512 49.6 → 199.8 tok/s,
-  greedy stream hash byte-identical (artifact under `artifacts/phase-13.1/`).
-- [phase-13.0-resident-decode-100-toks.md](phase-13.0-resident-decode-100-toks.md) —
-  Resident decode to 100 tok/s. Active: resume, hotspot baseline, ordered
-  improvement plan (RMS fusion, dispatch fusion, flash16 v3 tiling, matvec
-  ILP), acceptance gates.
+Atlas is a Rust-first, Apple-Silicon Metal inference engine for Gemma 4
+(production support is Gemma-only; the local fixture is
+`gemma-4-e2b-it-q4_0`, pinned in `models/manifest.toml`).  All inference,
+benchmarks, and profiles run on the **GPU-resident executor**
+(`ExecutorMode::Resident`); the reference executor exists as an oracle for
+parity diagnostics only.
 
-## Supporting analysis
+## Correctness contract
 
-- [atlas-vs-llama-gap-analysis.md](../atlas-vs-llama-gap-analysis.md) — why
-  llama.cpp is 12–45× faster in prefill and 2–5× in decode on the same GGUF:
-  batched GEMM vs per-token prefill loops, and dispatch/occupancy-bound decode
-  vs llama.cpp's near-bandwidth-bound fused kernels. Read-only reference for
-  prioritizing phase 13+ work.
+- Greedy-stream sentinel hash **`f23c2962…`** on the matched workloads
+  (pp512/tg128) — the byte-identical end-to-end gate.
+- Bitwise-identical kernels: 16-row decode q4 matvec family, RMS norms,
+  PLE gate+gelu fusion, PLE epilogue fusion.
+- Tolerance-level (max-abs 1e-3 / max-rel 1e-2 kernel gates): decode and
+  prefill Flash16 attention, mul_mm prefill GEMMs (fp16 fragments).
 
-## Retired phases
+## Current performance
 
-Phase 12.3 (resident decode optimization) reached its promotion gate with
-the composed flash16_uw + mv_ext + rms-vec4 stack at 56.6/68.9 tok/s
-long/short and was retired when phase 13.0 started. Earlier phase documents
-were removed as part of that cleanup; their evidence artifacts remain under
-`artifacts/`.
+Recorded on M2 Max, Resident, q4_0 KV, flash16, pp512/tg128, warmup 1:
+`benchmark matched --model gemma4-e2b-q4_0 --prompt-tokens 512
+--decode-tokens 128 --warmup-runs 1 --runs 3`.
+
+| Metric | Value |
+|---|---:|
+| Prefill | **339–341 ms, ~1505–1510 tok/s** |
+| Decode (128 tokens) | 1850–1866 ms, **~68.8 tok/s** (~14.5 ms/tok) |
+| End-to-end host wall | ~2.2 s (prefill + 128 tokens) |
+| Greedy stream hash | `f23c2962…1875` (all configs) |
+
+Decode per-token GPU (~18.8 ms, exact per-dispatch profile,
+`artifacts/phase-12a/gemma4-resident-decode-profile.jsonl`): attention
+swa+full ~3.5–4.4 ms (largest family), ffn gate/up ~2.4, qk_norm_rope ~2.3,
+PLE family ~1.7 (71 dispatches), ffn_down ~1.4, lm_head ~1.2, qkv ~1.2.
+Decode is GPU-latency-bound; dispatch-count reduction does not raise
+throughput (verified twice).
+
+## Production defaults and opt-outs
+
+| Behavior | Default | Opt-out / fallback |
+|---|---|---|
+| Fast prefill: llama mul_mm GEMMs + Flash16-v7 batched attention | **on** | `ATLAS_GEMMA4_LLAMA_MUL_MM=0`, `ATLAS_GEMMA4_FLASH_PREFILL=0` (legacy prefill, ~317 tok/s A/B) |
+| Prefill attention variant | v7 (single-pass) | `ATLAS_GEMMA4_FLASH_PREFILL_V5=1` → v5 |
+| Decode q4 matvec band | 16-row/threadgroup | `ATLAS_GEMMA4_DECODE_16ROW=0` → 64/32-row |
+| PLE input-gate fusion (gate+gelu in one dispatch) | **on** | `ATLAS_GEMMA4_PLE_SPLIT=1` → split kernels |
+| lm_head | 64-row q6 (16-row falsified) | — |
+| fp16 batch GEMM / mm64 | off | `ATLAS_GEMMA4_MUL_MM`, `ATLAS_GEMMA4_MM64` |
+
+## Validation
+
+```zsh
+cargo test --workspace                                   # Rust + Metal regression
+
+cargo test -p atlas-metal --test phase_00_bootstrap      # Metal bootstrap
+cargo run -p atlas-cli -- model verify --model gemma4-e2b-q4_0
+
+cargo run --release -p atlas-cli -- benchmark matched --model gemma4-e2b-q4_0 \
+  --prompt-tokens 512 --decode-tokens 128 --warmup-runs 1 --runs 3 \
+  --output-format json                                   # performance + hash gate
+```
+
+Fixture-gated tests that need `models/hf/SmolLM2-135M-Instruct`:
+`cargo test -p atlas-model --test phase_06_executors -- --ignored` (that
+fixture is not present on the current machine).
+
+## Artifacts
+
+- `artifacts/phase-12a/gemma4-resident-decode-profile.jsonl` — exact
+  per-dispatch decode profiles (records 25–28: 64-row baseline, all-16,
+  fused-PLE, split-PLE A/B).
+- `artifacts/phase-13.14/` — prefill attention A/B benches.
+- `artifacts/atlas-vs-llama/` — llama.cpp gap measurements
+  (see [atlas-vs-llama-gap-analysis.md](../atlas-vs-llama-gap-analysis.md)).

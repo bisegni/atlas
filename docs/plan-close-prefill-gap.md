@@ -101,7 +101,7 @@ prefill tolerance to unlock the fp16 matrix-unit path.
 
 ## Docs
 
-`docs/atlas-metal-phases/phase-13.8-llama-grade-prefill-mul-mm.md`, README
+`docs/atlas-metal-phases/README.md` (phase records consolidated 2026-08-18)
 index, gap-analysis prefill status.
 
 ## simdgroup matrix-unit layout findings (2026-08-17, `rev_probe` harness)
