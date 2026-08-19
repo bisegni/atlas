@@ -885,12 +885,16 @@ pub struct Gemma4DecodeProfile {
 fn gemma4_kernel_family(kernel: &str) -> &'static str {
     if matches!(
         kernel,
-        "matmul_q4_0_qkv_32row_mv" | "matmul_q4_0_qkv_32row_mv_rms"
+        "matmul_q4_0_qkv_32row_mv"
+            | "matmul_q4_0_qkv_32row_mv_rms"
+            | "matmul_q4_0_qkv_16row_mv_rms"
     ) {
         "q4_qkv_projection"
     } else if matches!(
         kernel,
-        "matmul_q4_0_gate_up_32row_mv" | "matmul_q4_0_gate_up_32row_mv_rms"
+        "matmul_q4_0_gate_up_32row_mv"
+            | "matmul_q4_0_gate_up_32row_mv_rms"
+            | "matmul_q4_0_gate_up_16row_mv_rms"
     ) {
         "q4_ffn_gate_up_projection"
     } else if matches!(
@@ -1042,11 +1046,29 @@ pub(crate) fn gemma4_q4_projection_kernel() -> &'static str {
 }
 
 pub(crate) fn gemma4_q4_qkv_projection_kernel() -> &'static str {
-    "matmul_q4_0_qkv_32row_mv_rms"
+    gemma4_q4_fused_projection_binding(false).0
 }
 
 pub(crate) fn gemma4_q4_gate_up_projection_kernel() -> &'static str {
-    "matmul_q4_0_gate_up_32row_mv_rms"
+    gemma4_q4_fused_projection_binding(true).0
+}
+
+/// Fused decode Q4 matvec binding (qkv and gate/up fusions): kernel name and
+/// rows-per-threadgroup.  The 16-row variants (`matmul_q4_0_[qkv|gate_up]_16row_mv_rms`)
+/// keep the 32-row per-lane arithmetic and only shrink the simdgroup band to
+/// 4 rows (grid rpg/16), staying bitwise identical per row.
+fn gemma4_q4_fused_projection_binding(ffn_gate_up: bool) -> (&'static str, usize) {
+    if gemma4_decode_16row_enabled() {
+        if ffn_gate_up {
+            ("matmul_q4_0_gate_up_16row_mv_rms", 16)
+        } else {
+            ("matmul_q4_0_qkv_16row_mv_rms", 16)
+        }
+    } else if ffn_gate_up {
+        ("matmul_q4_0_gate_up_32row_mv_rms", 32)
+    } else {
+        ("matmul_q4_0_qkv_32row_mv_rms", 32)
+    }
 }
 
 fn gemma4_q4_batch_projection_kernel() -> &'static str {
@@ -1183,14 +1205,15 @@ pub(crate) fn gemma4_ffn_down_projection_kernel() -> &'static str {
     }
 }
 
-/// Opt-in gate for the llama.cpp-current 16-row-per-threadgroup q4_0 matvec
-/// granularity (128 threads, 4 SIMD groups x 4 rows) on the decode Q4
-/// matvec sites: ffn-down, attention-output, PLE, and the shared-KV query
-/// projection.  Off by default so the composed 64-row stack stays the
-/// production path; the 16-row kernels are bitwise-identical to the 64-row
-/// family per row and only change the threadgroup grid.
+/// Decode 16-row-per-threadgroup q4_0 matvec granularity (4 SIMD groups x 4
+/// rows, grids of ceil(width/16)) on the decode Q4 matvec sites: ffn-down,
+/// attention-output, PLE, shared-KV query, and the fused qkv and gate/up
+/// projections.  Production default since phase-13.16: the 16-row kernels
+/// are bitwise-identical to the 64-row/32-row family per row and only change
+/// the threadgroup grid; set `ATLAS_GEMMA4_DECODE_16ROW=0` to opt out for an
+/// A/B comparison.
 fn gemma4_decode_16row_enabled() -> bool {
-    std::env::var_os("ATLAS_GEMMA4_DECODE_16ROW").is_some()
+    std::env::var_os("ATLAS_GEMMA4_DECODE_16ROW").map_or(true, |value| value != "0")
 }
 
 /// 16-row counterpart binding for the RMS-input decode matvecs: kernel name
@@ -2380,7 +2403,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
     ) -> Result<()> {
         let (kernel, buffers): (&'static str, Vec<&GpuBuffer>) = match rms_weight {
             Some(rms_weight) => (
-                "matmul_q4_0_qkv_32row_mv_rms",
+                gemma4_q4_fused_projection_binding(false).0,
                 vec![
                     input,
                     q_weight,
@@ -2412,11 +2435,12 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 ],
             ),
         };
+        let rows_per_group = gemma4_q4_fused_projection_binding(false).1;
         command.dispatch_threadgroups_1d_labeled(
             kernel,
             Some("qkv_projection"),
             &buffers,
-            q_width_value.div_ceil(32) + 2 * kv_width_value.div_ceil(32),
+            q_width_value.div_ceil(rows_per_group) + 2 * kv_width_value.div_ceil(rows_per_group),
             128,
         )?;
         Ok(())
@@ -2436,7 +2460,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
     ) -> Result<()> {
         let (kernel, buffers): (&'static str, Vec<&GpuBuffer>) = match rms_weight {
             Some(rms_weight) => (
-                "matmul_q4_0_gate_up_32row_mv_rms",
+                gemma4_q4_fused_projection_binding(true).0,
                 vec![
                     input,
                     gate_weight,
@@ -2462,11 +2486,12 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 ],
             ),
         };
+        let rows_per_group = gemma4_q4_fused_projection_binding(true).1;
         command.dispatch_threadgroups_1d_labeled(
             kernel,
             Some("ffn_gate_up_projection"),
             &buffers,
-            2 * output_width_value.div_ceil(32),
+            2 * output_width_value.div_ceil(rows_per_group),
             128,
         )?;
         Ok(())
@@ -4959,12 +4984,17 @@ mod tests {
         for kernel in ["matvec_q4_0_64row_mv_rms", "matvec_q4_0_64row_mv"] {
             assert_eq!(gemma4_kernel_family(kernel), "q4_projection_other");
         }
-        for kernel in ["matmul_q4_0_qkv_32row_mv_rms", "matmul_q4_0_qkv_32row_mv"] {
+        for kernel in [
+            "matmul_q4_0_qkv_32row_mv_rms",
+            "matmul_q4_0_qkv_32row_mv",
+            "matmul_q4_0_qkv_16row_mv_rms",
+        ] {
             assert_eq!(gemma4_kernel_family(kernel), "q4_qkv_projection");
         }
         for kernel in [
             "matmul_q4_0_gate_up_32row_mv_rms",
             "matmul_q4_0_gate_up_32row_mv",
+            "matmul_q4_0_gate_up_16row_mv_rms",
         ] {
             assert_eq!(gemma4_kernel_family(kernel), "q4_ffn_gate_up_projection");
         }

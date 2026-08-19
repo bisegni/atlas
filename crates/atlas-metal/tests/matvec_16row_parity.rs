@@ -197,6 +197,103 @@ fn run_rms(
     runtime.read_f32(&out_buf, rows).unwrap()
 }
 
+fn run_qkv_fused(
+    runtime: &MetalRuntime,
+    kernel: &'static str,
+    sixteen_row: bool,
+    input: &[f32],
+    q_weights: &[u8],
+    k_weights: &[u8],
+    v_weights: &[u8],
+    rms_weight: &[f32],
+    q_rows: usize,
+    kv_rows: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let input_buf = runtime.upload_f32(input).unwrap();
+    let q_w = runtime.upload_bytes(q_weights).unwrap();
+    let k_w = runtime.upload_bytes(k_weights).unwrap();
+    let v_w = runtime.upload_bytes(v_weights).unwrap();
+    let q_out = runtime.upload_f32(&vec![0.0f32; q_rows]).unwrap();
+    let k_out = runtime.upload_f32(&vec![0.0f32; kv_rows]).unwrap();
+    let v_out = runtime.upload_f32(&vec![0.0f32; kv_rows]).unwrap();
+    let input_width_buf = runtime.upload_u32(&[input.len() as u32]).unwrap();
+    let q_width_buf = runtime.upload_u32(&[q_rows as u32]).unwrap();
+    let kv_width_buf = runtime.upload_u32(&[kv_rows as u32]).unwrap();
+    let rms_buf = runtime.upload_f32(rms_weight).unwrap();
+    let epsilon_buf = runtime.upload_f32(&[EPSILON]).unwrap();
+    let per_group = if sixteen_row { 16 } else { 32 };
+    let groups = q_rows.div_ceil(per_group) + 2 * kv_rows.div_ceil(per_group);
+    dispatch(
+        runtime,
+        kernel,
+        &[
+            (&input_buf, 0),
+            (&q_w, 0),
+            (&k_w, 0),
+            (&v_w, 0),
+            (&q_out, 0),
+            (&k_out, 0),
+            (&v_out, 0),
+            (&input_width_buf, 0),
+            (&q_width_buf, 0),
+            (&kv_width_buf, 0),
+            (&rms_buf, 0),
+            (&epsilon_buf, 0),
+        ],
+        groups,
+        128,
+    );
+    (
+        runtime.read_f32(&q_out, q_rows).unwrap(),
+        runtime.read_f32(&k_out, kv_rows).unwrap(),
+        runtime.read_f32(&v_out, kv_rows).unwrap(),
+    )
+}
+
+fn run_gate_up_fused(
+    runtime: &MetalRuntime,
+    kernel: &'static str,
+    sixteen_row: bool,
+    input: &[f32],
+    gate_weights: &[u8],
+    up_weights: &[u8],
+    rms_weight: &[f32],
+    rows: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let input_buf = runtime.upload_f32(input).unwrap();
+    let gate_w = runtime.upload_bytes(gate_weights).unwrap();
+    let up_w = runtime.upload_bytes(up_weights).unwrap();
+    let gate_out = runtime.upload_f32(&vec![0.0f32; rows]).unwrap();
+    let up_out = runtime.upload_f32(&vec![0.0f32; rows]).unwrap();
+    let input_width_buf = runtime.upload_u32(&[input.len() as u32]).unwrap();
+    let output_width_buf = runtime.upload_u32(&[rows as u32]).unwrap();
+    let rms_buf = runtime.upload_f32(rms_weight).unwrap();
+    let epsilon_buf = runtime.upload_f32(&[EPSILON]).unwrap();
+    let per_group = if sixteen_row { 16 } else { 32 };
+    let groups = 2 * rows.div_ceil(per_group);
+    dispatch(
+        runtime,
+        kernel,
+        &[
+            (&input_buf, 0),
+            (&gate_w, 0),
+            (&up_w, 0),
+            (&gate_out, 0),
+            (&up_out, 0),
+            (&input_width_buf, 0),
+            (&output_width_buf, 0),
+            (&rms_buf, 0),
+            (&epsilon_buf, 0),
+        ],
+        groups,
+        128,
+    );
+    (
+        runtime.read_f32(&gate_out, rows).unwrap(),
+        runtime.read_f32(&up_out, rows).unwrap(),
+    )
+}
+
 fn runtime_or_skip() -> Option<MetalRuntime> {
     match MetalRuntime::new() {
         Ok(runtime) => Some(runtime),
@@ -271,6 +368,170 @@ fn matvec_q4_16row_mv_rms_matches_cpu_oracle() {
                 &candidate,
             );
         }
+    }
+}
+
+#[test]
+fn matmul_q4_16row_qkv_fused_matches_cpu_oracle() {
+    let Some(runtime) = runtime_or_skip() else {
+        return;
+    };
+    let mut state = 0x9e37_79b9u32;
+    for input_width in [32u32, 256u32] {
+        let blocks = (input_width / 32) as usize;
+        let mut input = vec![0.0f32; input_width as usize];
+        fill_f32(&mut input, &mut state);
+        let mut rms_weight = vec![0.0f32; input_width as usize];
+        fill_rms_weight(&mut rms_weight, &mut state);
+        for (q_rows, kv_rows) in [(33usize, 17usize), (129usize, 33usize)] {
+            let normalized = cpu_rms_normalize(&input, &rms_weight, EPSILON);
+            let q = build_q4_weights(q_rows, blocks, &mut state);
+            let k = build_q4_weights(kv_rows, blocks, &mut state);
+            let v = build_q4_weights(kv_rows, blocks, &mut state);
+            let (gpu_q, gpu_k, gpu_v) = run_qkv_fused(
+                &runtime,
+                "matmul_q4_0_qkv_16row_mv_rms",
+                true,
+                &input,
+                &q,
+                &k,
+                &v,
+                &rms_weight,
+                q_rows,
+                kv_rows,
+            );
+            compare(
+                &format!("qkv16 q={q_rows} kv={kv_rows} in={input_width}"),
+                &cpu_q4_matvec(&normalized, &q, q_rows),
+                &gpu_q,
+            );
+            compare(
+                &format!("qkv16 k={kv_rows} in={input_width}"),
+                &cpu_q4_matvec(&normalized, &k, kv_rows),
+                &gpu_k,
+            );
+            compare(
+                &format!("qkv16 v={kv_rows} in={input_width}"),
+                &cpu_q4_matvec(&normalized, &v, kv_rows),
+                &gpu_v,
+            );
+        }
+    }
+}
+
+#[test]
+fn matmul_q4_16row_gate_up_fused_matches_cpu_oracle() {
+    let Some(runtime) = runtime_or_skip() else {
+        return;
+    };
+    let mut state = 0x9e37_79b9u32;
+    for input_width in [32u32, 256u32] {
+        let blocks = (input_width / 32) as usize;
+        let mut input = vec![0.0f32; input_width as usize];
+        fill_f32(&mut input, &mut state);
+        let mut rms_weight = vec![0.0f32; input_width as usize];
+        fill_rms_weight(&mut rms_weight, &mut state);
+        for rows in [33usize, 97usize, 137usize] {
+            let normalized = cpu_rms_normalize(&input, &rms_weight, EPSILON);
+            let gate = build_q4_weights(rows, blocks, &mut state);
+            let up = build_q4_weights(rows, blocks, &mut state);
+            let (gpu_gate, gpu_up) = run_gate_up_fused(
+                &runtime,
+                "matmul_q4_0_gate_up_16row_mv_rms",
+                true,
+                &input,
+                &gate,
+                &up,
+                &rms_weight,
+                rows,
+            );
+            compare(
+                &format!("gate_up16 gate rows={rows} in={input_width}"),
+                &cpu_q4_matvec(&normalized, &gate, rows),
+                &gpu_gate,
+            );
+            compare(
+                &format!("gate_up16 up rows={rows} in={input_width}"),
+                &cpu_q4_matvec(&normalized, &up, rows),
+                &gpu_up,
+            );
+        }
+    }
+}
+
+#[test]
+fn matmul_q4_16row_fused_is_bitwise_identical_to_32row() {
+    let Some(runtime) = runtime_or_skip() else {
+        return;
+    };
+    let mut state = 0x9e37_79b9u32;
+    let input_width = 256u32;
+    let blocks = (input_width / 32) as usize;
+    let mut input = vec![0.0f32; input_width as usize];
+    fill_f32(&mut input, &mut state);
+    let mut rms_weight = vec![0.0f32; input_width as usize];
+    fill_rms_weight(&mut rms_weight, &mut state);
+    for (q_rows, kv_rows) in [
+        (31usize, 17usize),
+        (129usize, 33usize),
+        (512usize, 256usize),
+    ] {
+        let q = build_q4_weights(q_rows, blocks, &mut state);
+        let k = build_q4_weights(kv_rows, blocks, &mut state);
+        let v = build_q4_weights(kv_rows, blocks, &mut state);
+        let (q32, k32, v32) = run_qkv_fused(
+            &runtime,
+            "matmul_q4_0_qkv_32row_mv_rms",
+            false,
+            &input,
+            &q,
+            &k,
+            &v,
+            &rms_weight,
+            q_rows,
+            kv_rows,
+        );
+        let (q16, k16, v16) = run_qkv_fused(
+            &runtime,
+            "matmul_q4_0_qkv_16row_mv_rms",
+            true,
+            &input,
+            &q,
+            &k,
+            &v,
+            &rms_weight,
+            q_rows,
+            kv_rows,
+        );
+        assert_bitwise(&format!("qkv16_vs_32 q={q_rows} kv={kv_rows}"), &q32, &q16);
+        assert_bitwise(&format!("qkv16_vs_32 k={kv_rows}"), &k32, &k16);
+        assert_bitwise(&format!("qkv16_vs_32 v={kv_rows}"), &v32, &v16);
+    }
+    for rows in [31usize, 97usize, 512usize] {
+        let gate = build_q4_weights(rows, blocks, &mut state);
+        let up = build_q4_weights(rows, blocks, &mut state);
+        let (g32, u32) = run_gate_up_fused(
+            &runtime,
+            "matmul_q4_0_gate_up_32row_mv_rms",
+            false,
+            &input,
+            &gate,
+            &up,
+            &rms_weight,
+            rows,
+        );
+        let (g16, u16) = run_gate_up_fused(
+            &runtime,
+            "matmul_q4_0_gate_up_16row_mv_rms",
+            true,
+            &input,
+            &gate,
+            &up,
+            &rms_weight,
+            rows,
+        );
+        assert_bitwise(&format!("gate_up16_vs_32 gate rows={rows}"), &g32, &g16);
+        assert_bitwise(&format!("gate_up16_vs_32 up rows={rows}"), &u32, &u16);
     }
 }
 
