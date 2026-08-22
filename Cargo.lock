@@ -31,9 +31,7 @@ dependencies = [
  "atlas-core",
  "atlas-metal",
  "atlas-model",
- "atlas-profiler",
  "keyring",
- "ratatui",
  "rpassword",
  "serde_json",
  "sha2",
@@ -46,6 +44,23 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "atlas-dev"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "atlas-core",
+ "atlas-metal",
+ "atlas-model",
+ "atlas-profiler",
+ "keyring",
+ "ratatui",
+ "rpassword",
+ "serde_json",
+ "sha2",
+ "ureq",
 ]
 
 [[package]]

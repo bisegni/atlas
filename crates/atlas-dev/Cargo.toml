@@ -1,5 +1,5 @@
 [package]
-name = "atlas-cli"
+name = "atlas-dev"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -10,8 +10,10 @@ anyhow.workspace = true
 atlas-core = { path = "../atlas-core" }
 atlas-metal = { path = "../atlas-metal" }
 atlas-model = { path = "../atlas-model" }
+atlas-profiler = { path = "../atlas-profiler" }
 serde_json.workspace = true
 sha2.workspace = true
 ureq.workspace = true
 keyring.workspace = true
 rpassword.workspace = true
+ratatui.workspace = true

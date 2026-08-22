@@ -70,6 +70,27 @@ pub fn load_default_provider() -> Result<Option<String>> {
     }))
 }
 
+pub fn set_default_provider(provider: Option<&str>) -> Result<()> {
+    if let Some(provider) = provider {
+        ensure!(
+            registered().contains(&provider),
+            "provider `{provider}` is not registered"
+        );
+    }
+    let path = config_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(provider) = provider {
+        let temporary = path.with_extension("toml.tmp");
+        fs::write(&temporary, format!("default_provider = \"{provider}\"\n"))?;
+        fs::rename(temporary, path)?;
+    } else if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
 pub fn select(
     explicit: Option<&str>,
     configured: Option<&str>,
@@ -126,6 +147,44 @@ pub fn token(provider: &str) -> Result<(AuthSource, Option<String>)> {
         Err(keyring::Error::NoEntry) => Ok((AuthSource::Missing, None)),
         Err(error) => Err(error).context("read provider keychain entry"),
     }
+}
+
+pub fn store_token(provider: &str, value: &str) -> Result<()> {
+    ensure!(
+        registered().contains(&provider),
+        "provider `{provider}` is not registered"
+    );
+    ensure!(
+        value.starts_with("hf_"),
+        "Hugging Face access tokens start with `hf_`"
+    );
+    Entry::new(KEYCHAIN_SERVICE, provider)?
+        .set_password(value)
+        .context("store provider token")
+}
+
+pub fn logout(provider: &str) -> Result<()> {
+    ensure!(
+        registered().contains(&provider),
+        "provider `{provider}` is not registered"
+    );
+    let entry = Entry::new(KEYCHAIN_SERVICE, provider)?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(error).context("delete provider keychain entry"),
+    }
+}
+
+pub fn validate_hugging_face_token(value: &str) -> Result<()> {
+    let response = ureq::get("https://huggingface.co/api/whoami-v2")
+        .header("Authorization", format!("Bearer {value}"))
+        .call()
+        .context("validate Hugging Face token")?;
+    ensure!(
+        response.status().is_success(),
+        "Hugging Face rejected the token"
+    );
+    Ok(())
 }
 
 pub trait ModelProvider {

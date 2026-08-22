@@ -250,6 +250,11 @@ cargo test -p atlas-model --test phase_12a_gemma4_resident -- --ignored
 
 ## 6. Performance instrumentation
 
+> Note: the user-facing `atlas-cli` binary is intentionally minimal (chat,
+> model search, model download). All benchmark/profile/instrumentation commands
+> below live in the `atlas-dev` binary (a separate workspace member) so the
+> main CLI stays simple for users. The commands below use `atlas-dev`.
+
 Two complementary tools answer "where is Atlas losing time compared with
 llama.cpp, and what should be optimized first?":
 
@@ -402,6 +407,16 @@ batched GEMM** to close the prefill gap; prefill-first is justified for
 large-prompt workloads, where the prefill absolute gap dominates. Matvec
 breadth tuning (D4) should not be pursued further until the GPU-latency levers
 are spent.
+
+> Note (2026-08-22): these ratios predate the phase-13.19 prefill default-flip
+> (llama mul_mm GEMMs + Flash16-v7, now ~1575–1589 tok/s prefill) and the
+> phase-13.21 wide qk_norm_rope (now the default; decode +12–14% to ~77 tok/s,
+> prefill +3%, with a deliberate canonical-fixture re-baseline to the wide
+> greedy stream — the exact kernels remain via `ATLAS_GEMMA4_EXACT_QKNORM=1`).
+> The authoritative current-state index and improved numbers are in
+> [atlas-metal-phases/README.md](atlas-metal-phases/README.md); the open work
+> list is in
+> [atlas-metal-phases/next-improvements.md](atlas-metal-phases/next-improvements.md).
 
 ## 8. Historical documents
 

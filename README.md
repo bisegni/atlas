@@ -31,6 +31,21 @@ append-only performance metrics. See the
 [current state and performance](docs/atlas-metal-phases/README.md) and the
 [open improvements list](docs/atlas-metal-phases/next-improvements.md).
 
+## User CLI (`atlas-cli`)
+
+The user-facing binary exposes only the common workflows:
+
+```zsh
+cargo run --release -p atlas-cli -- chat --model gemma4-e2b-q4_0
+cargo run --release -p atlas-cli -- model search <query>
+cargo run --release -p atlas-cli -- model download 'huggingface:<repo>@<rev>:gguf-gemma4-q4_0:<file>' --id <id>
+```
+
+All benchmarking, profiling, llama.cpp comparison, the reference executor,
+provider/keychain login, `model verify`, `metal-info`, and the parity-test
+tooling live in a separate `atlas-dev` binary so the main CLI stays simple.
+(`model quantize` is a documented future feature, not yet implemented.)
+
 ## Plan structure
 
 - [Engineering reference](docs/atlas-engineering.md) — design principles,
@@ -102,14 +117,14 @@ Run the CLI to confirm that Atlas can create a Metal device and compile/cache
 the Phase 0 kernels:
 
 ```zsh
-cargo run -p atlas-cli -- metal-info
+cargo run -p atlas-dev -- metal-info
 ```
 
 After downloading the small model, validate its configuration and SafeTensors
 header without loading the model weights:
 
 ```zsh
-cargo run -p atlas-cli -- fixture verify --model small
+cargo run -p atlas-dev -- fixture verify --model small
 ```
 
 Talk to the model directly (omit `--prompt` for the REPL):
@@ -153,14 +168,14 @@ projector. It validates the embedded `gemma4` architecture, supported packed
 tensor formats, pinned filename, byte count, and SHA-256 before registering the
 fixture. The public repository does not currently require authentication. For
 a gated/private Hugging Face artifact, set `HF_TOKEN` in the environment or run
-`cargo run -p atlas-cli -- provider login huggingface` first.
+`cargo run -p atlas-dev -- provider login huggingface` first.
 
 If the registered fixture directory already exists, Atlas refuses to overwrite
 it. Verify the downloaded model and confirm that Metal is available:
 
 ```zsh
-cargo run --release -p atlas-cli -- model verify --model gemma4-e2b-q4_0
-cargo run -p atlas-cli -- metal-info
+cargo run --release -p atlas-dev -- model verify --model gemma4-e2b-q4_0
+cargo run -p atlas-dev -- metal-info
 ```
 
 The verification command should report `"verified": true`. Then start chat as
@@ -202,8 +217,8 @@ cargo run --release -p atlas-cli -- chat \
 Gemma 4 chat applies the instruction template embedded in the GGUF and always
 uses the GPU-resident executor. Thought-channel text is filtered by default;
 pass `--show-thoughts` only when it is intentionally needed. The raw
-`generate --max-new-tokens N --greedy` command is for completion and parity
-diagnostics and does not apply the chat template.
+`generate` command (completion and parity diagnostics, no chat template) is in
+the `atlas-dev` binary.
 
 Each completed turn appends one JSON record to `artifacts/chat-performance.jsonl`.
 The first turn includes the model weight upload. After `/reset`, later turns in

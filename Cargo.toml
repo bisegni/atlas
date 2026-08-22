@@ -5,6 +5,7 @@ members = [
     "crates/atlas-metal",
     "crates/atlas-ops",
     "crates/atlas-model",
+    "crates/atlas-dev",
     "crates/atlas-cli",
 ]
 resolver = "3"
