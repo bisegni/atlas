@@ -414,6 +414,17 @@ fn gemma4_decode_uses_unfused_vnorm() -> bool {
     std::env::var_os("ATLAS_GEMMA4_UNFUSED_VNORM").is_some()
 }
 
+/// Phase-13.21: the wide (SIMD-group-parallel) qk_norm_rope kernels are the
+/// **default** — decode +11.6→13.7% and prefill +2.6→3.1% at pp512/tg128.
+/// The parallel per-head RMS reduction reorders FP32 arithmetic (tolerance
+/// level, max-abs < 1e-3), so the canonical golden fixture was deliberately
+/// re-baselined to the wide-kernel greedy stream (a documented
+/// correctness-contract change).  Set `ATLAS_GEMMA4_EXACT_QKNORM=1` to fall
+/// back to the byte-identical single-thread `_f32`/`_batch_f32` kernels.
+fn gemma4_qk_norm_rope_wide_enabled() -> bool {
+    std::env::var_os("ATLAS_GEMMA4_EXACT_QKNORM").is_none()
+}
+
 /// Exact-compatible Flash16 attention bindings. They retain Flash16's
 /// explicit Resident dispatches while preserving LegacyFused's runtime FP32
 /// dot-product, reduction, and key-ordered online-softmax ordering. The
@@ -455,6 +466,44 @@ fn gemma4_q4_flash16_v4_binding(sliding: bool) -> (&'static str, &'static str, u
             "attention_decode_gemma4_simd_q4_0_flash16_v4",
             "gemma_attention_flash16",
             384,
+        )
+    }
+}
+
+/// Split-KV decode attention bindings (next-improvements item 1): two-pass
+/// "flash-decoding" — the `scan` kernel spreads the per-head KV scan across
+/// `SPLIT` threadgroups writing per-chunk partial softmax state to resident
+/// scratch, and the `combine` kernel merges them into the head output.  The
+/// scan threads mirror v4 (SLICES * 32); the combine is a narrow per-head
+/// reduction (128 threads).  Tolerance-level (cross-threadgroup split + merge
+/// reorder the FP32 reduction, like v4).
+fn gemma4_q4_flash16_split_kv_binding(
+    sliding: bool,
+) -> (
+    &'static str,
+    &'static str,
+    u32,
+    &'static str,
+    &'static str,
+    u32,
+) {
+    if sliding {
+        (
+            "attention_decode_gemma4_simd_q4_0_flash16_split_swa_scan",
+            "gemma_attention_flash16_split_scan_swa",
+            768,
+            "attention_decode_gemma4_simd_q4_0_flash16_split_swa_combine",
+            "gemma_attention_flash16_split_combine_swa",
+            128,
+        )
+    } else {
+        (
+            "attention_decode_gemma4_simd_q4_0_flash16_split_full_scan",
+            "gemma_attention_flash16_split_scan",
+            384,
+            "attention_decode_gemma4_simd_q4_0_flash16_split_full_combine",
+            "gemma_attention_flash16_split_combine",
+            128,
         )
     }
 }
@@ -517,6 +566,7 @@ impl Gemma4KvCacheType {
 pub enum Gemma4Q4AttentionMode {
     Flash16,
     Flash16Exact,
+    Flash16SplitKv,
     LegacyFused,
 }
 
@@ -531,10 +581,11 @@ impl Gemma4Q4AttentionMode {
         match value {
             "flash16" => Ok(Self::Flash16),
             "flash16_exact" => Ok(Self::Flash16Exact),
+            "flash16_split_kv" => Ok(Self::Flash16SplitKv),
             "legacy_fused" => Ok(Self::LegacyFused),
             _ => {
                 anyhow::bail!(
-                    "unknown Gemma Q4 attention mode `{value}`; expected flash16, flash16_exact, or legacy_fused"
+                    "unknown Gemma Q4 attention mode `{value}`; expected flash16, flash16_exact, flash16_split_kv, or legacy_fused"
                 )
             }
         }
@@ -544,9 +595,28 @@ impl Gemma4Q4AttentionMode {
         match self {
             Self::Flash16 => "flash16",
             Self::Flash16Exact => "flash16_exact",
+            Self::Flash16SplitKv => "flash16_split_kv",
             Self::LegacyFused => "legacy_fused",
         }
     }
+}
+
+/// Split-KV scan threadgroups per head (ATLAS_GEMMA4_SPLIT_KV).  The scan and
+/// combine kernels are specialized to at most 32 split states; the live count
+/// is clamped to that so the combine's threadgroup arrays
+/// (`slice_max[SPLIT]`, `slice_sum[SPLIT]`, SPLIT = 32) stay in-bounds.  Smaller
+/// counts leave later split states empty (the scan writes a degenerate partial
+/// and the combine drops it via `inv_denominator`).
+fn gemma4_split_kv_clamp(value: u32) -> u32 {
+    value.clamp(1, 32)
+}
+
+/// Split-KV scan threadgroups per head, read from `ATLAS_GEMMA4_SPLIT_KV`
+/// (default 8, clamped to the 1..=32 range the combine arrays expect).
+fn gemma4_split_kv_split() -> u32 {
+    std::env::var_os("ATLAS_GEMMA4_SPLIT_KV")
+        .and_then(|value| value.to_str().and_then(|text| text.parse::<u32>().ok()))
+        .map_or(8, gemma4_split_kv_clamp)
 }
 
 fn gemma4_rope_angle(
@@ -915,6 +985,8 @@ fn gemma4_kernel_family(kernel: &str) -> &'static str {
         "gemma_attention"
     } else if kernel == "gemma4_qk_norm_rope_fused_f32"
         || kernel == "gemma4_qk_norm_rope_fused_batch_f32"
+        || kernel == "gemma4_qk_norm_rope_fused_f32_wide"
+        || kernel == "gemma4_qk_norm_rope_fused_batch_f32_wide"
     {
         "qk_norm_rope_fused"
     } else if kernel.starts_with("rms_norm") {
@@ -1023,6 +1095,9 @@ fn gemma4_attention_kernel(
         match q4_attention_mode {
             Gemma4Q4AttentionMode::Flash16 => {
                 return gemma4_q4_flash16_v4_binding(sliding).0;
+            }
+            Gemma4Q4AttentionMode::Flash16SplitKv => {
+                return gemma4_q4_flash16_split_kv_binding(sliding).0;
             }
             Gemma4Q4AttentionMode::Flash16Exact => {
                 return gemma4_q4_flash16_binding(sliding).0;
@@ -1339,6 +1414,9 @@ pub struct Gemma4E2bExecutor<'a> {
     k_rot: GpuBuffer,
     v: GpuBuffer,
     attention: GpuBuffer,
+    split_kv_partials: GpuBuffer,
+    split_kv_split_value: GpuBuffer,
+    split_kv_partial_stride: GpuBuffer,
     work: GpuBuffer,
     gate: GpuBuffer,
     up: GpuBuffer,
@@ -1471,6 +1549,22 @@ impl<'a> Gemma4E2bExecutor<'a> {
         let h = c.hidden_size;
         let head = c.key_length.max(c.key_length_swa);
         let q_width = c.attention_heads * head;
+        // Split-KV scratch (opt-in Flash16SplitKv decode attention): one
+        // partial-softmax-state record per (head, split) — {maximum,
+        // denominator, out[head]} — sized to the max split count (32, matching
+        // the combine's threadgroup arrays).  Allocated unconditionally so
+        // `resident_bytes` is identical across attention modes (the A/B parity
+        // gate compares residency).
+        let split_kv = gemma4_split_kv_split();
+        let split_kv_stride = (head as u32)
+            .checked_add(2)
+            .context("Gemma split-KV stride overflows")?;
+        let split_kv_bytes = c
+            .attention_heads
+            .checked_mul(32)
+            .and_then(|states| states.checked_mul(split_kv_stride as usize))
+            .and_then(|records| records.checked_mul(std::mem::size_of::<f32>()))
+            .context("Gemma split-KV partial scratch overflows")?;
         let ple_total = c.layers * c.per_layer_embedding_size;
         let max_ffn = c
             .feed_forward_sizes
@@ -1743,6 +1837,9 @@ impl<'a> Gemma4E2bExecutor<'a> {
             k_rot: allocate(head)?,
             v: allocate(head)?,
             attention: allocate(q_width)?,
+            split_kv_partials: runtime.allocate(split_kv_bytes)?,
+            split_kv_split_value: runtime.upload_u32(&[split_kv])?,
+            split_kv_partial_stride: runtime.upload_u32(&[split_kv_stride])?,
             work: allocate(h)?,
             gate: allocate(max_ffn)?,
             up: allocate(max_ffn)?,
@@ -1834,6 +1931,9 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 &self.k_rot,
                 &self.v,
                 &self.attention,
+                &self.split_kv_partials,
+                &self.split_kv_split_value,
+                &self.split_kv_partial_stride,
                 &self.work,
                 &self.gate,
                 &self.activated,
@@ -2522,25 +2622,48 @@ impl<'a> Gemma4E2bExecutor<'a> {
         head_width: &GpuBuffer,
         provider_key: bool,
     ) -> Result<()> {
-        command.dispatch_threadgroups_1d_at(
-            "gemma4_qk_norm_rope_fused_f32",
-            &[
-                (&self.q, 0),
-                (&self.k, 0),
-                (q_weight, 0),
-                (k_weight, 0),
-                (cosine, rope_offset),
-                (sine, rope_offset),
-                (&self.q_rot, 0),
-                (&self.k_rot, 0),
-                (head_width, 0),
-                (&self.heads, 0),
-                (&self.one, 0),
-                (&self.epsilon, 0),
-            ],
-            self.model.config.attention_heads + usize::from(provider_key),
-            1,
-        )?;
+        if gemma4_qk_norm_rope_wide_enabled() {
+            command.dispatch_threadgroups_1d_at_labeled(
+                "gemma4_qk_norm_rope_fused_f32_wide",
+                Some("qk_norm_rope_fused_wide"),
+                &[
+                    (&self.q, 0),
+                    (&self.k, 0),
+                    (q_weight, 0),
+                    (k_weight, 0),
+                    (cosine, rope_offset),
+                    (sine, rope_offset),
+                    (&self.q_rot, 0),
+                    (&self.k_rot, 0),
+                    (head_width, 0),
+                    (&self.heads, 0),
+                    (&self.one, 0),
+                    (&self.epsilon, 0),
+                ],
+                self.model.config.attention_heads + usize::from(provider_key),
+                32,
+            )?;
+        } else {
+            command.dispatch_threadgroups_1d_at(
+                "gemma4_qk_norm_rope_fused_f32",
+                &[
+                    (&self.q, 0),
+                    (&self.k, 0),
+                    (q_weight, 0),
+                    (k_weight, 0),
+                    (cosine, rope_offset),
+                    (sine, rope_offset),
+                    (&self.q_rot, 0),
+                    (&self.k_rot, 0),
+                    (head_width, 0),
+                    (&self.heads, 0),
+                    (&self.one, 0),
+                    (&self.epsilon, 0),
+                ],
+                self.model.config.attention_heads + usize::from(provider_key),
+                1,
+            )?;
+        }
         Ok(())
     }
 
@@ -3673,8 +3796,13 @@ impl<'a> Gemma4E2bExecutor<'a> {
         } else {
             &self.zero
         };
+        let (qk_norm_rope_kernel, qk_norm_rope_threads) = if gemma4_qk_norm_rope_wide_enabled() {
+            ("gemma4_qk_norm_rope_fused_batch_f32_wide", 32)
+        } else {
+            ("gemma4_qk_norm_rope_fused_batch_f32", 1)
+        };
         command.dispatch_threadgroups_1d_labeled(
-            "gemma4_qk_norm_rope_fused_batch_f32",
+            qk_norm_rope_kernel,
             Some("layer_major_batched_qk_norm_rope"),
             &[
                 &self.prefill.q,
@@ -3693,7 +3821,7 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 &self.rope_pairs,
             ],
             batch_value * (c.attention_heads + has_key),
-            1,
+            qk_norm_rope_threads,
         )?;
         if source == layer {
             command.dispatch_1d_labeled(
@@ -4245,18 +4373,73 @@ impl<'a> Gemma4E2bExecutor<'a> {
                 .context("Gemma attention control-table offset overflows")?;
             let (attention_kernel, attention_threads) =
                 gemma4_attention_binding(self.kv_cache_type);
+            let split_kv_binding = if self.kv_cache_type == Gemma4KvCacheType::Q4_0
+                && gemma4_q4_flash16_supported(c.attention_heads, head)
+                && self.q4_attention_mode == Gemma4Q4AttentionMode::Flash16SplitKv
+            {
+                Some(gemma4_q4_flash16_split_kv_binding(sliding))
+            } else {
+                None
+            };
             let flash16_binding = if self.kv_cache_type == Gemma4KvCacheType::Q4_0
                 && gemma4_q4_flash16_supported(c.attention_heads, head)
             {
                 match self.q4_attention_mode {
                     Gemma4Q4AttentionMode::Flash16 => Some(gemma4_q4_flash16_v4_binding(sliding)),
                     Gemma4Q4AttentionMode::Flash16Exact => Some(gemma4_q4_flash16_binding(sliding)),
+                    Gemma4Q4AttentionMode::Flash16SplitKv => None,
                     Gemma4Q4AttentionMode::LegacyFused => None,
                 }
             } else {
                 None
             };
-            if let Some((attention_kernel, attention_label, attention_threads)) = flash16_binding {
+            if let Some((
+                scan_kernel,
+                scan_label,
+                scan_threads,
+                combine_kernel,
+                combine_label,
+                combine_threads,
+            )) = split_kv_binding
+            {
+                let split_grid = c
+                    .attention_heads
+                    .checked_mul(gemma4_split_kv_split() as usize)
+                    .context("Gemma split-KV scan grid overflows")?;
+                command.dispatch_threadgroups_1d_at_labeled(
+                    scan_kernel,
+                    Some(scan_label),
+                    &[
+                        (&self.q_rot, 0),
+                        (cache, 0),
+                        (&self.split_kv_partials, 0),
+                        (&self.heads, 0),
+                        (&self.kv_heads, 0),
+                        (head_width, 0),
+                        (&self.capacity, 0),
+                        (key_counts, key_count_offset),
+                        (&self.split_kv_split_value, 0),
+                        (&self.split_kv_partial_stride, 0),
+                    ],
+                    split_grid,
+                    usize::try_from(scan_threads).expect("scan threadgroup size"),
+                )?;
+                command.dispatch_threadgroups_1d_at_labeled(
+                    combine_kernel,
+                    Some(combine_label),
+                    &[
+                        (&self.split_kv_partials, 0),
+                        (&self.attention, 0),
+                        (&self.heads, 0),
+                        (&self.split_kv_partial_stride, 0),
+                        (&self.split_kv_split_value, 0),
+                    ],
+                    c.attention_heads,
+                    usize::try_from(combine_threads).expect("combine threadgroup size"),
+                )?;
+            } else if let Some((attention_kernel, attention_label, attention_threads)) =
+                flash16_binding
+            {
                 command.dispatch_threadgroups_1d_at_labeled(
                     attention_kernel,
                     Some(attention_label),
@@ -4520,7 +4703,8 @@ mod tests {
         gemma4_decode_profile_targets, gemma4_kernel_family, gemma4_prefill_path,
         gemma4_profile_family, gemma4_q6_k_to_q4_0, gemma4_rms_norm_decode_kernel,
         gemma4_rope_angle, gemma4_selected_group_formats, gemma4_should_finish,
-        gemma4_weight_format_with_plan, q4_weight_bytes_to_input_width,
+        gemma4_split_kv_clamp, gemma4_split_kv_split, gemma4_weight_format_with_plan,
+        q4_weight_bytes_to_input_width,
     };
     use atlas_core::{GgufTensorType, dequantize_block};
 
@@ -4564,8 +4748,8 @@ mod tests {
             Gemma4Q4AttentionMode::Flash16Exact
         );
         assert_eq!(
-            Gemma4Q4AttentionMode::parse("legacy_fused").unwrap(),
-            Gemma4Q4AttentionMode::LegacyFused
+            Gemma4Q4AttentionMode::parse("flash16_split_kv").unwrap(),
+            Gemma4Q4AttentionMode::Flash16SplitKv
         );
         assert!(Gemma4Q4AttentionMode::parse("fast").is_err());
         assert_eq!(
@@ -4602,6 +4786,36 @@ mod tests {
             ),
             "attention_decode_fused_gemma4_simd_q4_0"
         );
+        assert_eq!(
+            gemma4_attention_kernel(
+                Gemma4KvCacheType::Q4_0,
+                8,
+                512,
+                false,
+                Gemma4Q4AttentionMode::Flash16SplitKv,
+            ),
+            "attention_decode_gemma4_simd_q4_0_flash16_split_full_scan"
+        );
+        assert_eq!(
+            gemma4_attention_kernel(
+                Gemma4KvCacheType::Q4_0,
+                8,
+                512,
+                true,
+                Gemma4Q4AttentionMode::Flash16SplitKv,
+            ),
+            "attention_decode_gemma4_simd_q4_0_flash16_split_swa_scan"
+        );
+    }
+
+    #[test]
+    fn split_kv_split_count_defaults_to_eight_and_clamps() {
+        assert_eq!(gemma4_split_kv_split(), 8);
+        assert_eq!(gemma4_split_kv_clamp(16), 16);
+        assert_eq!(gemma4_split_kv_clamp(0), 1);
+        assert_eq!(gemma4_split_kv_clamp(64), 32);
+        assert_eq!(gemma4_split_kv_clamp(1), 1);
+        assert_eq!(gemma4_split_kv_clamp(32), 32);
     }
 
     #[test]

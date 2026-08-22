@@ -52,9 +52,14 @@ fn fp32_neural_operators_match_cpu_oracles_for_prefill_and_decode() {
     // phase-13.14 single-pass online-softmax pair
     // (attention_prefill_gemma4_simd_q4_0_flash16_[swa_]v7), the phase-13.15/13.16
     // 16-row q4 decode matvec quartet (matvec_q4_0_16row_mv[_rms],
-    // matmul_q4_0_[qkv|gate_up]_16row_mv_rms), and the phase-13.18 PLE
-    // input-gate fusion (gemma4_ple_gate_gelu_f32) = 103.
-    assert_eq!(ops.runtime().pipeline_count(), 103);
+    // matmul_q4_0_[qkv|gate_up]_16row_mv_rms), the phase-13.18 PLE
+    // input-gate fusion (gemma4_ple_gate_gelu_f32), the split-KV decode
+    // Flash16 scan+combine quartet (attention_decode_gemma4_simd_q4_0_flash16_split_[swa_]scan,
+    // attention_decode_gemma4_simd_q4_0_flash16_split_[swa_]combine), and the
+    // phase-13.21 wide qk_norm_rope pair (gemma4_qk_norm_rope_fused_f32_wide,
+    // gemma4_qk_norm_rope_fused_batch_f32_wide) = 108 (the orphan
+    // rms_norm_groups_in_place_f32 was removed).
+    assert_eq!(ops.runtime().pipeline_count(), 108);
 
     let table = [0.0, 0.1, 0.2, 0.3, 1.0, 1.1, 1.2, 1.3, 2.0, 2.1, 2.2, 2.3];
     let (embedded, _) = ops.embedding(&table, 3, 4, &[2, 0]).unwrap();
